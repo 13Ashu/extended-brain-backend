@@ -1,10 +1,11 @@
 """
 Database models using SQLAlchemy with PostgreSQL
+Updated with full user registration fields
 """
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Text, DateTime, ForeignKey, JSON, Enum as SQLEnum
+from sqlalchemy import String, Text, DateTime, ForeignKey, JSON, Enum as SQLEnum, Integer
 from datetime import datetime
 from typing import Optional, List
 import enum
@@ -65,15 +66,32 @@ class User(Base):
     __tablename__ = "users"
     
     id: Mapped[int] = mapped_column(primary_key=True)
+    
+    # Contact Information
     phone_number: Mapped[str] = mapped_column(String(20), unique=True, index=True)
-    name: Mapped[Optional[str]] = mapped_column(String(100))
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    
+    # Personal Information
+    name: Mapped[str] = mapped_column(String(100))
+    age: Mapped[int] = mapped_column(Integer)
+    occupation: Mapped[str] = mapped_column(String(100))
+    
+    # Authentication
+    password_hash: Mapped[str] = mapped_column(String(255))  # Store hashed password
+    
+    # Settings
     timezone: Mapped[str] = mapped_column(String(50), default="UTC")
+    is_active: Mapped[bool] = mapped_column(default=True)
+    is_verified: Mapped[bool] = mapped_column(default=False)
+    
+    # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
         onupdate=datetime.utcnow
     )
+    last_login: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     
     # Relationships
     messages: Mapped[List["Message"]] = relationship(
@@ -88,7 +106,23 @@ class User(Base):
     )
     
     def __repr__(self):
-        return f"<User {self.phone_number}>"
+        return f"<User {self.phone_number} - {self.name}>"
+
+
+class OTPVerification(Base):
+    """Store OTP codes for phone verification"""
+    __tablename__ = "otp_verifications"
+    
+    id: Mapped[int] = mapped_column(primary_key=True)
+    phone_number: Mapped[str] = mapped_column(String(20), index=True)
+    otp_code: Mapped[str] = mapped_column(String(6))
+    is_verified: Mapped[bool] = mapped_column(default=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    def __repr__(self):
+        return f"<OTP {self.phone_number} - {self.otp_code}>"
 
 
 class Category(Base):
