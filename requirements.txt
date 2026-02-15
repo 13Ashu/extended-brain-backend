@@ -1,0 +1,27 @@
+# Core Framework
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+
+# Database
+sqlalchemy
+asyncpg
+alembic
+
+# HTTP Client
+httpx
+
+# Environment Variables
+python-dotenv
+
+# PDF Processing (for document extraction)
+pypdf2
+python-docx
+
+# Audio Processing (optional - for transcription)
+# openai-whisper==20231117
+
+# Utilities
+python-jose[cryptography]
+passlib[bcrypt]
