@@ -11,6 +11,8 @@ alembic
 
 # HTTP Client
 httpx
+email-validator
+dnspython
 
 # Environment Variables
 python-dotenv
