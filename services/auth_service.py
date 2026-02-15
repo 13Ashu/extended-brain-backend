@@ -11,7 +11,7 @@ import hashlib
 import secrets
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from loguru import logger
 from database import User, OTPVerification
 
 
@@ -62,7 +62,7 @@ class AuthService:
             # Generate OTP
             otp_code = self.generate_otp()
             expires_at = datetime.utcnow() + timedelta(minutes=self.OTP_EXPIRY_MINUTES)
-            
+            logger.info(f"This is the otp: {otp_code}")
             # Delete any existing OTPs for this number
             await db.execute(
                 select(OTPVerification)
