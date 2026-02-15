@@ -58,12 +58,7 @@ app = FastAPI(
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://your-digital-mind.vercel.app",  # Add your Vercel domain
-        "https://your-digital-mind-*.vercel.app",
-        "http://localhost:5173",         # Keep for local dev
-    ],  # Configure for production
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origins=["*"],  # Configure for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
