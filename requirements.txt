@@ -27,3 +27,4 @@ python-docx
 # Utilities
 python-jose[cryptography]
 passlib[bcrypt]
+loguru
