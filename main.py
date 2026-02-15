@@ -1,15 +1,16 @@
 """
 Extended Brain - Main FastAPI Application
 WhatsApp-powered knowledge base with Cerebras AI and PostgreSQL
+Updated with full authentication and user registration
 """
 
 # IMPORTANT: Load environment variables FIRST
 from dotenv import load_dotenv
-load_dotenv()  # This reads the .env file and loads all variables
+load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
@@ -17,7 +18,7 @@ from contextlib import asynccontextmanager
 import os
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# Import our modules (we'll create these)
+# Import our modules
 from database import get_db, init_db
 from models import User, Message, Category, MessageType
 from cerebras_client import CerebrasClient
@@ -25,16 +26,14 @@ from whatsapp import WhatsAppClient
 from services.message_processor import MessageProcessor
 from services.search_service import SearchService
 from services.category_manager import CategoryManager
+from services.auth_service import AuthService
 
 
-# ================== Lifespan Events (Modern FastAPI) ==================
+# ================== Lifespan Events ==================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Lifespan event handler for startup and shutdown
-    Replaces deprecated on_event
-    """
+    """Lifespan event handler for startup and shutdown"""
     # Startup
     print("🚀 Starting Extended Brain API...")
     await init_db()
@@ -53,13 +52,16 @@ app = FastAPI(
     title="Extended Brain API",
     description="WhatsApp-powered AI knowledge base with Cerebras and PostgreSQL",
     version="2.0.0",
-    lifespan=lifespan  # Use the lifespan handler
+    lifespan=lifespan
 )
 
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure for production
+    allow_origins=[
+        "https://your-digital-mind.vercel.app",  # Add your Vercel domain
+        "http://localhost:5173",         # Keep for local dev
+    ],  # Configure for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,6 +76,7 @@ whatsapp_client = WhatsAppClient(
 message_processor = MessageProcessor(cerebras_client)
 search_service = SearchService(cerebras_client)
 category_manager = CategoryManager(cerebras_client)
+auth_service = AuthService(whatsapp_client)
 
 
 # ================== Pydantic Models ==================
@@ -84,6 +87,34 @@ class MessageTypeEnum(str, Enum):
     AUDIO = "audio"
     DOCUMENT = "document"
     VIDEO = "video"
+
+
+class UserRegistrationRequest(BaseModel):
+    """Full user registration data"""
+    name: str = Field(..., min_length=2, max_length=100)
+    email: EmailStr
+    age: int = Field(..., ge=13, le=120)
+    occupation: str = Field(..., min_length=2, max_length=100)
+    phone_number: str = Field(..., min_length=10, max_length=20)
+    password: str = Field(..., min_length=6)
+    timezone: Optional[str] = "UTC"
+
+
+class OTPSendRequest(BaseModel):
+    """Request to send OTP"""
+    phone_number: str = Field(..., min_length=10, max_length=20)
+
+
+class OTPVerifyRequest(BaseModel):
+    """Request to verify OTP"""
+    phone_number: str = Field(..., min_length=10, max_length=20)
+    otp: str = Field(..., min_length=6, max_length=6)
+
+
+class LoginRequest(BaseModel):
+    """User login request"""
+    phone_number: str
+    password: str
 
 
 class IncomingWebhook(BaseModel):
@@ -109,16 +140,10 @@ class SearchQuery(BaseModel):
 
 class CategoryOperation(BaseModel):
     user_phone: str
-    operation: str  # "create", "edit", "delete", "list"
+    operation: str
     category_name: Optional[str] = None
     new_name: Optional[str] = None
     description: Optional[str] = None
-
-
-class UserRegistration(BaseModel):
-    phone_number: str
-    name: Optional[str] = None
-    timezone: Optional[str] = "UTC"
 
 
 # ================== Core Endpoints ==================
@@ -135,7 +160,8 @@ async def root():
             "AI-Powered Categorization",
             "Semantic Search",
             "Multi-format Support (Text/Image/Audio/PDF)",
-            "Dynamic Category Management"
+            "Dynamic Category Management",
+            "OTP Authentication"
         ]
     }
 
@@ -154,12 +180,90 @@ async def health_check():
     }
 
 
+# ================== Authentication Endpoints ==================
+
+@app.post("/api/auth/send-otp")
+async def send_otp(
+    request: OTPSendRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Send OTP to phone number"""
+    result = await auth_service.send_otp(request.phone_number, db)
+    
+    if not result['success']:
+        raise HTTPException(status_code=400, detail=result['message'])
+    
+    return result
+
+
+@app.post("/api/auth/verify-otp")
+async def verify_otp(
+    request: OTPVerifyRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Verify OTP code"""
+    result = await auth_service.verify_otp(
+        request.phone_number,
+        request.otp,
+        db
+    )
+    
+    if not result['verified']:
+        raise HTTPException(status_code=400, detail=result['message'])
+    
+    return result
+
+
+@app.post("/api/auth/login")
+async def login(
+    request: LoginRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """User login"""
+    result = await auth_service.login_user(
+        request.phone_number,
+        request.password,
+        db
+    )
+    
+    if not result['success']:
+        raise HTTPException(status_code=401, detail=result['message'])
+    
+    return result
+
+
+# ================== User Registration ==================
+
+@app.post("/api/users/register")
+async def register_user(
+    user_data: UserRegistrationRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Register a new user with full details"""
+    
+    result = await auth_service.register_user(
+        phone_number=user_data.phone_number,
+        name=user_data.name,
+        email=user_data.email,
+        age=user_data.age,
+        occupation=user_data.occupation,
+        password=user_data.password,
+        timezone=user_data.timezone,
+        db=db
+    )
+    
+    if not result['success']:
+        raise HTTPException(status_code=400, detail=result['message'])
+    
+    return result
+
+
 # ================== WhatsApp Webhook Endpoints ==================
 
 @app.get("/webhook")
 async def verify_webhook(
     hub_mode: str | None = None,
-    hub_verify_token: str | None= None,
+    hub_verify_token: str | None = None,
     hub_challenge: str | None = None
 ):
     """Verify WhatsApp webhook"""
@@ -179,7 +283,6 @@ async def handle_webhook(
 ):
     """Handle incoming WhatsApp messages"""
     
-    # Process webhook in background to return 200 quickly
     background_tasks.add_task(
         process_whatsapp_message,
         webhook,
@@ -213,9 +316,8 @@ async def process_whatsapp_message(webhook: IncomingWebhook, db: AsyncSession):
                         db=db
                     )
                     
-                    # Check if this is a search query or command
+                    # Handle different command types
                     if content.lower().startswith(("search:", "find:", "get:")):
-                        # Handle search query
                         search_result = await search_service.search(
                             user_phone=phone,
                             query=content.split(":", 1)[1].strip(),
@@ -224,18 +326,15 @@ async def process_whatsapp_message(webhook: IncomingWebhook, db: AsyncSession):
                         response = format_search_results(search_result)
                     
                     elif content.lower().startswith(("category:", "categories")):
-                        # Handle category management
                         response = await handle_category_command(phone, content, db)
                     
                     else:
-                        # Confirmation message for stored content
                         response = (
                             f"✓ Saved to '{result['category']}'!\n\n"
                             f"📊 Tags: {', '.join(result['tags'])}\n\n"
-                            f"💡 Tip: Search with 'search: your query' or manage categories with 'categories'"
+                            f"💡 Tip: Search with 'search: your query'"
                         )
                     
-                    # Send response via WhatsApp
                     await whatsapp_client.send_message(phone, response)
                     
     except Exception as e:
@@ -258,7 +357,6 @@ async def extract_message_content(message: Dict) -> tuple[str, Optional[str]]:
     elif message_type == "audio":
         audio_id = message.get("audio", {}).get("id")
         media_url = await whatsapp_client.get_media_url(audio_id)
-        # Transcribe audio using Cerebras or other service
         transcription = await cerebras_client.transcribe_audio(media_url)
         return transcription, media_url
     
@@ -266,7 +364,6 @@ async def extract_message_content(message: Dict) -> tuple[str, Optional[str]]:
         doc_id = message.get("document", {}).get("id")
         filename = message.get("document", {}).get("filename", "")
         media_url = await whatsapp_client.get_media_url(doc_id)
-        # Extract text from PDF/document
         from services.document_processor import extract_document_text
         text = await extract_document_text(media_url)
         return f"{filename}: {text}", media_url
@@ -281,7 +378,7 @@ async def capture_message(
     message: MessageCreate,
     db: AsyncSession = Depends(get_db)
 ):
-    """Manually capture a message (for testing/API access)"""
+    """Manually capture a message"""
     
     result = await message_processor.process(
         user_phone=message.user_phone,
@@ -321,7 +418,7 @@ async def search_messages(
     }
 
 
-# ================== Category Management Endpoints ==================
+# ================== Category Management ==================
 
 @app.post("/api/categories/manage")
 async def manage_categories(
@@ -331,10 +428,7 @@ async def manage_categories(
     """Manage user categories"""
     
     if operation.operation == "list":
-        categories = await category_manager.list_categories(
-            operation.user_phone,
-            db
-        )
+        categories = await category_manager.list_categories(operation.user_phone, db)
         return {"success": True, "categories": categories}
     
     elif operation.operation == "create":
@@ -367,106 +461,55 @@ async def manage_categories(
     raise HTTPException(status_code=400, detail="Invalid operation")
 
 
-async def handle_category_command(
-    phone: str,
-    content: str,
-    db: AsyncSession
-) -> str:
-    """Handle category-related commands from WhatsApp"""
-    
+async def handle_category_command(phone: str, content: str, db: AsyncSession) -> str:
+    """Handle category-related commands"""
     content_lower = content.lower()
     
     if content_lower == "categories":
-        # List all categories
         categories = await category_manager.list_categories(phone, db)
         if not categories:
-            return "You don't have any categories yet. They'll be created automatically as you send messages!"
+            return "You don't have any categories yet!"
         
         response = "📁 Your Categories:\n\n"
         for cat in categories:
             response += f"• {cat['name']} ({cat['count']} items)\n"
         return response
     
-    # Add more category commands as needed
-    return "Category command recognized. Available: 'categories' to list all."
+    return "Category command recognized. Use 'categories' to list all."
 
 
 def format_search_results(results: List[Dict]) -> str:
     """Format search results for WhatsApp"""
     if not results:
-        return "No results found. Try a different search term."
+        return "No results found."
     
     response = f"🔍 Found {len(results)} result(s):\n\n"
     
     for i, result in enumerate(results, 1):
-        response += f"{i}. "
-        response += f"[{result['category']}] "
-        response += f"{result['content'][:100]}{'...' if len(result['content']) > 100 else ''}\n"
+        response += f"{i}. [{result['category']}] "
+        response += f"{result['content'][:100]}...\n"
         response += f"   📅 {result['created_at']}\n\n"
     
     return response
 
 
-# ================== User Management ==================
-
-@app.post("/api/users/register")
-async def register_user(
-    user: UserRegistration,
-    db: AsyncSession = Depends(get_db)
-):
-    """Register a new user"""
-    
-    from sqlalchemy import select
-    
-    # Check if user exists
-    result = await db.execute(
-        select(User).where(User.phone_number == user.phone_number)
-    )
-    existing_user = result.scalar_one_or_none()
-    
-    if existing_user:
-        return {
-            "success": True,
-            "message": "User already registered",
-            "user_id": existing_user.id
-        }
-    
-    # Create new user
-    new_user = User(
-        phone_number=user.phone_number,
-        name=user.name,
-        timezone=user.timezone
-    )
-    db.add(new_user)
-    await db.commit()
-    await db.refresh(new_user)
-    
-    return {
-        "success": True,
-        "message": "User registered successfully",
-        "user_id": new_user.id
-    }
-
-
-# ================== Analytics Endpoints ==================
+# ================== Analytics ==================
 
 @app.get("/api/analytics/{phone_number}")
 async def get_user_analytics(
     phone_number: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get user analytics and statistics"""
+    """Get user analytics"""
     
     from sqlalchemy import select, func
     
-    # Total messages
     total_messages = await db.scalar(
         select(func.count(Message.id))
         .join(User)
         .where(User.phone_number == phone_number)
     )
     
-    # Messages by category
     category_stats = await db.execute(
         select(Category.name, func.count(Message.id))
         .join(Message.category)
@@ -475,7 +518,6 @@ async def get_user_analytics(
         .group_by(Category.name)
     )
     
-    # Messages by type
     type_stats = await db.execute(
         select(Message.message_type, func.count(Message.id))
         .join(User)
