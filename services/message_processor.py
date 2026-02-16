@@ -102,10 +102,12 @@ class MessageProcessor:
         user = result.scalar_one_or_none()
         
         if not user:
-            user = User(phone_number=phone_number)
-            db.add(user)
-            await db.commit()
-            await db.refresh(user)
+            # user = User(phone_number=phone_number)
+            # db.add(user)
+            # await db.commit()
+            # await db.refresh(user)
+
+            raise ValueError("User not registered")
         
         return user
     
