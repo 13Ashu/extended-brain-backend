@@ -376,37 +376,49 @@ async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
                     print(f"Error extracting document text: {e}")
             
             # Process the message
-            if content.lower().startswith(("search:", "find:", "get:")):
-                # Search command
-                search_result = await search_service.search(
-                    user_phone=user_id,
-                    query=content.split(":", 1)[1].strip(),
-                    db=db
-                )
-                response = format_search_results(search_result)
-            
-            elif content.lower().startswith(("category:", "categories")):
-                # Category command
-                response = await handle_category_command(user_id, content, db)
-            
-            else:
-                # Regular message - save it
-                result = await message_processor.process(
-                    user_phone=user_id,
-                    content=content,
-                    message_type=message_type,
-                    media_url=media_url,
-                    db=db
-                )
-                
+            try:
+                # Process the message
+                if content.lower().startswith(("search:", "find:", "get:")):
+                    search_result = await search_service.search(
+                        user_phone=user_id,
+                        query=content.split(":", 1)[1].strip(),
+                        db=db
+                    )
+                    response = format_search_results(search_result)
+
+                elif content.lower().startswith(("category:", "categories")):
+                    response = await handle_category_command(user_id, content, db)
+
+                else:
+                    result = await message_processor.process(
+                        user_phone=user_id,
+                        content=content,
+                        message_type=message_type,
+                        media_url=media_url,
+                        db=db
+                    )
+
+                    response = (
+                        f"✓ Saved to '{result['category']}'!\n\n"
+                        f"📊 Tags: {', '.join(result['tags'])}\n\n"
+                        f"💡 Tip: Search with 'search: your query'"
+                    )
+
+            except ValueError as e:
+                # 🚨 User not registered
                 response = (
-                    f"✓ Saved to '{result['category']}'!\n\n"
-                    f"📊 Tags: {', '.join(result['tags'])}\n\n"
-                    f"💡 Tip: Search with 'search: your query'"
+                    "🚫 You are not registered yet.\n\n"
+                    "Please register on the web app first.\n"
+                    "After registration, you can use this bot."
                 )
-            
-            # Send response back
+
+            except Exception as e:
+                print(f"Processing error: {e}")
+                response = "⚠ Something went wrong. Please try again."
+
+            # Always send response
             await messaging_client.send_message(user_id, response)
+
     
     except Exception as e:
         print(f"Error processing webhook: {e}")
