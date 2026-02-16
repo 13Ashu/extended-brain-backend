@@ -31,7 +31,7 @@ from cerebras_client import CerebrasClient
 from services.message_processor import MessageProcessor
 from services.search_service import SearchService
 from services.category_manager import CategoryManager
-from services.auth_service import AuthService
+from services.auth_service import AuthService, get_current_user
 
 
 # ================== Lifespan Events ==================
@@ -131,7 +131,6 @@ class LoginRequest(BaseModel):
 
 
 class MessageCreate(BaseModel):
-    user_phone: str
     content: str
     message_type: MessageTypeEnum = MessageTypeEnum.TEXT
     media_url: Optional[str] = None
@@ -139,14 +138,12 @@ class MessageCreate(BaseModel):
 
 
 class SearchQuery(BaseModel):
-    user_phone: str
     query: str
     limit: int = 10
     category_filter: Optional[List[str]] = None
 
 
 class CategoryOperation(BaseModel):
-    user_phone: str
     operation: str
     category_name: Optional[str] = None
     new_name: Optional[str] = None
@@ -431,18 +428,17 @@ async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
 @app.post("/api/messages/capture")
 async def capture_message(
     message: MessageCreate,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Manually capture a message"""
-    
     result = await message_processor.process(
-        user_phone=message.user_phone,
+        user_phone=current_user.phone_number,
         content=message.content,
         message_type=message.message_type,
         media_url=message.media_url,
         db=db
     )
-    
+
     return {
         "success": True,
         "message": "Content captured successfully",
@@ -450,21 +446,21 @@ async def capture_message(
     }
 
 
+
 @app.post("/api/search")
 async def search_messages(
     search: SearchQuery,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Search through user's knowledge base"""
-    
     results = await search_service.search(
-        user_phone=search.user_phone,
+        user_phone=current_user.phone_number,
         query=search.query,
         limit=search.limit,
         category_filter=search.category_filter,
         db=db
     )
-    
+
     return {
         "success": True,
         "query": search.query,
@@ -473,47 +469,50 @@ async def search_messages(
     }
 
 
+
 # ================== Category Management ==================
 
 @app.post("/api/categories/manage")
 async def manage_categories(
     operation: CategoryOperation,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Manage user categories"""
-    
+    phone = current_user.phone_number
+
     if operation.operation == "list":
-        categories = await category_manager.list_categories(operation.user_phone, db)
+        categories = await category_manager.list_categories(phone, db)
         return {"success": True, "categories": categories}
-    
+
     elif operation.operation == "create":
         result = await category_manager.create_category(
-            operation.user_phone,
+            phone,
             operation.category_name,
             operation.description,
             db
         )
         return {"success": True, "data": result}
-    
+
     elif operation.operation == "edit":
         result = await category_manager.edit_category(
-            operation.user_phone,
+            phone,
             operation.category_name,
             operation.new_name,
             operation.description,
             db
         )
         return {"success": True, "data": result}
-    
+
     elif operation.operation == "delete":
         result = await category_manager.delete_category(
-            operation.user_phone,
+            phone,
             operation.category_name,
             db
         )
         return {"success": True, "data": result}
-    
+
     raise HTTPException(status_code=400, detail="Invalid operation")
+
 
 
 async def handle_category_command(phone: str, content: str, db: AsyncSession) -> str:
@@ -550,11 +549,13 @@ def format_search_results(results: List[Dict]) -> str:
 
 # ================== Analytics ==================
 
-@app.get("/api/analytics/{phone_number}")
+@app.get("/api/analytics")
 async def get_user_analytics(
-    phone_number: str,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
+    phone_number = current_user.phone_number
+
     """Get user analytics"""
     
     from sqlalchemy import select, func
