@@ -1,6 +1,7 @@
 """
 Authentication Service
 Handles OTP generation, verification, and user authentication
+Updated for multi-platform support (WhatsApp/Telegram)
 """
 
 import random
@@ -13,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 from database import User, OTPVerification
+from messaging_interface import MessagingClient
 
 
 class AuthService:
@@ -20,10 +22,15 @@ class AuthService:
     
     OTP_EXPIRY_MINUTES = 10
     MAX_OTP_ATTEMPTS = 5
-    
-    def __init__(self, whatsapp_client=None):
-        """Initialize with optional WhatsApp client for sending OTP"""
-        self.whatsapp_client = whatsapp_client
+
+    def __init__(self, messaging_client: MessagingClient):
+        """
+        Initialize auth service with messaging client
+        
+        Args:
+            messaging_client: Platform-agnostic messaging client (WhatsApp or Telegram)
+        """
+        self.messaging_client = messaging_client
     
     @staticmethod
     def generate_otp(length: int = 6) -> str:
@@ -53,21 +60,23 @@ class AuthService:
         db: AsyncSession
     ) -> dict:
         """
-        Generate and send OTP to phone number
+        Generate and send OTP to phone number/chat_id
+        Works with both WhatsApp and Telegram
+        
+        Args:
+            phone_number: User identifier (phone number for WhatsApp, chat_id for Telegram)
+            db: Database session
         
         Returns:
-            dict: {'success': bool, 'message': str}
+            dict: {'success': bool, 'message': str, 'expires_in': int}
         """
         try:
             # Generate OTP
             otp_code = self.generate_otp()
             expires_at = datetime.utcnow() + timedelta(minutes=self.OTP_EXPIRY_MINUTES)
-            logger.info(f"This is the otp: {otp_code}")
+            logger.info(f"Generated OTP for {phone_number}: {otp_code}")
+            
             # Delete any existing OTPs for this number
-            await db.execute(
-                select(OTPVerification)
-                .where(OTPVerification.phone_number == phone_number)
-            )
             existing = await db.execute(
                 select(OTPVerification)
                 .where(OTPVerification.phone_number == phone_number)
@@ -84,18 +93,20 @@ class AuthService:
             db.add(otp_record)
             await db.commit()
             
-            # Send OTP via WhatsApp
-            if self.whatsapp_client:
+            # Send OTP via messaging platform
+            try:
                 message = (
-                    f"🧠 *Extended Brain Verification*\n\n"
-                    f"Your OTP code is: *{otp_code}*\n\n"
+                    f"🧠 Extended Brain Verification\n\n"
+                    f"Your OTP code is: {otp_code}\n\n"
                     f"This code will expire in {self.OTP_EXPIRY_MINUTES} minutes.\n"
                     f"Do not share this code with anyone."
                 )
-                await self.whatsapp_client.send_message(phone_number, message)
-            else:
-                # For development/testing - log the OTP
-                print(f"📱 OTP for {phone_number}: {otp_code}")
+                await self.messaging_client.send_message(phone_number, message)
+                logger.info(f"OTP sent to {phone_number} via messaging platform")
+            except Exception as e:
+                # If messaging fails, log the OTP for development
+                logger.warning(f"Failed to send OTP via messaging: {e}")
+                logger.info(f"📱 OTP for {phone_number}: {otp_code}")
             
             return {
                 'success': True,
@@ -104,7 +115,7 @@ class AuthService:
             }
             
         except Exception as e:
-            print(f"Error sending OTP: {e}")
+            logger.error(f"Error sending OTP: {e}")
             return {
                 'success': False,
                 'message': f'Failed to send OTP: {str(e)}'
@@ -118,6 +129,11 @@ class AuthService:
     ) -> dict:
         """
         Verify OTP code
+        
+        Args:
+            phone_number: User identifier
+            otp_code: OTP code to verify
+            db: Database session
         
         Returns:
             dict: {'success': bool, 'message': str, 'verified': bool}
@@ -160,6 +176,7 @@ class AuthService:
                 otp_record.is_verified = True
                 await db.commit()
                 
+                logger.info(f"OTP verified successfully for {phone_number}")
                 return {
                     'success': True,
                     'message': 'OTP verified successfully',
@@ -171,6 +188,7 @@ class AuthService:
                 await db.commit()
                 
                 remaining = self.MAX_OTP_ATTEMPTS - otp_record.attempts
+                logger.warning(f"Invalid OTP attempt for {phone_number}. {remaining} remaining.")
                 return {
                     'success': False,
                     'message': f'Invalid OTP. {remaining} attempts remaining.',
@@ -178,7 +196,7 @@ class AuthService:
                 }
                 
         except Exception as e:
-            print(f"Error verifying OTP: {e}")
+            logger.error(f"Error verifying OTP: {e}")
             return {
                 'success': False,
                 'message': f'Failed to verify OTP: {str(e)}',
@@ -190,7 +208,16 @@ class AuthService:
         phone_number: str,
         db: AsyncSession
     ) -> bool:
-        """Check if phone number has been verified via OTP"""
+        """
+        Check if phone number/chat_id has been verified via OTP
+        
+        Args:
+            phone_number: User identifier
+            db: Database session
+        
+        Returns:
+            bool: True if verified within last hour, False otherwise
+        """
         result = await db.execute(
             select(OTPVerification)
             .where(OTPVerification.phone_number == phone_number)
@@ -219,6 +246,16 @@ class AuthService:
     ) -> dict:
         """
         Register a new user after OTP verification
+        
+        Args:
+            phone_number: User identifier (phone or chat_id)
+            name: User's full name
+            email: User's email
+            age: User's age
+            occupation: User's occupation
+            password: User's password (will be hashed)
+            timezone: User's timezone
+            db: Database session
         
         Returns:
             dict: {'success': bool, 'message': str, 'user_id': int}
@@ -266,19 +303,23 @@ class AuthService:
             await db.commit()
             await db.refresh(new_user)
             
-            # Send welcome message via WhatsApp
-            if self.whatsapp_client:
+            # Send welcome message via messaging platform
+            try:
                 welcome_message = (
-                    f"🎉 *Welcome to Extended Brain, {name}!*\n\n"
+                    f"🎉 Welcome to Extended Brain, {name}!\n\n"
                     f"Your second brain is ready to capture your thoughts, ideas, and content.\n\n"
-                    f"*How to use:*\n"
+                    f"How to use:\n"
                     f"📝 Send any text, image, or audio\n"
                     f"🔍 Search with: 'search: your query'\n"
                     f"📁 View categories: 'categories'\n\n"
                     f"Start sending messages and I'll organize everything for you!"
                 )
-                await self.whatsapp_client.send_message(phone_number, welcome_message)
+                await self.messaging_client.send_message(phone_number, welcome_message)
+                logger.info(f"Welcome message sent to {phone_number}")
+            except Exception as e:
+                logger.warning(f"Failed to send welcome message: {e}")
             
+            logger.info(f"User registered successfully: {phone_number}")
             return {
                 'success': True,
                 'message': 'User registered successfully',
@@ -286,7 +327,7 @@ class AuthService:
             }
             
         except Exception as e:
-            print(f"Error registering user: {e}")
+            logger.error(f"Error registering user: {e}")
             await db.rollback()
             return {
                 'success': False,
@@ -302,8 +343,13 @@ class AuthService:
         """
         Authenticate user login
         
+        Args:
+            phone_number: User identifier
+            password: User's password
+            db: Database session
+        
         Returns:
-            dict: {'success': bool, 'message': str, 'user': User}
+            dict: {'success': bool, 'message': str, 'user': dict}
         """
         try:
             # Find user
@@ -313,6 +359,7 @@ class AuthService:
             user = result.scalar_one_or_none()
             
             if not user:
+                logger.warning(f"Login attempt with invalid phone: {phone_number}")
                 return {
                     'success': False,
                     'message': 'Invalid phone number or password'
@@ -320,6 +367,7 @@ class AuthService:
             
             # Verify password
             if not self.verify_password(password, user.password_hash):
+                logger.warning(f"Login attempt with invalid password: {phone_number}")
                 return {
                     'success': False,
                     'message': 'Invalid phone number or password'
@@ -329,6 +377,7 @@ class AuthService:
             user.last_login = datetime.utcnow()
             await db.commit()
             
+            logger.info(f"User logged in successfully: {phone_number}")
             return {
                 'success': True,
                 'message': 'Login successful',
@@ -342,8 +391,55 @@ class AuthService:
             }
             
         except Exception as e:
-            print(f"Error during login: {e}")
+            logger.error(f"Error during login: {e}")
             return {
                 'success': False,
                 'message': f'Login failed: {str(e)}'
+            }
+    
+    async def send_notification(
+        self,
+        phone_number: str,
+        message: str,
+        db: AsyncSession
+    ) -> dict:
+        """
+        Send a notification message to a user
+        Platform-agnostic helper method
+        
+        Args:
+            phone_number: User identifier
+            message: Message to send
+            db: Database session
+        
+        Returns:
+            dict: {'success': bool, 'message': str}
+        """
+        try:
+            # Verify user exists
+            result = await db.execute(
+                select(User).where(User.phone_number == phone_number)
+            )
+            user = result.scalar_one_or_none()
+            
+            if not user:
+                return {
+                    'success': False,
+                    'message': 'User not found'
+                }
+            
+            # Send message
+            await self.messaging_client.send_message(phone_number, message)
+            
+            logger.info(f"Notification sent to {phone_number}")
+            return {
+                'success': True,
+                'message': 'Notification sent successfully'
+            }
+            
+        except Exception as e:
+            logger.error(f"Error sending notification: {e}")
+            return {
+                'success': False,
+                'message': f'Failed to send notification: {str(e)}'
             }

@@ -225,6 +225,8 @@ async def main():
     
     # Get base URL from command line or use default
     base_url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
+
+    base_url = 'https://extended-brain-backend-production.up.railway.app'
     
     print(f"\n🚀 Starting tests against: {base_url}")
     print("Make sure your API is running!\n")
