@@ -1,14 +1,15 @@
 """
 Extended Brain - Main FastAPI Application
+Multi-platform messaging support (WhatsApp/Telegram)
 WhatsApp-powered knowledge base with Cerebras AI and PostgreSQL
-Updated with full authentication and user registration
+Updated with platform abstraction and Telegram support
 """
 
 # IMPORTANT: Load environment variables FIRST
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List, Dict, Any
@@ -18,11 +19,15 @@ from contextlib import asynccontextmanager
 import os
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# Import configuration and messaging
+from config import Config, MessagingPlatform
+from messaging_factory import create_messaging_client, get_platform_name
+from messaging_interface import MessagingClient
+
 # Import our modules
 from database import get_db, init_db
 from models import User, Message, Category, MessageType
 from cerebras_client import CerebrasClient
-from whatsapp import WhatsAppClient
 from services.message_processor import MessageProcessor
 from services.search_service import SearchService
 from services.category_manager import CategoryManager
@@ -36,8 +41,19 @@ async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown"""
     # Startup
     print("🚀 Starting Extended Brain API...")
+    print(f"📱 Messaging Platform: {get_platform_name().upper()}")
+    
     await init_db()
     print("✓ Database initialized")
+    
+    # Setup webhook if Telegram
+    if Config.get_messaging_platform() == MessagingPlatform.TELEGRAM and Config.TELEGRAM_WEBHOOK_URL:
+        try:
+            result = await messaging_client.setup_webhook(Config.TELEGRAM_WEBHOOK_URL)
+            print(f"✓ Telegram webhook configured: {result}")
+        except Exception as e:
+            print(f"⚠ Telegram webhook setup failed: {e}")
+    
     print("✓ Extended Brain API started successfully")
     
     yield  # Application runs here
@@ -50,8 +66,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Extended Brain API",
-    description="WhatsApp-powered AI knowledge base with Cerebras and PostgreSQL",
-    version="2.0.0",
+    description="Multi-platform AI knowledge base with Cerebras and PostgreSQL (WhatsApp/Telegram)",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -68,15 +84,12 @@ app.add_middleware(
 )
 
 # Initialize services
-cerebras_client = CerebrasClient(api_key=os.getenv("CEREBRAS_API_KEY"))
-whatsapp_client = WhatsAppClient(
-    access_token=os.getenv("WHATSAPP_ACCESS_TOKEN"),
-    phone_number_id=os.getenv("WHATSAPP_PHONE_NUMBER_ID")
-)
+cerebras_client = CerebrasClient(api_key=Config.CEREBRAS_API_KEY)
+messaging_client: MessagingClient = create_messaging_client()
 message_processor = MessageProcessor(cerebras_client)
 search_service = SearchService(cerebras_client)
 category_manager = CategoryManager(cerebras_client)
-auth_service = AuthService(whatsapp_client)
+auth_service = AuthService(messaging_client)
 
 
 # ================== Pydantic Models ==================
@@ -117,12 +130,6 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class IncomingWebhook(BaseModel):
-    """WhatsApp webhook payload"""
-    object: str
-    entry: List[Dict[str, Any]]
-
-
 class MessageCreate(BaseModel):
     user_phone: str
     content: str
@@ -153,15 +160,17 @@ async def root():
     """API root endpoint"""
     return {
         "message": "Extended Brain API",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "status": "active",
+        "messaging_platform": get_platform_name(),
         "features": [
-            "WhatsApp Integration",
+            f"{get_platform_name().capitalize()} Integration",
             "AI-Powered Categorization",
             "Semantic Search",
             "Multi-format Support (Text/Image/Audio/PDF)",
             "Dynamic Category Management",
-            "OTP Authentication"
+            "OTP Authentication",
+            "Multi-Platform Support"
         ]
     }
 
@@ -172,10 +181,11 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
+        "platform": get_platform_name(),
         "services": {
             "database": "connected",
             "cerebras": "active",
-            "whatsapp": "active"
+            "messaging": "active"
         }
     }
 
@@ -260,14 +270,17 @@ async def register_user(
 
 # ================== WhatsApp Webhook Endpoints ==================
 
-@app.get("/webhook")
-async def verify_webhook(
+@app.get("/webhook/whatsapp")
+async def verify_whatsapp_webhook(
     hub_mode: str | None = None,
     hub_verify_token: str | None = None,
     hub_challenge: str | None = None
 ):
     """Verify WhatsApp webhook"""
-    verify_token = os.getenv("WHATSAPP_VERIFY_TOKEN", "your_verify_token")
+    if Config.get_messaging_platform() != MessagingPlatform.WHATSAPP:
+        raise HTTPException(status_code=400, detail="WhatsApp not configured")
+    
+    verify_token = Config.WHATSAPP_VERIFY_TOKEN
     
     if hub_mode == "subscribe" and hub_verify_token == verify_token:
         return int(hub_challenge)
@@ -275,100 +288,130 @@ async def verify_webhook(
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
-@app.post("/webhook")
-async def handle_webhook(
-    webhook: IncomingWebhook,
+@app.post("/webhook/whatsapp")
+async def handle_whatsapp_webhook(
+    request: Request,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
     """Handle incoming WhatsApp messages"""
+    if Config.get_messaging_platform() != MessagingPlatform.WHATSAPP:
+        raise HTTPException(status_code=400, detail="WhatsApp not configured")
+    
+    webhook_data = await request.json()
     
     background_tasks.add_task(
-        process_whatsapp_message,
-        webhook,
+        process_webhook_message,
+        webhook_data,
         db
     )
     
     return {"status": "received"}
 
 
-async def process_whatsapp_message(webhook: IncomingWebhook, db: AsyncSession):
-    """Process incoming WhatsApp message"""
+# ================== Telegram Webhook Endpoint ==================
+
+@app.post("/webhook/telegram")
+async def handle_telegram_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """Handle incoming Telegram messages"""
+    if Config.get_messaging_platform() != MessagingPlatform.TELEGRAM:
+        raise HTTPException(status_code=400, detail="Telegram not configured")
+    
+    webhook_data = await request.json()
+    
+    background_tasks.add_task(
+        process_webhook_message,
+        webhook_data,
+        db
+    )
+    
+    return {"ok": True}
+
+
+# ================== Unified Message Processing ==================
+
+async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
+    """Process incoming message from any platform"""
     try:
-        for entry in webhook.entry:
-            for change in entry.get("changes", []):
-                value = change.get("value", {})
-                messages = value.get("messages", [])
+        # Extract messages using platform-specific logic
+        messages = messaging_client.extract_message_data(webhook_data)
+        
+        for msg_data in messages:
+            user_id = msg_data["user_id"]
+            content = msg_data["content"]
+            message_type = msg_data["message_type"]
+            message_id = msg_data["message_id"]
+            metadata = msg_data.get("metadata", {})
+            
+            # Get media URL if applicable
+            media_url = None
+            if metadata.get("media_id") or metadata.get("file_id"):
+                media_id = metadata.get("media_id") or metadata.get("file_id")
+                try:
+                    media_url = await messaging_client.get_media_url(media_id)
+                except Exception as e:
+                    print(f"Error getting media URL: {e}")
+            
+            # Handle audio transcription
+            if message_type == "audio" and media_url:
+                try:
+                    transcription = await cerebras_client.transcribe_audio(media_url)
+                    content = transcription
+                except Exception as e:
+                    print(f"Error transcribing audio: {e}")
+                    content = "[Audio - transcription failed]"
+            
+            # Handle document text extraction
+            if message_type == "document" and media_url:
+                try:
+                    from services.document_processor import extract_document_text
+                    text = await extract_document_text(media_url)
+                    filename = metadata.get("file_name", "document")
+                    content = f"{filename}: {text}"
+                except Exception as e:
+                    print(f"Error extracting document text: {e}")
+            
+            # Process the message
+            if content.lower().startswith(("search:", "find:", "get:")):
+                # Search command
+                search_result = await search_service.search(
+                    user_phone=user_id,
+                    query=content.split(":", 1)[1].strip(),
+                    db=db
+                )
+                response = format_search_results(search_result)
+            
+            elif content.lower().startswith(("category:", "categories")):
+                # Category command
+                response = await handle_category_command(user_id, content, db)
+            
+            else:
+                # Regular message - save it
+                result = await message_processor.process(
+                    user_phone=user_id,
+                    content=content,
+                    message_type=message_type,
+                    media_url=media_url,
+                    db=db
+                )
                 
-                for message in messages:
-                    phone = message.get("from")
-                    message_type = message.get("type")
-                    
-                    # Extract content based on message type
-                    content, media_url = await extract_message_content(message)
-                    
-                    # Process the message
-                    result = await message_processor.process(
-                        user_phone=phone,
-                        content=content,
-                        message_type=message_type,
-                        media_url=media_url,
-                        db=db
-                    )
-                    
-                    # Handle different command types
-                    if content.lower().startswith(("search:", "find:", "get:")):
-                        search_result = await search_service.search(
-                            user_phone=phone,
-                            query=content.split(":", 1)[1].strip(),
-                            db=db
-                        )
-                        response = format_search_results(search_result)
-                    
-                    elif content.lower().startswith(("category:", "categories")):
-                        response = await handle_category_command(phone, content, db)
-                    
-                    else:
-                        response = (
-                            f"✓ Saved to '{result['category']}'!\n\n"
-                            f"📊 Tags: {', '.join(result['tags'])}\n\n"
-                            f"💡 Tip: Search with 'search: your query'"
-                        )
-                    
-                    await whatsapp_client.send_message(phone, response)
-                    
+                response = (
+                    f"✓ Saved to '{result['category']}'!\n\n"
+                    f"📊 Tags: {', '.join(result['tags'])}\n\n"
+                    f"💡 Tip: Search with 'search: your query'"
+                )
+            
+            # Send response back
+            await messaging_client.send_message(user_id, response)
+    
     except Exception as e:
         print(f"Error processing webhook: {e}")
-
-
-async def extract_message_content(message: Dict) -> tuple[str, Optional[str]]:
-    """Extract content and media URL from WhatsApp message"""
-    message_type = message.get("type")
-    
-    if message_type == "text":
-        return message.get("text", {}).get("body", ""), None
-    
-    elif message_type == "image":
-        image_id = message.get("image", {}).get("id")
-        caption = message.get("image", {}).get("caption", "")
-        media_url = await whatsapp_client.get_media_url(image_id)
-        return caption or "[Image]", media_url
-    
-    elif message_type == "audio":
-        audio_id = message.get("audio", {}).get("id")
-        media_url = await whatsapp_client.get_media_url(audio_id)
-        transcription = await cerebras_client.transcribe_audio(media_url)
-        return transcription, media_url
-    
-    elif message_type == "document":
-        doc_id = message.get("document", {}).get("id")
-        filename = message.get("document", {}).get("filename", "")
-        media_url = await whatsapp_client.get_media_url(doc_id)
-        from services.document_processor import extract_document_text
-        text = await extract_document_text(media_url)
-        return f"{filename}: {text}", media_url
-    
-    return "", None
+        import traceback
+        traceback.print_exc()
 
 
 # ================== Message Management Endpoints ==================
@@ -479,7 +522,7 @@ async def handle_category_command(phone: str, content: str, db: AsyncSession) ->
 
 
 def format_search_results(results: List[Dict]) -> str:
-    """Format search results for WhatsApp"""
+    """Format search results for messaging"""
     if not results:
         return "No results found."
     
@@ -533,6 +576,35 @@ async def get_user_analytics(
     }
 
 
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
+# ================== Webhook Info ==================
+
+@app.get("/api/webhook/info")
+async def get_webhook_info():
+    """Get webhook configuration information"""
+    
+    platform = Config.get_messaging_platform()
+    
+    if platform == MessagingPlatform.WHATSAPP:
+        return {
+            "platform": "whatsapp",
+            "webhook_endpoint": "/webhook/whatsapp",
+            "verify_token": Config.WHATSAPP_VERIFY_TOKEN,
+            "instructions": "Configure in Meta Business Suite > WhatsApp > Configuration > Webhooks"
+        }
+    
+    elif platform == MessagingPlatform.TELEGRAM:
+        try:
+            info = await messaging_client.get_webhook_info()
+            return {
+                "platform": "telegram",
+                "webhook_endpoint": "/webhook/telegram",
+                "current_webhook": info.get("result", {}),
+                "configured_url": Config.TELEGRAM_WEBHOOK_URL
+            }
+        except:
+            return {
+                "platform": "telegram",
+                "webhook_endpoint": "/webhook/telegram",
+                "configured_url": Config.TELEGRAM_WEBHOOK_URL,
+                "status": "not_configured"
+            }
