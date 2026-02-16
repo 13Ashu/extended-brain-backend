@@ -15,6 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 from database import User, OTPVerification
 from messaging_interface import MessagingClient
+import jwt
+from config import Config
 
 
 class AuthService:
@@ -54,6 +56,22 @@ class AuthService:
         except:
             return False
     
+    def create_access_token(self, user_id: int) -> str:
+        payload = {
+            "sub": str(user_id),
+            "iat": datetime.utcnow(),
+            "exp": datetime.utcnow() + timedelta(days=7)
+        }
+
+        token = jwt.encode(
+            payload,
+            Config.JWT_SECRET,
+            algorithm="HS256"
+        )
+
+        return token
+
+
     async def send_otp(
         self,
         phone_number: str,
@@ -320,11 +338,24 @@ class AuthService:
                 logger.warning(f"Failed to send welcome message: {e}")
             
             logger.info(f"User registered successfully: {phone_number}")
+
+            access_token = self.create_access_token(new_user.id)
+
             return {
                 'success': True,
                 'message': 'User registered successfully',
-                'user_id': new_user.id
+                'data': {
+                    'access_token': access_token,
+                    'user': {
+                        'id': new_user.id,
+                        'phone_number': new_user.phone_number,
+                        'name': new_user.name,
+                        'email': new_user.email,
+                        'timezone': new_user.timezone
+                    }
+                }
             }
+
             
         except Exception as e:
             logger.error(f"Error registering user: {e}")
@@ -378,17 +409,23 @@ class AuthService:
             await db.commit()
             
             logger.info(f"User logged in successfully: {phone_number}")
+            access_token = self.create_access_token(user.id)
+
             return {
                 'success': True,
                 'message': 'Login successful',
-                'user': {
-                    'id': user.id,
-                    'phone_number': user.phone_number,
-                    'name': user.name,
-                    'email': user.email,
-                    'timezone': user.timezone
+                'data': {
+                    'access_token': access_token,
+                    'user': {
+                        'id': user.id,
+                        'phone_number': user.phone_number,
+                        'name': user.name,
+                        'email': user.email,
+                        'timezone': user.timezone
+                    }
                 }
             }
+
             
         except Exception as e:
             logger.error(f"Error during login: {e}")
