@@ -4,6 +4,7 @@ uvicorn[standard]
 pydantic
 pydantic-settings
 python-multipart
+jwt
 
 # Database
 sqlalchemy
