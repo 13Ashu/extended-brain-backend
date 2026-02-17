@@ -18,7 +18,7 @@ def create_messaging_client() -> MessagingClient:
     platform = Config.get_messaging_platform()
     
     if platform == MessagingPlatform.WHATSAPP:
-        from whatsapp_updated import WhatsAppClient
+        from whatsapp import WhatsAppClient
         
         client = WhatsAppClient(
             access_token=Config.WHATSAPP_ACCESS_TOKEN,
