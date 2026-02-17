@@ -12,7 +12,7 @@ import hashlib
 import secrets
 import os
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
@@ -324,6 +324,18 @@ class AuthService:
                 }
             }
         }
+
+    async def reset_password(self, phone_number: str, new_password: str, db: AsyncSession):
+        
+        user = await db.scalar(select(User).where(User.phone_number == phone_number))
+        if not user:
+            return {"success": False, "message": "No account found with this phone number"}
+        
+        hashed = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+        await db.execute(update(User).where(User.phone_number == phone_number).values(password_hash=hashed))
+        await db.commit()
+        
+        return {"success": True, "message": "Password reset successfully"}
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
