@@ -129,6 +129,9 @@ class LoginRequest(BaseModel):
     phone_number: str
     password: str
 
+class ForgotPasswordRequest(BaseModel):
+    phone_number: str
+    new_password: str = Field(..., min_length=6)
 
 class MessageCreate(BaseModel):
     content: str
@@ -239,6 +242,20 @@ async def login(
     return result
 
 
+
+@app.post("/api/auth/forgot-password")
+async def forgot_password(
+    request: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    result = await auth_service.reset_password(
+        phone_number=request.phone_number,
+        new_password=request.new_password,
+        db=db
+    )
+    if not result['success']:
+        raise HTTPException(status_code=400, detail=result['message'])
+    return result
 # ================== User Registration ==================
 
 @app.post("/api/users/register")
