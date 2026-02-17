@@ -332,8 +332,12 @@ class AuthService:
         if not user:
             return {"success": False, "message": "No account found with this phone number"}
         
-        hashed = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-        await db.execute(update(User).where(User.phone_number == phone_number).values(password_hash=hashed))
+        new_hash = self.hash_password(new_password)
+        await db.execute(
+            update(User)
+            .where(User.phone_number == phone_number)
+            .values(password_hash=new_hash)
+        )
         await db.commit()
         
         return {"success": True, "message": "Password reset successfully"}
