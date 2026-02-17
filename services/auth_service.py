@@ -9,7 +9,6 @@ import string
 from datetime import datetime, timedelta
 from typing import Optional
 import hashlib
-import bcrypt
 import secrets
 import os
 
@@ -327,11 +326,11 @@ class AuthService:
         }
 
     async def reset_password(self, phone_number: str, new_password: str, db: AsyncSession):
-        
         user = await db.scalar(select(User).where(User.phone_number == phone_number))
         if not user:
             return {"success": False, "message": "No account found with this phone number"}
         
+        # Use the same hash_password as register_user and login_user
         new_hash = self.hash_password(new_password)
         await db.execute(
             update(User)
