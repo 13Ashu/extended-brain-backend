@@ -21,6 +21,8 @@ class Config:
     
     # Messaging Platform Selection
     MESSAGING_PLATFORM = os.getenv("MESSAGING_PLATFORM", "telegram").lower()
+
+    ENABLE_OTP = os.getenv("ENABLE_OTP", "false").lower() == "true"
     
     # WhatsApp Configuration
     WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")

@@ -69,6 +69,13 @@ class AuthService:
         return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
     async def send_otp(self, phone_number: str, db: AsyncSession) -> dict:
+
+        if not Config.ENABLE_OTP:
+            return {
+                "success": True,
+                "message": "OTP disabled (dev mode)",
+                "expires_in": 0
+            }
         try:
             otp_code = self.generate_otp()
             expires_at = datetime.utcnow() + timedelta(
@@ -125,6 +132,14 @@ class AuthService:
         otp_code: str,
         db: AsyncSession
     ) -> dict:
+        
+        if not Config.ENABLE_OTP:
+            return {
+                "success": True,
+                "message": "OTP verification skipped (dev mode)",
+                "verified": True
+            }
+    
         try:
             result = await db.execute(
                 select(OTPVerification)
@@ -237,6 +252,78 @@ class AuthService:
                 "message": str(e)
             }
 
+    async def register_user(
+        self,
+        phone_number: str,
+        name: str,
+        email: str,
+        age: int,
+        occupation: str,
+        password: str,
+        timezone: str = "UTC",
+        db: AsyncSession = None
+    ) -> dict:
+        """
+        Register a new user.
+        OTP verification is optional based on Config.ENABLE_OTP.
+        """
+
+        # Check if user already exists
+        result = await db.execute(
+            select(User).where(User.phone_number == phone_number)
+        )
+        existing_user = result.scalar_one_or_none()
+        if existing_user:
+            return {"success": False, "message": "User already exists"}
+
+        # If OTP is enabled, verify it first
+        if Config.ENABLE_OTP:
+            otp_result = await db.execute(
+                select(OTPVerification)
+                .where(OTPVerification.phone_number == phone_number)
+                .where(OTPVerification.is_verified == True)
+            )
+            otp_verified = otp_result.scalar_one_or_none()
+            if not otp_verified:
+                return {"success": False, "message": "OTP verification required"}
+
+        # Hash the password
+        password_hash = self.hash_password(password)
+
+        # Create the new user
+        new_user = User(
+            name=name,
+            email=email,
+            age=age,
+            occupation=occupation,
+            phone_number=phone_number,
+            password_hash=password_hash,
+            timezone=timezone,
+            created_at=datetime.utcnow(),
+            last_login=None
+        )
+
+        db.add(new_user)
+        await db.commit()
+        await db.refresh(new_user)
+
+        # Generate access token
+        access_token = self.create_access_token(new_user.id)
+
+        return {
+            "success": True,
+            "message": "User registered successfully",
+            "data": {
+                "access_token": access_token,
+                "user": {
+                    "id": new_user.id,
+                    "phone_number": new_user.phone_number,
+                    "name": new_user.name,
+                    "email": new_user.email,
+                    "timezone": new_user.timezone
+                }
+            }
+        }
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
