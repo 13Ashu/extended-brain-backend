@@ -31,5 +31,6 @@ python-jose[cryptography]
 passlib[bcrypt]
 loguru
 
+
 sentence-transformers==3.0.1
 pgvector==0.3.2
