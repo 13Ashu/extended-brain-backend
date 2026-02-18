@@ -30,3 +30,6 @@ python-docx
 python-jose[cryptography]
 passlib[bcrypt]
 loguru
+
+sentence-transformers
+pgvector

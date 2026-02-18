@@ -82,6 +82,9 @@ class MessageProcessor:
         db.add(message)
         await db.commit()
         await db.refresh(message)
+
+        # ===== STEP 4: GENERATE & SAVE EMBEDDING =====
+        await self._save_embedding(message.id, content, understanding, db)
         
         return {
             "message_id": message.id,
@@ -293,3 +296,32 @@ Return JSON:
             select(Category).where(Category.user_id == user_id)
         )
         return list(result.scalars().all())
+    
+    async def _save_embedding(
+        self,
+        message_id: int,
+        content: str,
+        understanding: Dict,
+        db: AsyncSession
+    ):
+        """Generate and store vector embedding for semantic search"""
+        try:
+            from services.embedding_service import embedding_service
+            from sqlalchemy import update
+            
+            # Combine content + essence for richer embedding
+            # e.g. "chidiya marriage 24 feb" + "Wedding event for Chidiya on February 24th"
+            text_to_embed = f"{content} {understanding.get('essence', '')}".strip()
+            
+            embedding = embedding_service.embed(text_to_embed)
+            
+            await db.execute(
+                update(Message)
+                .where(Message.id == message_id)
+                .values(embedding=embedding)
+            )
+            await db.commit()
+            
+        except Exception as e:
+            print(f"⚠ Embedding failed (non-critical): {e}")
+            # Never block the main save flow
