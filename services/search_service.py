@@ -33,7 +33,7 @@ class SearchService:
         db: AsyncSession,
         limit: int = 15,
         category_filter: Optional[List[str]] = None,
-    ) -> List[Dict]:
+    ) -> Dict:
         """
         Natural language search with intelligence:
         
@@ -70,7 +70,15 @@ class SearchService:
         )
         
         # Return top results
-        return ranked[:limit]
+        ranked_results = ranked[:limit]
+
+        # Generate natural response
+        natural_response = await self._generate_natural_response(query, ranked_results)
+
+        return {
+            "results": ranked_results,
+            "natural_response": natural_response
+        }
     
     async def _understand_search_query(
         self,
@@ -190,7 +198,6 @@ Think: What is the user REALLY trying to find?
             message._semantic_score = semantic_hits.get(message.id, 0.0)
         
         return [(m, c) for m, c in rows]
-
 
     async def _rank_by_relevance(
         self,
@@ -341,3 +348,36 @@ Think: What is the user REALLY trying to find?
             select(Category.name).where(Category.user_id == user_id)
         )
         return [row[0] for row in result.all()]
+    
+    async def _generate_natural_response(
+        self,
+        query: str,
+        results: List[Dict]
+    ) -> str:
+        """Use LLM to generate a natural language response from search results"""
+        
+        if not results:
+            return "I couldn't find anything related to that in your notes."
+        
+        # Prepare context from top results
+        context = ""
+        for i, r in enumerate(results[:5], 1):
+            context += f"\n[{r['category']}] {r['content']}\n"
+        
+        prompt = f"""You are a personal assistant helping someone retrieve info from their notes.
+
+    USER ASKED: "{query}"
+
+    RELEVANT NOTES FOUND:
+    {context}
+
+    Answer the user's question directly and naturally based on their notes.
+    - Be concise and conversational
+    - Answer their specific question directly
+    - If multiple relevant items exist, mention them briefly
+    - Don't say "based on your notes" or "I found" — just answer naturally
+    - Keep it under 3-4 lines
+
+    Reply:"""
+        
+        return await self.cerebras._chat_completion(prompt, max_tokens=200, temperature=0.4)
