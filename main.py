@@ -76,6 +76,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
+        "http://localhost:8080",
         "https://your-digital-mind.vercel.app"
     ],
     allow_credentials=True,
@@ -129,9 +130,17 @@ class LoginRequest(BaseModel):
     phone_number: str
     password: str
 
+
 class ForgotPasswordRequest(BaseModel):
     phone_number: str
     new_password: str = Field(..., min_length=6)
+
+
+class TelegramLinkRequest(BaseModel):
+    """Link Telegram chat ID to user account"""
+    phone_number: str
+    telegram_chat_id: str
+
 
 class MessageCreate(BaseModel):
     content: str
@@ -242,12 +251,12 @@ async def login(
     return result
 
 
-
 @app.post("/api/auth/forgot-password")
 async def forgot_password(
     request: ForgotPasswordRequest,
     db: AsyncSession = Depends(get_db)
 ):
+    """Reset user password"""
     result = await auth_service.reset_password(
         phone_number=request.phone_number,
         new_password=request.new_password,
@@ -256,6 +265,29 @@ async def forgot_password(
     if not result['success']:
         raise HTTPException(status_code=400, detail=result['message'])
     return result
+
+
+@app.post("/api/auth/link-telegram")
+async def link_telegram(
+    request: TelegramLinkRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Link Telegram chat ID to user account"""
+    from sqlalchemy import select
+    
+    user = await db.scalar(
+        select(User).where(User.phone_number == request.phone_number)
+    )
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user.telegram_chat_id = request.telegram_chat_id
+    await db.commit()
+    
+    return {"success": True, "message": "Telegram linked successfully"}
+
+
 # ================== User Registration ==================
 
 @app.post("/api/users/register")
@@ -351,15 +383,101 @@ async def handle_telegram_webhook(
 async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
     """Process incoming message from any platform"""
     try:
+        from sqlalchemy import select
+        
         # Extract messages using platform-specific logic
         messages = messaging_client.extract_message_data(webhook_data)
         
         for msg_data in messages:
-            user_id = msg_data["user_id"]
+            chat_id = msg_data["user_id"]  # Telegram chat_id or WhatsApp phone
             content = msg_data["content"]
             message_type = msg_data["message_type"]
             message_id = msg_data["message_id"]
             metadata = msg_data.get("metadata", {})
+            
+            # Check if this chat_id is linked to a registered user
+            if Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                result = await db.execute(
+                    select(User).where(User.telegram_chat_id == chat_id)
+                )
+            else:  # WhatsApp uses phone number directly
+                result = await db.execute(
+                    select(User).where(User.phone_number == chat_id)
+                )
+            
+            user = result.scalar_one_or_none()
+            
+            # Handle /start command
+            if content.lower().strip() == "/start":
+                if user:
+                    response = (
+                        f"👋 Welcome back, {user.name}!\n\n"
+                        f"Your Extended Brain is ready.\n\n"
+                        f"📝 Send me anything:\n"
+                        f"• Text notes\n"
+                        f"• Voice messages\n"
+                        f"• Images\n"
+                        f"• Documents\n\n"
+                        f"🔍 Commands:\n"
+                        f"• search: <query> - Find your notes\n"
+                        f"• categories - View all categories"
+                    )
+                else:
+                    response = (
+                        f"👋 Welcome to Extended Brain!\n\n"
+                        f"To get started:\n"
+                        f"1. Register at: https://your-digital-mind.vercel.app\n"
+                        f"2. Link your Telegram by sending:\n"
+                        f"   /link +919876543210\n\n"
+                        f"(Replace with your registered phone number)"
+                    )
+                await messaging_client.send_message(chat_id, response)
+                continue
+            
+            # Handle /link command (Telegram only)
+            if content.lower().startswith("/link"):
+                parts = content.split()
+                if len(parts) != 2:
+                    response = "Usage: /link +919876543210"
+                    await messaging_client.send_message(chat_id, response)
+                    continue
+                
+                phone = parts[1].strip()
+                
+                # Find user by phone
+                user_to_link = await db.scalar(
+                    select(User).where(User.phone_number == phone)
+                )
+                
+                if not user_to_link:
+                    response = f"❌ No account found with {phone}\n\nPlease register first at:\nhttps://your-digital-mind.vercel.app"
+                else:
+                    user_to_link.telegram_chat_id = chat_id
+                    await db.commit()
+                    response = f"✅ Account linked!\n\nHi {user_to_link.name}, you can now start using Extended Brain.\n\nSend me anything to save it!"
+                
+                await messaging_client.send_message(chat_id, response)
+                continue
+            
+            # Block unregistered/unlinked users
+            if not user:
+                if Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                    response = (
+                        "🚫 Please link your account first.\n\n"
+                        "Send: /link +919876543210\n"
+                        "(with your registered phone number)"
+                    )
+                else:
+                    response = (
+                        "🚫 You are not registered yet.\n\n"
+                        "Please register on the web app first.\n"
+                        "After registration, you can use this bot."
+                    )
+                await messaging_client.send_message(chat_id, response)
+                continue
+            
+            # FROM HERE ON, USER IS REGISTERED AND LINKED
+            user_phone = user.phone_number
             
             # Get media URL if applicable
             media_url = None
@@ -391,21 +509,20 @@ async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
             
             # Process the message
             try:
-                # Process the message
                 if content.lower().startswith(("search:", "find:", "get:")):
                     search_result = await search_service.search(
-                        user_phone=user_id,
+                        user_phone=user_phone,
                         query=content.split(":", 1)[1].strip(),
                         db=db
                     )
                     response = format_search_results(search_result)
 
                 elif content.lower().startswith(("category:", "categories")):
-                    response = await handle_category_command(user_id, content, db)
+                    response = await handle_category_command(user_phone, content, db)
 
                 else:
                     result = await message_processor.process(
-                        user_phone=user_id,
+                        user_phone=user_phone,
                         content=content,
                         message_type=message_type,
                         media_url=media_url,
@@ -418,21 +535,14 @@ async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
                         f"💡 Tip: Search with 'search: your query'"
                     )
 
-            except ValueError as e:
-                # 🚨 User not registered
-                response = (
-                    "🚫 You are not registered yet.\n\n"
-                    "Please register on the web app first.\n"
-                    "After registration, you can use this bot."
-                )
-
             except Exception as e:
                 print(f"Processing error: {e}")
+                import traceback
+                traceback.print_exc()
                 response = "⚠ Something went wrong. Please try again."
 
-            # Always send response
-            await messaging_client.send_message(user_id, response)
-
+            # Send response
+            await messaging_client.send_message(chat_id, response)
     
     except Exception as e:
         print(f"Error processing webhook: {e}")
@@ -463,7 +573,6 @@ async def capture_message(
     }
 
 
-
 @app.post("/api/search")
 async def search_messages(
     search: SearchQuery,
@@ -484,7 +593,6 @@ async def search_messages(
         "results": results,
         "total": len(results)
     }
-
 
 
 # ================== Category Management ==================
@@ -529,7 +637,6 @@ async def manage_categories(
         return {"success": True, "data": result}
 
     raise HTTPException(status_code=400, detail="Invalid operation")
-
 
 
 async def handle_category_command(phone: str, content: str, db: AsyncSession) -> str:
