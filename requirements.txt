@@ -34,3 +34,4 @@ loguru
 
 # AI/Embeddings
 fastembed
+pgvector
