@@ -79,7 +79,7 @@ class CerebrasClient:
         content: str,
         existing_categories: List[str],
         message_type: str = "text"
-    ) -> Dict[str, any]:
+    ) -> Dict[str, Any]:
         """
         Legacy method - kept for backward compatibility
         Use chat() for new intelligent processing
@@ -116,7 +116,7 @@ Return JSON:
         self,
         query: str,
         context: Optional[str] = None
-    ) -> Dict[str, any]:
+    ) -> Dict[str, Any]:
         """
         Enhance search query with synonyms and related terms
         """

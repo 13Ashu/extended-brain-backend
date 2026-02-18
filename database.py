@@ -7,7 +7,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import String, Text, DateTime, ForeignKey, JSON, Enum as SQLEnum, Integer
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, AsyncGenerator
+from typing import AsyncGenerator
 import enum
 import os
 
@@ -194,7 +195,7 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
 
 
-async def get_db() -> AsyncSession:
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """Dependency for getting database session"""
     async with async_session_maker() as session:
         try:
