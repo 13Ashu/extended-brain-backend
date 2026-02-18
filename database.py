@@ -157,6 +157,7 @@ class Message(Base):
     
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    telegram_chat_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, unique=True)
     category_id: Mapped[Optional[int]] = mapped_column(ForeignKey("categories.id"), index=True)
     
     content: Mapped[str] = mapped_column(Text)
