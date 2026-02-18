@@ -1,22 +1,25 @@
 """
-Message Processor Service
-Handles incoming messages, categorization, and storage
+Intelligent Message Processor
+Transforms raw thoughts into organized, searchable knowledge
 
-IMPORTANT: Save this file as services/message_processor.py
-Create a 'services' folder and put this file inside it
+Core Philosophy:
+- Understand INTENT, not just content
+- Build CONNECTIONS between ideas
+- Create CONTEXT-AWARE categories
+- Generate RICH metadata for powerful search
 """
 
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime
 
-from database import User, Message, Category, MessageType
+from database import User, Message, Category
 from cerebras_client import CerebrasClient
 
 
 class MessageProcessor:
-    """Process and store incoming messages"""
+    """Transform messages into structured knowledge"""
     
     def __init__(self, cerebras_client: CerebrasClient):
         self.cerebras = cerebras_client
@@ -26,56 +29,54 @@ class MessageProcessor:
         user_phone: str,
         content: str,
         message_type: str,
-        media_url: Optional[str],
-        db: AsyncSession
+        db: AsyncSession,
+        media_url: Optional[str] = None,
     ) -> Dict:
         """
-        Process incoming message:
-        1. Get or create user
-        2. Analyze content with AI
-        3. Categorize and tag
-        4. Store in database
-        
-        Returns processing result
+        Deep processing pipeline:
+        1. Understand the essence and intent
+        2. Extract entities, concepts, and actionables
+        3. Find or create the perfect category
+        4. Generate rich, searchable metadata
+        5. Build connections to existing knowledge
         """
         
-        # Get or create user
-        user = await self._get_or_create_user(user_phone, db)
+        # Get user
+        user = await self._get_user(user_phone, db)
+        if not user:
+            raise ValueError("User not registered")
         
-        # Get existing categories for this user
-        existing_categories = await self._get_user_categories(user.id, db)
-        category_names = [cat.name for cat in existing_categories]
+        # ===== STEP 1: DEEP UNDERSTANDING =====
+        understanding = await self._deep_understand(content, user, db)
         
-        # Analyze message with Cerebras
-        analysis = await self.cerebras.categorize_message(
+        # ===== STEP 2: FIND OR CREATE CATEGORY =====
+        category = await self._intelligent_categorize(
             content=content,
-            existing_categories=category_names,
-            message_type=message_type
-        )
-        
-        # Get or create category
-        category = await self._get_or_create_category(
-            user_id=user.id,
-            category_name=analysis["category"],
+            understanding=understanding,
+            user=user,
             db=db
         )
         
-        # Create message record
+        # ===== STEP 3: SAVE WITH RICH METADATA =====
         message = Message(
             user_id=user.id,
             category_id=category.id,
             content=content,
-            message_type=MessageType[message_type.upper()],
+            message_type=message_type,
             media_url=media_url,
-            summary=analysis.get("summary"),
-            tags=analysis.get("tags", []),
-            entities=analysis.get("entities", {}),
-            original_timestamp=datetime.utcnow()
+            
+            # Rich metadata for search
+            summary=understanding["essence"],
+            tags={
+                "keywords": understanding["keywords"],
+                "entities": understanding["entities"],
+                "concepts": understanding["concepts"],
+                "actionables": understanding["actionables"],
+                "sentiment": understanding["sentiment"],
+                "time_reference": understanding["time_reference"],
+            },
+            created_at=datetime.utcnow()
         )
-        
-        # Generate embedding for semantic search (if needed)
-        # embedding = await self.cerebras.generate_embedding(content)
-        # message.embedding = str(embedding)
         
         db.add(message)
         await db.commit()
@@ -84,57 +85,164 @@ class MessageProcessor:
         return {
             "message_id": message.id,
             "category": category.name,
-            "tags": analysis.get("tags", []),
-            "summary": analysis.get("summary"),
-            "entities": analysis.get("entities", {})
+            "tags": understanding["keywords"],
+            "essence": understanding["essence"],
+            "connections": understanding["related_concepts"]
         }
     
-    async def _get_or_create_user(
+    async def _deep_understand(
         self,
-        phone_number: str,
+        content: str,
+        user: User,
         db: AsyncSession
-    ) -> User:
-        """Get existing user or create new one"""
+    ) -> Dict:
+        """
+        Use AI to deeply understand the message:
+        - What is this really about? (essence)
+        - What does the user intend? (intent)
+        - What are the key concepts?
+        - Are there actionable items?
+        - How does this relate to their existing knowledge?
+        """
         
-        result = await db.execute(
-            select(User).where(User.phone_number == phone_number)
-        )
-        user = result.scalar_one_or_none()
+        # Get user's recent context for better understanding
+        recent_categories = await self._get_user_categories(user.id, db)
+        recent_topics = await self._get_recent_topics(user.id, db)
         
-        if not user:
-            # user = User(phone_number=phone_number)
-            # db.add(user)
-            # await db.commit()
-            # await db.refresh(user)
+        prompt = f"""You are analyzing a thought/note from a user's personal knowledge base.
 
-            raise ValueError("User not registered")
+USER CONTEXT:
+- Name: {user.name}
+- Occupation: {user.occupation}
+- Recent categories: {', '.join(recent_categories[:10])}
+- Recent topics: {', '.join(recent_topics[:15])}
+
+MESSAGE TO ANALYZE:
+"{content}"
+
+TASK: Deep analysis to make this searchable and organizable.
+
+Return JSON with:
+{{
+  "essence": "One clear sentence capturing the core meaning",
+  "intent": "what/why/reminder/idea/task/reference/learning",
+  "keywords": ["3-5 most important searchable keywords"],
+  "entities": {{"people": [], "places": [], "products": [], "companies": []}},
+  "concepts": ["abstract concepts or themes"],
+  "actionables": ["specific action items if any"],
+  "sentiment": "neutral/positive/excited/urgent/contemplative",
+  "time_reference": "now/today/this_week/future/none",
+  "related_concepts": ["concepts from user's existing knowledge this relates to"],
+  "suggested_category": "best category name for this"
+}}
+
+Be specific and intelligent. Think like you're organizing this for future retrieval.
+"""
         
-        return user
+        response = await self.cerebras.chat(prompt)
+        return response
     
-    async def _get_user_categories(
+    async def _intelligent_categorize(
         self,
-        user_id: int,
+        content: str,
+        understanding: Dict,
+        user: User,
         db: AsyncSession
-    ) -> list:
-        """Get all categories for a user"""
+    ) -> Category:
+        """
+        Find the PERFECT category - not generic buckets.
         
-        result = await db.execute(
-            select(Category).where(Category.user_id == user_id)
+        Rules:
+        1. Use existing category if content clearly fits
+        2. Create NEW specific category if this is a new theme
+        3. Never use vague categories like "Notes" or "General"
+        4. Category names should be MEANINGFUL and SEARCHABLE
+        """
+        
+        suggested_category = understanding["suggested_category"]
+        intent = understanding["intent"]
+        concepts = understanding["concepts"]
+        
+        # Get all user's categories
+        existing_categories = await self._get_all_user_categories(user.id, db)
+        
+        if not existing_categories:
+            # First message - create meaningful category
+            category_name = suggested_category
+        else:
+            # Find best match or create new
+            category_name = await self._find_best_category_match(
+                suggested=suggested_category,
+                existing=[c.name for c in existing_categories],
+                content=content,
+                understanding=understanding
+            )
+        
+        # Get or create category
+        category = await self._get_or_create_category(
+            user_id=user.id,
+            name=category_name,
+            auto_description=f"{intent.capitalize()} - {understanding['essence'][:100]}",
+            db=db
         )
-        return result.scalars().all()
+        
+        return category
+    
+    async def _find_best_category_match(
+        self,
+        suggested: str,
+        existing: List[str],
+        content: str,
+        understanding: Dict
+    ) -> str:
+        """Use AI to find best category match or suggest new one"""
+        
+        prompt = f"""You are organizing a note into the user's knowledge base.
+
+EXISTING CATEGORIES:
+{', '.join(existing)}
+
+NEW NOTE:
+"{content}"
+
+NOTE ANALYSIS:
+- Intent: {understanding['intent']}
+- Concepts: {', '.join(understanding['concepts'])}
+- Suggested category: {suggested}
+
+TASK: Choose the BEST category.
+
+Rules:
+1. Use existing category if note clearly fits (>70% match)
+2. Create NEW specific category if this is a distinct theme
+3. Be specific - avoid generic names
+4. Good: "Startup Ideas", "Python Learning", "Meeting Notes - Project X"
+5. Bad: "Notes", "Ideas", "Work", "Personal"
+
+Return JSON:
+{{
+  "category": "chosen or new category name",
+  "reason": "brief explanation",
+  "is_new": true/false
+}}
+"""
+        
+        response = await self.cerebras.chat(prompt)
+        return response.get("category", suggested)
     
     async def _get_or_create_category(
         self,
         user_id: int,
-        category_name: str,
+        name: str,
+        auto_description: str,
         db: AsyncSession
     ) -> Category:
-        """Get existing category or create new one"""
+        """Get existing or create new category"""
         
         result = await db.execute(
             select(Category).where(
                 Category.user_id == user_id,
-                Category.name == category_name
+                Category.name == name
             )
         )
         category = result.scalar_one_or_none()
@@ -142,10 +250,45 @@ class MessageProcessor:
         if not category:
             category = Category(
                 user_id=user_id,
-                name=category_name
+                name=name,
+                description=auto_description
             )
             db.add(category)
-            await db.commit()
-            await db.refresh(category)
+            await db.flush()
         
         return category
+    
+    async def _get_user(self, phone: str, db: AsyncSession) -> Optional[User]:
+        result = await db.execute(select(User).where(User.phone_number == phone))
+        return result.scalar_one_or_none()
+    
+    async def _get_user_categories(self, user_id: int, db: AsyncSession) -> List[str]:
+        """Get user's category names for context"""
+        result = await db.execute(
+            select(Category.name).where(Category.user_id == user_id).limit(20)
+        )
+        return [row[0] for row in result.all()]
+    
+    async def _get_recent_topics(self, user_id: int, db: AsyncSession) -> List[str]:
+        """Get recent topics/keywords for context"""
+        result = await db.execute(
+            select(Message.tags)
+            .where(Message.user_id == user_id)
+            .order_by(Message.created_at.desc())
+            .limit(20)
+        )
+        
+        topics = set()
+        for row in result.all():
+            if row[0] and isinstance(row[0], dict):
+                keywords = row[0].get("keywords", [])
+                topics.update(keywords[:3])
+        
+        return list(topics)[:15]
+    
+    async def _get_all_user_categories(self, user_id: int, db: AsyncSession) -> List[Category]:
+        """Get all categories for a user"""
+        result = await db.execute(
+            select(Category).where(Category.user_id == user_id)
+        )
+        return result.scalars().all()
