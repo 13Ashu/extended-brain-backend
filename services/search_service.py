@@ -200,7 +200,7 @@ Think: What is the user REALLY trying to find?
                 "content": message.content,
                 "essence": message.summary,
                 "category": category.name if category else "Uncategorized",
-                "tags": message.tags.get("keywords", []) if message.tags else [],
+                "tags": message.tags.get("keywords", []) if isinstance(message.tags, dict) else [],
                 "created_at": message.created_at.isoformat(),
                 "relevance": score,
                 "preview": self._generate_preview(message.content, understanding["keywords"])
@@ -250,11 +250,6 @@ Think: What is the user REALLY trying to find?
                 score += 1.0
         
         # === TAG MATCHING ===
-        if message.tags:
-            msg_keywords = message.tags.get("keywords", [])
-            for keyword in understanding["keywords"]:
-                if keyword.lower() in [k.lower() for k in msg_keywords]:
-                    score += 1.5
         
         # === CATEGORY MATCHING ===
         if category and understanding.get("category_hints"):
@@ -273,7 +268,7 @@ Think: What is the user REALLY trying to find?
         
         # === INTENT MATCHING ===
         intent = understanding.get("intent", "")
-        if message.tags:
+        if isinstance(message.tags, dict):
             msg_intent = message.tags.get("actionables", [])
             if intent == "find_specific" and msg_intent:
                 score += 2.0
