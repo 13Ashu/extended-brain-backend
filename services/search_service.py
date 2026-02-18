@@ -11,7 +11,7 @@ Search Philosophy:
 
 from typing import List, Dict, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, and_, func
+from sqlalchemy import select, or_, and_, func, String
 from datetime import datetime, timedelta
 
 from database import User, Message, Category
@@ -153,7 +153,7 @@ Think: What is the user REALLY trying to find?
         # 3. Search in tags (JSON field)
         for keyword in understanding["keywords"][:3]:
             search_conditions.append(
-                func.lower(Message.tags.cast(str)).contains(keyword.lower())
+                func.lower(Message.tags.cast(String)).contains(keyword.lower())
             )
         
         # 4. Search in category names
@@ -171,7 +171,9 @@ Think: What is the user REALLY trying to find?
         
         # Execute
         result = await db.execute(stmt)
-        return result.all()
+        rows = result.all()
+
+        return [(m, c) for m, c in rows]
     
     async def _rank_by_relevance(
         self,
