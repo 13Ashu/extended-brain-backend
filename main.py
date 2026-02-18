@@ -579,7 +579,7 @@ async def search_messages(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    results = await search_service.search(
+    search_data = await search_service.search(
         user_phone=current_user.phone_number,
         query=search.query,
         limit=search.limit,
@@ -590,8 +590,9 @@ async def search_messages(
     return {
         "success": True,
         "query": search.query,
-        "results": results,
-        "total": len(results)
+        "natural_response": search_data.get("natural_response", ""),
+        "results": search_data.get("results", []),
+        "total": len(search_data.get("results", []))
     }
 
 
@@ -656,20 +657,20 @@ async def handle_category_command(phone: str, content: str, db: AsyncSession) ->
     return "Category command recognized. Use 'categories' to list all."
 
 
-def format_search_results(results: List[Dict]) -> str:
+def format_search_results(search_data) -> str:
     """Format search results for messaging"""
+    # Handle both old list format and new dict format
+    if isinstance(search_data, list):
+        results = search_data
+        return "No results found." if not results else f"Found {len(results)} result(s)."
+    
+    natural = search_data.get("natural_response", "")
+    results = search_data.get("results", [])
+    
     if not results:
-        return "No results found."
+        return "I couldn't find anything related to that in your notes."
     
-    response = f"🔍 Found {len(results)} result(s):\n\n"
-    
-    for i, result in enumerate(results, 1):
-        response += f"{i}. [{result['category']}] "
-        response += f"{result['content'][:100]}...\n"
-        response += f"   📅 {result['created_at']}\n\n"
-    
-    return response
-
+    return natural
 
 # ================== Analytics ==================
 
