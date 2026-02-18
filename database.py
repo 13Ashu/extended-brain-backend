@@ -8,7 +8,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import String, Text, DateTime, ForeignKey, JSON, Enum as SQLEnum, Integer
 from datetime import datetime
 from typing import Optional, List, AsyncGenerator
-from typing import AsyncGenerator
+from pgvector.sqlalchemy import Vector
 import enum
 import os
 
@@ -169,7 +169,7 @@ class Message(Base):
     summary: Mapped[Optional[str]] = mapped_column(Text)
     tags: Mapped[Optional[dict]] = mapped_column(JSON)  # List of tags
     entities: Mapped[Optional[dict]] = mapped_column(JSON)  # Extracted entities
-    embedding: Mapped[Optional[str]] = mapped_column(Text)  # Vector embedding for search
+    embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(384), nullable=True)  # Vector embedding for search
     
     # Timestamps
     original_timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime)

@@ -13,6 +13,8 @@ from typing import List, Dict, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, and_, func, String
 from datetime import datetime, timedelta
+from services.embedding_service import embedding_service
+from sqlalchemy import text
 
 from database import User, Message, Category
 from cerebras_client import CerebrasClient
@@ -117,64 +119,79 @@ Think: What is the user REALLY trying to find?
         db: AsyncSession,
         limit: int
     ) -> List[tuple]:
-        """
-        Search with intelligence - not just keyword matching
-        """
         
-        # Build base query
+        # Generate query embedding
+        query_embedding = embedding_service.embed(query)
+        embedding_str = f"[{','.join(map(str, query_embedding))}]"
+        
+        # --- SEMANTIC SEARCH via pgvector ---
+        semantic_sql = text("""
+            SELECT m.id, 1 - (m.embedding <=> :embedding ::vector) as similarity
+            FROM messages m
+            WHERE m.user_id = :user_id
+            AND m.embedding IS NOT NULL
+            ORDER BY m.embedding <=> :embedding ::vector
+            LIMIT :limit
+        """)
+        
+        semantic_result = await db.execute(semantic_sql, {
+            "embedding": embedding_str,
+            "user_id": user.id,
+            "limit": limit
+        })
+        semantic_hits = {row.id: row.similarity for row in semantic_result}
+        
+        # --- KEYWORD SEARCH (your existing logic) ---
         stmt = (
             select(Message, Category)
             .join(Category, Message.category_id == Category.id, isouter=True)
             .where(Message.user_id == user.id)
         )
         
-        # Apply time filter if specified
+        # Time filter
         time_filter = understanding.get("time_filter", "none")
         if time_filter != "none":
             cutoff = self._get_time_cutoff(time_filter)
             if cutoff:
                 stmt = stmt.where(Message.created_at >= cutoff)
         
-        # Build search conditions
+        # Keyword conditions
         search_conditions = []
+        for keyword in understanding.get("keywords", [])[:5]:
+            search_conditions.append(func.lower(Message.content).contains(keyword.lower()))
+        for concept in understanding.get("core_concepts", []):
+            search_conditions.append(func.lower(Message.summary).contains(concept.lower()))
         
-        # 1. Search in content (most important)
-        for keyword in understanding["keywords"][:5]:
-            search_conditions.append(
-                func.lower(Message.content).contains(keyword.lower())
-            )
-        
-        # 2. Search in essence/summary
-        for concept in understanding["core_concepts"]:
-            search_conditions.append(
-                func.lower(Message.summary).contains(concept.lower())
-            )
-        
-        # 3. Search in tags (JSON field)
-        for keyword in understanding["keywords"][:3]:
-            search_conditions.append(
-                func.lower(Message.tags.cast(String)).contains(keyword.lower())
-            )
-        
-        # 4. Search in category names
-        for hint in understanding.get("category_hints", []):
-            search_conditions.append(
-                func.lower(Category.name).contains(hint.lower())
-            )
-        
-        # Combine with OR (match ANY condition)
         if search_conditions:
             stmt = stmt.where(or_(*search_conditions))
         
-        # Order by recency
         stmt = stmt.order_by(Message.created_at.desc()).limit(limit)
+        keyword_result = await db.execute(stmt)
+        keyword_rows = keyword_result.all()
         
-        # Execute
-        result = await db.execute(stmt)
-        rows = result.all()
-
+        # --- MERGE: Collect all unique message IDs ---
+        keyword_ids = {m.id for m, c in keyword_rows}
+        all_ids = keyword_ids | set(semantic_hits.keys())
+        
+        if not all_ids:
+            return []
+        
+        # Fetch full data for all matched messages
+        final_stmt = (
+            select(Message, Category)
+            .join(Category, Message.category_id == Category.id, isouter=True)
+            .where(Message.id.in_(all_ids))
+        )
+        final_result = await db.execute(final_stmt)
+        rows = final_result.all()
+        
+        # Attach semantic similarity score to messages for ranking
+        for message, category in rows:
+            message._semantic_score = semantic_hits.get(message.id, 0.0)
+        
         return [(m, c) for m, c in rows]
-    
+
+
     async def _rank_by_relevance(
         self,
         messages: List[tuple],
@@ -229,6 +246,10 @@ Think: What is the user REALLY trying to find?
         score = 0.0
         content_lower = message.content.lower()
         summary_lower = (message.summary or "").lower()
+
+        # === SEMANTIC SIMILARITY (most powerful signal) ===
+        semantic_score = getattr(message, '_semantic_score', 0.0)
+        score += semantic_score * 15.0  # Highest weight — semantic beats keywords
         
         # === CONTENT MATCHING ===
         # Exact phrase match (highest weight)
