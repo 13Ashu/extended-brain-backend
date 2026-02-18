@@ -1,22 +1,79 @@
 """
 Cerebras AI Client for LLM operations
 Fast inference for categorization, tagging, and search
+Updated for intelligent knowledge processing
 """
 
 import os
 import json
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import httpx
 
 
 class CerebrasClient:
-    """Client for Cerebras Cloud API"""
+    """Client for Cerebras Cloud API with intelligent processing"""
     
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or os.getenv("CEREBRAS_API_KEY")
         self.base_url = "https://api.cerebras.ai/v1"
         self.model = "llama3.1-8b"  # Fast and efficient
         
+    async def chat(
+        self,
+        prompt: str,
+        max_tokens: int = 800,
+        temperature: float = 0.7,
+        response_format: str = "json"
+    ) -> Dict[str, Any]:
+        """
+        Main chat interface - returns parsed JSON
+        Used by the intelligent message processor and search
+        """
+        
+        # Ensure we get clean JSON
+        if response_format == "json" and "Return JSON" not in prompt:
+            prompt += "\n\nIMPORTANT: Return ONLY valid JSON, no markdown formatting, no extra text."
+        
+        response_text = await self._chat_completion(prompt, max_tokens, temperature)
+        
+        # Clean the response
+        response_text = self._clean_json_response(response_text)
+        
+        try:
+            return json.loads(response_text)
+        except json.JSONDecodeError as e:
+            print(f"JSON parse error: {e}")
+            print(f"Raw response: {response_text[:500]}")
+            # Return safe fallback
+            return {
+                "error": "Failed to parse AI response",
+                "raw": response_text[:200]
+            }
+    
+    def _clean_json_response(self, text: str) -> str:
+        """Clean AI response to extract pure JSON"""
+        
+        # Remove markdown code blocks
+        text = text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        elif text.startswith("```"):
+            text = text[3:]
+        
+        if text.endswith("```"):
+            text = text[:-3]
+        
+        # Find JSON object boundaries
+        start = text.find('{')
+        end = text.rfind('}')
+        
+        if start != -1 and end != -1:
+            text = text[start:end+1]
+        
+        return text.strip()
+    
+    # ===== LEGACY METHODS (keep for compatibility) =====
+    
     async def categorize_message(
         self,
         content: str,
@@ -24,15 +81,8 @@ class CerebrasClient:
         message_type: str = "text"
     ) -> Dict[str, any]:
         """
-        Analyze message and suggest category, tags, and summary
-        
-        Returns:
-            {
-                "category": "Work",
-                "tags": ["meeting", "urgent"],
-                "summary": "Brief summary of content",
-                "entities": {"people": ["John"], "dates": ["tomorrow"]}
-            }
+        Legacy method - kept for backward compatibility
+        Use chat() for new intelligent processing
         """
         
         categories_text = ", ".join(existing_categories) if existing_categories else "None yet"
@@ -47,7 +97,7 @@ Analyze this {message_type} message and provide:
 
 Message: {content}
 
-Respond ONLY with valid JSON in this exact format:
+Return JSON:
 {{
     "category": "category name",
     "tags": ["tag1", "tag2", "tag3"],
@@ -60,20 +110,7 @@ Respond ONLY with valid JSON in this exact format:
     }}
 }}"""
 
-        response = await self._chat_completion(prompt)
-        
-        # Parse JSON response
-        try:
-            result = json.loads(response)
-            return result
-        except json.JSONDecodeError:
-            # Fallback if JSON parsing fails
-            return {
-                "category": "Uncategorized",
-                "tags": ["general"],
-                "summary": content[:200],
-                "entities": {}
-            }
+        return await self.chat(prompt, response_format="json")
     
     async def search_query_enhancement(
         self,
@@ -82,13 +119,6 @@ Respond ONLY with valid JSON in this exact format:
     ) -> Dict[str, any]:
         """
         Enhance search query with synonyms and related terms
-        
-        Returns:
-            {
-                "enhanced_query": "expanded query",
-                "synonyms": ["term1", "term2"],
-                "filters": {"category": ["work"], "date_range": "last_week"}
-            }
         """
         
         prompt = f"""Enhance this search query for better results.
@@ -101,7 +131,7 @@ Provide:
 2. Related search terms
 3. Suggested filters
 
-Respond with JSON:
+Return JSON:
 {{
     "enhanced_query": "enhanced search terms",
     "synonyms": ["synonym1", "synonym2"],
@@ -109,17 +139,7 @@ Respond with JSON:
     "suggested_filters": {{"category": ["cat1"], "time": "recent"}}
 }}"""
 
-        response = await self._chat_completion(prompt)
-        
-        try:
-            return json.loads(response)
-        except:
-            return {
-                "enhanced_query": query,
-                "synonyms": [],
-                "related_terms": [],
-                "suggested_filters": {}
-            }
+        return await self.chat(prompt, response_format="json")
     
     async def answer_question(
         self,
@@ -128,13 +148,6 @@ Respond with JSON:
     ) -> str:
         """
         Answer user's question based on their stored messages
-        
-        Args:
-            question: User's question
-            context_messages: List of relevant messages from database
-        
-        Returns:
-            Natural language answer
         """
         
         context = "\n\n".join([
@@ -151,7 +164,7 @@ Relevant information from their notes:
 
 Provide a helpful, concise answer based on the information above. If you can't answer from the given context, say so."""
 
-        return await self._chat_completion(prompt)
+        return await self._chat_completion(prompt, max_tokens=500)
     
     async def suggest_category_name(
         self,
@@ -169,7 +182,7 @@ Existing categories: {", ".join(existing_categories)}
 
 Respond with just the category name (2-3 words max)."""
 
-        return await self._chat_completion(prompt)
+        return await self._chat_completion(prompt, max_tokens=50)
     
     async def extract_document_text(self, text: str, max_length: int = 5000) -> str:
         """Summarize and extract key information from long documents"""
@@ -197,13 +210,15 @@ Provide a comprehensive summary that captures all key points, dates, names, and 
         
         return f"[Audio transcription from {audio_url}]"
     
+    # ===== CORE API METHOD =====
+    
     async def _chat_completion(
         self,
         prompt: str,
         max_tokens: int = 500,
         temperature: float = 0.7
     ) -> str:
-        """Make API call to Cerebras"""
+        """Make API call to Cerebras - returns raw text"""
         
         async with httpx.AsyncClient() as client:
             try:
@@ -216,6 +231,10 @@ Provide a comprehensive summary that captures all key points, dates, names, and 
                     json={
                         "model": self.model,
                         "messages": [
+                            {
+                                "role": "system",
+                                "content": "You are a highly intelligent assistant. Always follow instructions precisely. When asked for JSON, return ONLY valid JSON with no extra text or markdown."
+                            },
                             {
                                 "role": "user",
                                 "content": prompt
@@ -231,6 +250,10 @@ Provide a comprehensive summary that captures all key points, dates, names, and 
                 data = response.json()
                 return data["choices"][0]["message"]["content"].strip()
                 
+            except httpx.HTTPStatusError as e:
+                print(f"Cerebras API HTTP error: {e.response.status_code}")
+                print(f"Response: {e.response.text}")
+                raise
             except Exception as e:
                 print(f"Error calling Cerebras API: {e}")
                 raise
