@@ -49,6 +49,19 @@ class MessageProcessor:
         
         # ===== STEP 1: DEEP UNDERSTANDING =====
         understanding = await self._deep_understand(content, user, db)
+
+        # Safety net if LLM response was malformed
+        if "suggested_category" not in understanding:
+            understanding.setdefault("suggested_category", "General Notes")
+            understanding.setdefault("essence", content[:100])
+            understanding.setdefault("keywords", [])
+            understanding.setdefault("concepts", [])
+            understanding.setdefault("entities", {})
+            understanding.setdefault("actionables", [])
+            understanding.setdefault("sentiment", "neutral")
+            understanding.setdefault("time_reference", "none")
+            understanding.setdefault("related_concepts", [])
+            understanding.setdefault("intent", "note")
         
         # ===== STEP 2: FIND OR CREATE CATEGORY =====
         category = await self._intelligent_categorize(
@@ -143,7 +156,7 @@ Return JSON with:
 Be specific and intelligent. Think like you're organizing this for future retrieval.
 """
         
-        response = await self.cerebras.chat(prompt)
+        response = await self.cerebras.chat(prompt, max_tokens=1200)
         return response
     
     async def _intelligent_categorize(
@@ -163,9 +176,9 @@ Be specific and intelligent. Think like you're organizing this for future retrie
         4. Category names should be MEANINGFUL and SEARCHABLE
         """
         
-        suggested_category = understanding["suggested_category"]
-        intent = understanding["intent"]
-        concepts = understanding["concepts"]
+        suggested_category = understanding.get("suggested_category", "General Notes")
+        intent = understanding.get("intent", "note")
+        concepts = understanding.get("concepts", [])
         
         # Get all user's categories
         existing_categories = await self._get_all_user_categories(user.id, db)
