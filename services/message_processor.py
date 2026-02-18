@@ -16,6 +16,7 @@ from datetime import datetime
 
 from database import User, Message, Category
 from cerebras_client import CerebrasClient
+from models import MessageType
 
 
 class MessageProcessor:
@@ -62,7 +63,7 @@ class MessageProcessor:
             user_id=user.id,
             category_id=category.id,
             content=content,
-            message_type=message_type,
+            message_type=MessageType(message_type),
             media_url=media_url,
             
             # Rich metadata for search
