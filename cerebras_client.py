@@ -19,7 +19,7 @@ CEREBRAS_BASE_URL  = "https://api.cerebras.ai/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 CEREBRAS_DEFAULT_MODEL    = "llama3.1-8b"
-OPENROUTER_DEFAULT_MODEL  = "qwen/qwen3-vl-235b-a22b-thinking"   # fast + cheap default
+OPENROUTER_DEFAULT_MODEL  = "google/gemma-3-4b-it:free"   # fast + cheap default
 
 
 class CerebrasClient:
@@ -51,7 +51,7 @@ class CerebrasClient:
     def __init__(
         self,
         api_key:   str | None = None,
-        provider:  str = "cerebras",          # "cerebras" | "openrouter"
+        provider:  str = "openrouter",          # "cerebras" | "openrouter"
         model:     str | None = None,
         # OpenRouter-specific optional metadata (used for rankings)
         site_url:  str | None = None,

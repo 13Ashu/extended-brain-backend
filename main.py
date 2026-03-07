@@ -85,7 +85,7 @@ app.add_middleware(
 )
 
 # Initialize services
-cerebras_client = CerebrasClient(api_key=Config.CEREBRAS_API_KEY)
+cerebras_client = CerebrasClient()
 messaging_client: MessagingClient = create_messaging_client()
 message_processor = MessageProcessor(cerebras_client)
 search_service = SearchService(cerebras_client)
