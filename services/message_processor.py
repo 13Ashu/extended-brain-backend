@@ -23,10 +23,10 @@ from models import MessageType
 
 class MessageProcessor:
     """Transform messages into structured knowledge"""
-    
+
     def __init__(self, cerebras_client: CerebrasClient):
         self.cerebras = cerebras_client
-    
+
     async def process(
         self,
         user_phone: str,
@@ -40,46 +40,50 @@ class MessageProcessor:
         1. Understand the essence and intent
         2. Extract entities, concepts, and actionables
         3. Find or create the perfect category
-        4. Generate rich, searchable metadata
-        5. Build connections to existing knowledge
-        6. Extract structured calendar events (NEW)
+        4. Extract structured calendar events (context-aware, reuses step 1)
+        5. Save with rich metadata
+        6. Generate & save embedding
         """
-        
-        # Get user
+
         user = await self._get_user(user_phone, db)
         if not user:
             raise ValueError("User not registered")
-        
+
         # ===== STEP 1: DEEP UNDERSTANDING =====
         understanding = await self._deep_understand(content, user, db)
 
-        # Safety net if LLM response was malformed
-        if "suggested_category" not in understanding:
-            understanding.setdefault("suggested_category", "General Notes")
-            understanding.setdefault("essence", content[:100])
-            understanding.setdefault("keywords", [])
-            understanding.setdefault("concepts", [])
-            understanding.setdefault("entities", {})
-            understanding.setdefault("actionables", [])
-            understanding.setdefault("sentiment", "neutral")
-            understanding.setdefault("time_reference", "none")
-            understanding.setdefault("related_concepts", [])
-            understanding.setdefault("intent", "note")
-        
+        # Safety net — if LLM response was malformed
+        understanding.setdefault("suggested_category", "General Notes")
+        understanding.setdefault("essence", content[:100])
+        understanding.setdefault("keywords", [])
+        understanding.setdefault("concepts", [])
+        understanding.setdefault("entities", {})
+        understanding.setdefault("actionables", [])
+        understanding.setdefault("sentiment", "neutral")
+        understanding.setdefault("time_reference", "none")
+        understanding.setdefault("related_concepts", [])
+        understanding.setdefault("intent", "note")
+
         # ===== STEP 2: FIND OR CREATE CATEGORY =====
         category = await self._intelligent_categorize(
             content=content,
             understanding=understanding,
             user=user,
-            db=db
+            db=db,
         )
 
-        # ===== STEP 3: EXTRACT CALENDAR EVENTS (parallel-safe) =====
-        # Only attempt for text messages that may contain dates/events
+        # ===== STEP 3: EXTRACT CALENDAR EVENTS =====
+        # We pass `understanding` so this step reuses what step 1 already
+        # figured out (time_reference, people, actionables) instead of
+        # rediscovering it — making it both cheaper and smarter.
         events: List[Dict] = []
         if message_type == "text":
-            events = await self._extract_events(content, datetime.utcnow())
-        
+            events = await self._extract_events(
+                content=content,
+                ref_date=datetime.utcnow(),
+                understanding=understanding,
+            )
+
         # ===== STEP 4: SAVE WITH RICH METADATA =====
         message = Message(
             user_id=user.id,
@@ -87,8 +91,6 @@ class MessageProcessor:
             content=content,
             message_type=MessageType(message_type),
             media_url=media_url,
-            
-            # Rich metadata for search
             summary=understanding["essence"],
             tags={
                 "keywords":       understanding["keywords"],
@@ -97,125 +99,166 @@ class MessageProcessor:
                 "actionables":    understanding["actionables"],
                 "sentiment":      understanding["sentiment"],
                 "time_reference": understanding["time_reference"],
-                # Calendar events — consumed by the Visual calendar on the frontend
+                # Consumed by the Visual calendar on the frontend
                 "events":         events,
             },
-            created_at=datetime.utcnow()
+            created_at=datetime.utcnow(),
         )
-        
+
         db.add(message)
         await db.commit()
         await db.refresh(message)
 
         # ===== STEP 5: GENERATE & SAVE EMBEDDING =====
         await self._save_embedding(message.id, content, understanding, db)
-        
+
         return {
             "message_id":  message.id,
             "category":    category.name,
             "tags":        understanding["keywords"],
             "essence":     understanding["essence"],
             "connections": understanding["related_concepts"],
-            "events":      events,   # useful for callers to know what was detected
+            "events":      events,
         }
-    
+
     # ─────────────────────────────────────────────────────────────
-    # NEW: Calendar event extraction
+    # Calendar event extraction
     # ─────────────────────────────────────────────────────────────
 
     async def _extract_events(
         self,
         content: str,
         ref_date: datetime,
+        understanding: Dict,
     ) -> List[Dict]:
         """
-        Use Cerebras to extract ALL structured calendar events from content.
+        Extract ALL time-anchored occurrences from a message.
 
-        Handles:
-          - Explicit dates:   "24 feb", "10,11 march"
-          - Relative dates:   "after 3 days", "next Monday", "this weekend"
-          - Multi-date spans: "20,21 march - shikhar"  →  two entries
-          - Smart labels:     raw "archi brother" → "Archi's brother's wedding"
+        Key design decisions:
+        ─────────────────────
+        1. Receives `understanding` from _deep_understand so we don't pay
+           for a second full-analysis pass. The LLM only needs to resolve
+           dates and generate labels, not re-infer context.
 
-        Returns a list of {date, label} dicts, e.g.:
-          [
-            {"date": "2025-02-24", "label": "Chidiya's wedding"},
-            {"date": "2025-03-10", "label": "Archi's brother's wedding"},
-            {"date": "2025-03-11", "label": "Archi's brother's wedding"},
-            {"date": "2025-03-20", "label": "Shikhar's wedding"},
-            {"date": "2025-03-21", "label": "Shikhar's wedding"},
-          ]
+        2. Fast-path skip: if step 1 flagged time_reference="none" AND there
+           are no people or actionables, the message is purely conceptual
+           (e.g. "interesting idea about ML") — skip the LLM call entirely.
 
-        Returns [] if no events found or if LLM call fails.
+        3. Robust JSON parsing: handles raw list, wrapped dict {"events":[...]},
+           string with markdown fences, or single-object responses.
+
+        4. Strict date validation via regex (not just length check) to catch
+           malformed responses like "2025-2-8" or "tomorrow".
+
+        Handles every real-world pattern:
+          Explicit dates      "24 feb", "10,11 march", "2025-03-15"
+          Relative dates      "tomorrow", "next Monday", "after 3 days", "this weekend"
+          Implicit timing     "mom is coming tomorrow", "flight next week"
+          Multi-day spans     "10,11 march - archi" → two entries, same label
+          Deadline phrasing   "submit by 20th", "due next Friday"
+          Informal plans      "dinner with Rahul on Sunday"
         """
-        prompt = f"""Extract ALL calendar events and dates from the message below.
-Reference date (when this was saved): {ref_date.strftime('%Y-%m-%d')}
+
+        time_ref    = understanding.get("time_reference", "none")
+        people      = understanding.get("entities", {}).get("people", [])
+        actionables = understanding.get("actionables", [])
+
+        # Fast-path: no temporal signal whatsoever → skip LLM call
+        if time_ref == "none" and not actionables and not people:
+            return []
+
+        prompt = f"""You extract calendar events from personal notes. Be inclusive — err on the side of extracting rather than skipping.
+
+Reference date: {ref_date.strftime('%Y-%m-%d')} ({ref_date.strftime('%A, %d %B %Y')})
 
 Message: "{content}"
 
-Instructions:
-- Resolve relative dates using the reference date above (e.g. "after 3 days" = ref + 3 days)
-- For comma-separated days like "10,11 march", emit one entry PER day
-- Labels must be short, human-friendly, and deduced from context
-  Good: "Archi's brother's wedding", "Flight to Bangalore", "Chidiya's marriage"
-  Bad:  "archi brother", "marriage to attend", the raw message text
-- If the same event spans multiple days (e.g. "20,21 march - shikhar"), repeat with same label
-- If no events or dates are found, return an empty array
-- Return ONLY a valid JSON array, no explanation, no markdown fences
+Context already known:
+- Time reference type : {time_ref}
+- People mentioned    : {people}
+- Actionables         : {actionables}
+- Concepts            : {understanding.get('concepts', [])}
+- Core meaning        : {understanding.get('essence', '')}
 
-Expected format:
-[
-  {{"date": "YYYY-MM-DD", "label": "short human-friendly title"}},
-  ...
-]"""
+━━━ RULES ━━━
+
+DATE RESOLUTION — resolve every date/time expression to YYYY-MM-DD:
+  "tomorrow"      → ref + 1 day
+  "day after"     → ref + 2 days
+  "after N days"  → ref + N days
+  "next Monday"   → the Monday that comes after ref date
+  "this weekend"  → the coming Saturday from ref date
+  "next week"     → Monday of next week
+  "24 feb"        → {ref_date.year}-02-24  (use next year if date already passed)
+  "10,11 march"   → emit one entry per day: {ref_date.year}-03-10 AND {ref_date.year}-03-11
+
+MULTI-DAY: For "10,11 march - archi brother", emit two objects with identical labels.
+
+LABEL GENERATION — short, human, inferred from full context (NOT raw text):
+  "mom is coming tomorrow"              → "Mom's visit"
+  "marriage to attend - chidiya"        → "Chidiya's wedding"
+  "10,11 march - archi brother"         → "Archi's brother's wedding"
+  "flight to delhi next friday"         → "Flight to Delhi"
+  "call with investor next monday"      → "Investor call"
+  "submit report by 20th"               → "Report deadline"
+
+INCLUDE any time-anchored occurrence: visits, arrivals, weddings, flights, meetings,
+calls, deadlines, dinners, birthdays, ceremonies — even casual informal ones.
+
+If there is genuinely NO date or time anchor at all, return [].
+
+━━━ OUTPUT ━━━
+Return ONLY a valid JSON array. No explanation. No markdown. No wrapper object.
+
+[{{"date": "YYYY-MM-DD", "label": "short human title"}}]"""
 
         try:
             raw = await self.cerebras.chat(prompt, max_tokens=512)
 
-            # cerebras.chat may return a dict (parsed JSON) or a string
+            # Handle all return shapes from cerebras.chat
             if isinstance(raw, list):
                 events = raw
             elif isinstance(raw, dict):
-                # Sometimes the LLM wraps the array: {"events": [...]}
+                # e.g. {"events": [...]} or {"dates": [...]}
                 events = raw.get("events", raw.get("dates", []))
             else:
-                # Strip markdown fences if present and parse
                 cleaned = re.sub(r"```(?:json)?|```", "", str(raw)).strip()
-                events = json.loads(cleaned)
+                parsed  = json.loads(cleaned)
+                events  = parsed if isinstance(parsed, list) else [parsed]
 
-            # Validate each entry
+            # Validate: must be {date: YYYY-MM-DD, label: non-empty string}
             validated = []
             for e in events:
+                if not isinstance(e, dict):
+                    continue
+                date  = e.get("date", "")
+                label = e.get("label", "")
                 if (
-                    isinstance(e, dict)
-                    and "date" in e
-                    and "label" in e
-                    and isinstance(e["date"], str)
-                    and len(e["date"]) == 10          # YYYY-MM-DD
-                    and isinstance(e["label"], str)
-                    and e["label"].strip()
+                    re.match(r"^\d{4}-\d{2}-\d{2}$", date)   # strict format
+                    and isinstance(label, str)
+                    and label.strip()
                 ):
                     validated.append({
-                        "date":  e["date"],
-                        "label": e["label"].strip(),
+                        "date":  date,
+                        "label": label.strip(),
                     })
 
             return validated
 
         except Exception as ex:
-            # Non-critical — never block the main save flow
+            # Never block the main save flow
             print(f"⚠ Event extraction failed (non-critical): {ex}")
             return []
 
     # ─────────────────────────────────────────────────────────────
-    # Existing methods below — unchanged
+    # Deep understanding
     # ─────────────────────────────────────────────────────────────
 
     async def _deep_understand(
         self,
         content: str,
         user: User,
-        db: AsyncSession
+        db: AsyncSession,
     ) -> Dict:
         """
         Use AI to deeply understand the message:
@@ -225,11 +268,10 @@ Expected format:
         - Are there actionable items?
         - How does this relate to their existing knowledge?
         """
-        
-        # Get user's recent context for better understanding
+
         recent_categories = await self._get_user_categories(user.id, db)
-        recent_topics = await self._get_recent_topics(user.id, db)
-        
+        recent_topics     = await self._get_recent_topics(user.id, db)
+
         prompt = f"""You are analyzing a thought/note from a user's personal knowledge base.
 
 USER CONTEXT:
@@ -259,64 +301,52 @@ Return JSON with:
 
 Be specific and intelligent. Think like you're organizing this for future retrieval.
 """
-        
+
         response = await self.cerebras.chat(prompt, max_tokens=1200)
         return response
-    
+
+    # ─────────────────────────────────────────────────────────────
+    # Categorisation
+    # ─────────────────────────────────────────────────────────────
+
     async def _intelligent_categorize(
         self,
         content: str,
         understanding: Dict,
         user: User,
-        db: AsyncSession
+        db: AsyncSession,
     ) -> Category:
-        """
-        Find the PERFECT category - not generic buckets.
-        
-        Rules:
-        1. Use existing category if content clearly fits
-        2. Create NEW specific category if this is a new theme
-        3. Never use vague categories like "Notes" or "General"
-        4. Category names should be MEANINGFUL and SEARCHABLE
-        """
-        
         suggested_category = understanding.get("suggested_category", "General Notes")
-        intent = understanding.get("intent", "note")
-        
-        # Get all user's categories
+        intent             = understanding.get("intent", "note")
+
         existing_categories = await self._get_all_user_categories(user.id, db)
-        
+
         if not existing_categories:
-            # First message - create meaningful category
             category_name = suggested_category
         else:
-            # Find best match or create new
             category_name = await self._find_best_category_match(
                 suggested=suggested_category,
                 existing=[c.name for c in existing_categories],
                 content=content,
-                understanding=understanding
+                understanding=understanding,
             )
-        
-        # Get or create category
+
         category = await self._get_or_create_category(
             user_id=user.id,
             name=category_name,
             auto_description=f"{intent.capitalize()} - {understanding['essence'][:100]}",
-            db=db
+            db=db,
         )
-        
+
         return category
-    
+
     async def _find_best_category_match(
         self,
         suggested: str,
         existing: List[str],
         content: str,
-        understanding: Dict
+        understanding: Dict,
     ) -> str:
-        """Use AI to find best category match or suggest new one"""
-        
         prompt = f"""You are organizing a note into the user's knowledge base.
 
 EXISTING CATEGORIES:
@@ -346,96 +376,95 @@ Return JSON:
   "is_new": true/false
 }}
 """
-        
+
         response = await self.cerebras.chat(prompt)
         return response.get("category", suggested)
-    
+
     async def _get_or_create_category(
         self,
         user_id: int,
         name: str,
         auto_description: str,
-        db: AsyncSession
+        db: AsyncSession,
     ) -> Category:
-        """Get existing or create new category"""
-        
         result = await db.execute(
             select(Category).where(
                 Category.user_id == user_id,
-                Category.name == name
+                Category.name == name,
             )
         )
         category = result.scalar_one_or_none()
-        
+
         if not category:
             category = Category(
                 user_id=user_id,
                 name=name,
-                description=auto_description
+                description=auto_description,
             )
             db.add(category)
             await db.flush()
-        
+
         return category
-    
+
+    # ─────────────────────────────────────────────────────────────
+    # DB helpers
+    # ─────────────────────────────────────────────────────────────
+
     async def _get_user(self, phone: str, db: AsyncSession) -> Optional[User]:
         result = await db.execute(select(User).where(User.phone_number == phone))
         return result.scalar_one_or_none()
-    
+
     async def _get_user_categories(self, user_id: int, db: AsyncSession) -> List[str]:
-        """Get user's category names for context"""
         result = await db.execute(
             select(Category.name).where(Category.user_id == user_id).limit(20)
         )
         return [row[0] for row in result.all()]
-    
+
     async def _get_recent_topics(self, user_id: int, db: AsyncSession) -> List[str]:
-        """Get recent topics/keywords for context"""
         result = await db.execute(
             select(Message.tags)
             .where(Message.user_id == user_id)
             .order_by(Message.created_at.desc())
             .limit(20)
         )
-        
         topics = set()
         for row in result.all():
             if row[0] and isinstance(row[0], dict):
                 keywords = row[0].get("keywords", [])
                 topics.update(keywords[:3])
-        
         return list(topics)[:15]
-    
+
     async def _get_all_user_categories(self, user_id: int, db: AsyncSession) -> List[Category]:
-        """Get all categories for a user"""
         result = await db.execute(
             select(Category).where(Category.user_id == user_id)
         )
         return list(result.scalars().all())
-    
+
+    # ─────────────────────────────────────────────────────────────
+    # Embedding
+    # ─────────────────────────────────────────────────────────────
+
     async def _save_embedding(
         self,
         message_id: int,
         content: str,
         understanding: Dict,
-        db: AsyncSession
+        db: AsyncSession,
     ):
         """Generate and store vector embedding for semantic search"""
         try:
             from services.embedding_service import embedding_service
-            
+
             # Combine content + essence for richer embedding
             text_to_embed = f"{content} {understanding.get('essence', '')}".strip()
-            
-            embedding = embedding_service.embed(text_to_embed)
-            
+            embedding     = embedding_service.embed(text_to_embed)
+
             await db.execute(
                 update(Message)
                 .where(Message.id == message_id)
                 .values(embedding=embedding)
             )
             await db.commit()
-            
+
         except Exception as e:
             print(f"⚠ Embedding failed (non-critical): {e}")
-            # Never block the main save flow
