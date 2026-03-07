@@ -269,17 +269,20 @@ Return ONLY this JSON:
         content: str,
         ref_date: datetime,
         understanding: Dict,
-    ) -> Optional[str]:
+    ) -> str:
         """
         Extract or infer a due date for a To-Do item.
+        Always returns a YYYY-MM-DD string — never None.
 
-        - Explicit date ("submit report by Friday") → resolve to YYYY-MM-DD
-        - Implicit urgency ("buy milk", "call dentist") → today (YYYY-MM-DD)
-        - No actionable signal at all → null
-
-        Returns YYYY-MM-DD string or None.
+        - Explicit date/day in content → LLM resolves it
+        - No temporal signal at all    → today (skip LLM entirely)
         """
         time_ref = understanding.get("time_reference", "none")
+        today    = ref_date.strftime("%Y-%m-%d")
+
+        # Fast-path: no temporal signal → always today, skip token call
+        if time_ref == "none":
+            return today
 
         prompt = f"""You extract the due date from a to-do note.
 
@@ -287,32 +290,28 @@ Reference date (today): {ref_date.strftime('%Y-%m-%d')} ({ref_date.strftime('%A,
 
 To-do: "{content}"
 
-Known context:
-- Time reference: {time_ref}
-- Actionables: {understanding.get('actionables', [])}
+━━━ DATE RESOLUTION ━━━
+  "today"      → {today}
+  "tomorrow"   → {(ref_date + timedelta(days=1)).strftime('%Y-%m-%d')}
+  "by Friday"  → next Friday from ref date
+  "next week"  → Monday of next week
+  "by 20th"    → {ref_date.year}-{ref_date.month:02d}-20 (next month if already past)
 
-━━━ RULES ━━━
-1. If an explicit date/day is mentioned → resolve it to YYYY-MM-DD
-   "by Friday"  → next Friday from ref date
-   "tomorrow"   → {(ref_date + timedelta(days=1)).strftime('%Y-%m-%d')}
-   "by 20th"    → {ref_date.year}-{ref_date.month:02d}-20 (next month if past)
-   "next week"  → Monday of next week
-2. If NO date is mentioned → always use today: {ref_date.strftime('%Y-%m-%d')}
-3. NEVER return null — every to-do gets a date.
+IMPORTANT: Only use a future date if the note EXPLICITLY mentions one.
+If unclear, return today: {today}
 
-Return ONLY this JSON:
+Return ONLY this JSON — no markdown, no explanation:
 {{"due_date": "YYYY-MM-DD"}}"""
 
         try:
-            response = await self.cerebras.chat(prompt, max_tokens=100)
+            response = await self.cerebras.chat(prompt, max_tokens=60)
             due = response.get("due_date")
             if due and re.match(r"^\d{4}-\d{2}-\d{2}$", str(due)):
                 return due
         except Exception as e:
             print(f"⚠ Due date extraction failed: {e}")
 
-        # Fallback: always today
-        return ref_date.strftime("%Y-%m-%d")
+        return today
 
     # ─────────────────────────────────────────────────────────────
     # Calendar event extraction (unchanged)
