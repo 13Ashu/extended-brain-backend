@@ -16,7 +16,7 @@ class CerebrasClient:
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or os.getenv("CEREBRAS_API_KEY")
         self.base_url = "https://api.cerebras.ai/v1"
-        self.model = "llama3.1-8b"  # Fast and efficient
+        self.model = "qwen-3-235b-a22b-instruct-2507"  # Fast and efficient
         
     async def chat(
         self,

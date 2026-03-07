@@ -12,7 +12,7 @@ Core Philosophy:
 from typing import Dict, Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import re
 
@@ -20,6 +20,64 @@ from database import User, Message, Category
 from cerebras_client import CerebrasClient
 from models import MessageType
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pure helper functions (no async, no DB — used as deterministic fallback)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_relative_date(time_ref: str, ref_date: datetime) -> Optional[str]:
+    """
+    Map a time_reference value (produced by _deep_understand) to a concrete
+    YYYY-MM-DD string. Used only when the LLM extraction returns [] despite
+    a clear time anchor being present.
+
+      "now" / "today"  → today
+      "this_week"      → Monday of the current week
+      "future"         → tomorrow  (safest assumption for a vague future ref)
+    """
+    d: Optional[datetime] = None
+
+    if time_ref in ("now", "today"):
+        d = ref_date
+    elif time_ref == "this_week":
+        d = ref_date - timedelta(days=ref_date.weekday())
+    elif time_ref == "future":
+        d = ref_date + timedelta(days=1)
+
+    return d.strftime("%Y-%m-%d") if d else None
+
+
+def _synthesize_label(content: str, people: List[str], concepts: List[str]) -> str:
+    """
+    Build a best-effort human label purely from already-extracted metadata.
+    Called only when the LLM extraction returns nothing.
+
+    Priority: person + concept combo → lone concept → truncated raw content.
+    """
+    VISIT_CONCEPTS    = {"visitation", "visit", "arrival", "coming"}
+    WEDDING_CONCEPTS  = {"wedding", "marriage", "ceremony", "engagement"}
+    MEETING_CONCEPTS  = {"meeting", "appointment", "standup", "sync"}
+    CALL_CONCEPTS     = {"call", "phone", "video call"}
+    DEADLINE_CONCEPTS = {"deadline", "due", "submission", "submit"}
+
+    lc = {c.lower() for c in concepts}
+
+    if people:
+        name = people[0].strip().capitalize()
+        if lc & WEDDING_CONCEPTS:  return f"{name}'s wedding"
+        if lc & VISIT_CONCEPTS:    return f"{name}'s visit"
+        if lc & MEETING_CONCEPTS:  return f"Meeting with {name}"
+        if lc & CALL_CONCEPTS:     return f"Call with {name}"
+        return f"{name}'s event"
+
+    if lc & DEADLINE_CONCEPTS: return "Deadline"
+    if concepts:               return concepts[0].strip().capitalize()
+    return content[:40].strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main processor
+# ─────────────────────────────────────────────────────────────────────────────
 
 class MessageProcessor:
     """Transform messages into structured knowledge"""
@@ -38,21 +96,20 @@ class MessageProcessor:
         """
         Deep processing pipeline:
         1. Understand the essence and intent
-        2. Extract entities, concepts, and actionables
-        3. Find or create the perfect category
-        4. Extract structured calendar events (context-aware, reuses step 1)
-        5. Save with rich metadata
-        6. Generate & save embedding
+        2. Find or create the perfect category
+        3. Extract structured calendar events (reuses step 1 context)
+        4. Save with rich metadata
+        5. Generate & save embedding
         """
 
         user = await self._get_user(user_phone, db)
         if not user:
             raise ValueError("User not registered")
 
-        # ===== STEP 1: DEEP UNDERSTANDING =====
+        # ── STEP 1: DEEP UNDERSTANDING ────────────────────────────
         understanding = await self._deep_understand(content, user, db)
 
-        # Safety net — if LLM response was malformed
+        # Safety net — guard against malformed LLM responses
         understanding.setdefault("suggested_category", "General Notes")
         understanding.setdefault("essence", content[:100])
         understanding.setdefault("keywords", [])
@@ -64,7 +121,7 @@ class MessageProcessor:
         understanding.setdefault("related_concepts", [])
         understanding.setdefault("intent", "note")
 
-        # ===== STEP 2: FIND OR CREATE CATEGORY =====
+        # ── STEP 2: FIND OR CREATE CATEGORY ──────────────────────
         category = await self._intelligent_categorize(
             content=content,
             understanding=understanding,
@@ -72,10 +129,9 @@ class MessageProcessor:
             db=db,
         )
 
-        # ===== STEP 3: EXTRACT CALENDAR EVENTS =====
-        # We pass `understanding` so this step reuses what step 1 already
-        # figured out (time_reference, people, actionables) instead of
-        # rediscovering it — making it both cheaper and smarter.
+        # ── STEP 3: EXTRACT CALENDAR EVENTS ──────────────────────
+        # Pass `understanding` so this step reuses what step 1 already knows
+        # (time_reference, people, actionables) rather than rediscovering it.
         events: List[Dict] = []
         if message_type == "text":
             events = await self._extract_events(
@@ -84,7 +140,7 @@ class MessageProcessor:
                 understanding=understanding,
             )
 
-        # ===== STEP 4: SAVE WITH RICH METADATA =====
+        # ── STEP 4: SAVE WITH RICH METADATA ──────────────────────
         message = Message(
             user_id=user.id,
             category_id=category.id,
@@ -109,7 +165,7 @@ class MessageProcessor:
         await db.commit()
         await db.refresh(message)
 
-        # ===== STEP 5: GENERATE & SAVE EMBEDDING =====
+        # ── STEP 5: GENERATE & SAVE EMBEDDING ────────────────────
         await self._save_embedding(message.id, content, understanding, db)
 
         return {
@@ -132,123 +188,123 @@ class MessageProcessor:
         understanding: Dict,
     ) -> List[Dict]:
         """
-        Extract ALL time-anchored occurrences from a message.
+        Two-layer event extraction — never misses an obvious case.
 
-        Key design decisions:
-        ─────────────────────
-        1. Receives `understanding` from _deep_understand so we don't pay
-           for a second full-analysis pass. The LLM only needs to resolve
-           dates and generate labels, not re-infer context.
+        Layer 1 — LLM:
+          Handles complex patterns: multi-date spans, wedding contexts,
+          "flight next Friday", etc. Receives `understanding` so it has
+          full context without a redundant analysis pass.
 
-        2. Fast-path skip: if step 1 flagged time_reference="none" AND there
-           are no people or actionables, the message is purely conceptual
-           (e.g. "interesting idea about ML") — skip the LLM call entirely.
+        Layer 2 — Deterministic fallback:
+          If the LLM still returns [] despite a confirmed time anchor,
+          `_resolve_relative_date` + `_synthesize_label` synthesize an
+          event purely from the understanding dict — zero extra tokens.
+          This catches cases like "mom is coming tomorrow" where the LLM
+          is sometimes too conservative.
 
-        3. Robust JSON parsing: handles raw list, wrapped dict {"events":[...]},
-           string with markdown fences, or single-object responses.
-
-        4. Strict date validation via regex (not just length check) to catch
-           malformed responses like "2025-2-8" or "tomorrow".
-
-        Handles every real-world pattern:
-          Explicit dates      "24 feb", "10,11 march", "2025-03-15"
-          Relative dates      "tomorrow", "next Monday", "after 3 days", "this weekend"
-          Implicit timing     "mom is coming tomorrow", "flight next week"
-          Multi-day spans     "10,11 march - archi" → two entries, same label
-          Deadline phrasing   "submit by 20th", "due next Friday"
-          Informal plans      "dinner with Rahul on Sunday"
+        Fast-path skip:
+          time_reference="none" AND no people AND no actionables → the
+          message is purely conceptual → skip entirely, save the token call.
         """
 
         time_ref    = understanding.get("time_reference", "none")
         people      = understanding.get("entities", {}).get("people", [])
         actionables = understanding.get("actionables", [])
+        concepts    = understanding.get("concepts", [])
 
-        # Fast-path: no temporal signal whatsoever → skip LLM call
+        # Fast-path: genuinely no temporal signal → nothing to extract
         if time_ref == "none" and not actionables and not people:
             return []
 
-        prompt = f"""You extract calendar events from personal notes. Be inclusive — err on the side of extracting rather than skipping.
+        prompt = f"""You extract calendar events from personal notes.
+CRITICAL: A time anchor IS present in this message. You MUST return at least one event — never return [].
 
 Reference date: {ref_date.strftime('%Y-%m-%d')} ({ref_date.strftime('%A, %d %B %Y')})
 
 Message: "{content}"
 
-Context already known:
-- Time reference type : {time_ref}
-- People mentioned    : {people}
-- Actionables         : {actionables}
-- Concepts            : {understanding.get('concepts', [])}
-- Core meaning        : {understanding.get('essence', '')}
+Already known from prior analysis:
+- Time reference : {time_ref}
+- People         : {people}
+- Actionables    : {actionables}
+- Concepts       : {concepts}
+- Essence        : {understanding.get('essence', '')}
 
-━━━ RULES ━━━
-
-DATE RESOLUTION — resolve every date/time expression to YYYY-MM-DD:
-  "tomorrow"      → ref + 1 day
-  "day after"     → ref + 2 days
+━━━ DATE RESOLUTION ━━━
+Resolve every date/time expression to YYYY-MM-DD:
+  "today"         → {ref_date.strftime('%Y-%m-%d')}
+  "tomorrow"      → {(ref_date + timedelta(days=1)).strftime('%Y-%m-%d')}
+  "day after"     → {(ref_date + timedelta(days=2)).strftime('%Y-%m-%d')}
   "after N days"  → ref + N days
-  "next Monday"   → the Monday that comes after ref date
+  "next Monday"   → the Monday after ref date
   "this weekend"  → the coming Saturday from ref date
   "next week"     → Monday of next week
-  "24 feb"        → {ref_date.year}-02-24  (use next year if date already passed)
-  "10,11 march"   → emit one entry per day: {ref_date.year}-03-10 AND {ref_date.year}-03-11
+  "24 feb"        → {ref_date.year}-02-24  (next year if already past)
+  "10,11 march"   → TWO entries: {ref_date.year}-03-10 AND {ref_date.year}-03-11
 
-MULTI-DAY: For "10,11 march - archi brother", emit two objects with identical labels.
+━━━ MULTI-DAY ━━━
+For "10,11 march - archi brother" → emit two objects with the same label.
 
-LABEL GENERATION — short, human, inferred from full context (NOT raw text):
-  "mom is coming tomorrow"              → "Mom's visit"
-  "marriage to attend - chidiya"        → "Chidiya's wedding"
-  "10,11 march - archi brother"         → "Archi's brother's wedding"
-  "flight to delhi next friday"         → "Flight to Delhi"
-  "call with investor next monday"      → "Investor call"
-  "submit report by 20th"               → "Report deadline"
+━━━ LABEL RULES ━━━
+Short, human, inferred from full context — NOT the raw message text:
+  "mom is coming tomorrow"        → "Mom's visit"
+  "my mom is coming tomorrow"     → "Mom's visit"
+  "marriage to attend - chidiya"  → "Chidiya's wedding"
+  "10,11 march - archi brother"   → "Archi's brother's wedding"
+  "flight to delhi next friday"   → "Flight to Delhi"
+  "call with investor monday"     → "Investor call"
+  "submit report by 20th"         → "Report deadline"
+  "dinner with rahul sunday"      → "Dinner with Rahul"
 
-INCLUDE any time-anchored occurrence: visits, arrivals, weddings, flights, meetings,
+━━━ INCLUDE ━━━
+ANY time-anchored occurrence: visits, arrivals, weddings, flights, meetings,
 calls, deadlines, dinners, birthdays, ceremonies — even casual informal ones.
 
-If there is genuinely NO date or time anchor at all, return [].
-
 ━━━ OUTPUT ━━━
-Return ONLY a valid JSON array. No explanation. No markdown. No wrapper object.
-
+Return ONLY a valid JSON array. No explanation. No markdown. No wrapper key.
 [{{"date": "YYYY-MM-DD", "label": "short human title"}}]"""
+
+        validated: List[Dict] = []
 
         try:
             raw = await self.cerebras.chat(prompt, max_tokens=512)
 
-            # Handle all return shapes from cerebras.chat
+            # Handle all return shapes cerebras.chat might produce
             if isinstance(raw, list):
                 events = raw
             elif isinstance(raw, dict):
-                # e.g. {"events": [...]} or {"dates": [...]}
                 events = raw.get("events", raw.get("dates", []))
             else:
                 cleaned = re.sub(r"```(?:json)?|```", "", str(raw)).strip()
                 parsed  = json.loads(cleaned)
                 events  = parsed if isinstance(parsed, list) else [parsed]
 
-            # Validate: must be {date: YYYY-MM-DD, label: non-empty string}
-            validated = []
             for e in events:
                 if not isinstance(e, dict):
                     continue
                 date  = e.get("date", "")
                 label = e.get("label", "")
                 if (
-                    re.match(r"^\d{4}-\d{2}-\d{2}$", date)   # strict format
+                    re.match(r"^\d{4}-\d{2}-\d{2}$", date)
                     and isinstance(label, str)
                     and label.strip()
                 ):
-                    validated.append({
-                        "date":  date,
-                        "label": label.strip(),
-                    })
-
-            return validated
+                    validated.append({"date": date, "label": label.strip()})
 
         except Exception as ex:
-            # Never block the main save flow
-            print(f"⚠ Event extraction failed (non-critical): {ex}")
-            return []
+            print(f"⚠ Event extraction (LLM) failed: {ex}")
+
+        # ── Layer 2: deterministic fallback ──────────────────────
+        # If the LLM still returned nothing despite a confirmed time anchor,
+        # synthesize an event from what _deep_understand already gave us.
+        if not validated and time_ref != "none":
+            date  = _resolve_relative_date(time_ref, ref_date)
+            label = _synthesize_label(content, people, concepts)
+            if date and label:
+                validated.append({"date": date, "label": label})
+                print(f"ℹ Event fallback used: '{label}' → {date}")
+
+        return validated
 
     # ─────────────────────────────────────────────────────────────
     # Deep understanding
@@ -347,35 +403,34 @@ Be specific and intelligent. Think like you're organizing this for future retrie
         content: str,
         understanding: Dict,
     ) -> str:
-        prompt = f"""You are organizing a note into the user's knowledge base.
+        prompt = f"""You are organizing a note into a personal knowledge base.
 
-EXISTING CATEGORIES:
-{', '.join(existing)}
+EXISTING CATEGORIES (already created by this user):
+{chr(10).join(f'  - {c}' for c in existing)}
 
 NEW NOTE:
 "{content}"
 
 NOTE ANALYSIS:
-- Intent: {understanding['intent']}
-- Concepts: {', '.join(understanding['concepts'])}
-- Suggested category: {suggested}
+- Intent   : {understanding['intent']}
+- Concepts : {', '.join(understanding['concepts'])}
+- People   : {understanding.get('entities', {}).get('people', [])}
+- Suggested: {suggested}
 
-TASK: Choose the BEST category.
+TASK: Pick the single best category name.
 
-Rules:
-1. Use existing category if note clearly fits (>70% match)
-2. Create NEW specific category if this is a distinct theme
-3. Be specific - avoid generic names
-4. Good: "Startup Ideas", "Python Learning", "Meeting Notes - Project X"
-5. Bad: "Notes", "Ideas", "Work", "Personal"
+STRICT RULES:
+1. DEFAULT to an existing category. Reuse aggressively.
+2. Treat semantically similar names as THE SAME — pick whichever already exists:
+   "Family Visit" = "Family and Upcoming Events" = "Family and Visitation" = "Family"
+   "Python Tips"  = "Python Learning" = "Python Notes" = "Python"
+3. Only create a NEW category if the note covers a topic with NO overlap
+   with any existing category whatsoever.
+4. Never create near-duplicates. When in doubt, reuse the closest one.
+5. Names must be short (1-3 words). No "and" chaining. No verbose phrases.
 
-Return JSON:
-{{
-  "category": "chosen or new category name",
-  "reason": "brief explanation",
-  "is_new": true/false
-}}
-"""
+Return ONLY this JSON, nothing else:
+{{"category": "name", "is_new": true/false}}"""
 
         response = await self.cerebras.chat(prompt)
         return response.get("category", suggested)
@@ -455,7 +510,6 @@ Return JSON:
         try:
             from services.embedding_service import embedding_service
 
-            # Combine content + essence for richer embedding
             text_to_embed = f"{content} {understanding.get('essence', '')}".strip()
             embedding     = embedding_service.embed(text_to_embed)
 
