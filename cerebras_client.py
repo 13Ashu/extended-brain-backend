@@ -51,7 +51,7 @@ class CerebrasClient:
     def __init__(
         self,
         api_key:   str | None = None,
-        provider:  str = "openrouter",          # "cerebras" | "openrouter"
+        provider:  str = "cerebras",          # "cerebras" | "openrouter"
         model:     str | None = None,
         # OpenRouter-specific optional metadata (used for rankings)
         site_url:  str | None = None,
