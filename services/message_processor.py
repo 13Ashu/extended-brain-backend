@@ -137,9 +137,23 @@ class MessageProcessor:
         # ── STEP 2: ASSIGN INTENT BUCKET ─────────────────────────
         bucket_name = await self._assign_intent_bucket(content, understanding)
 
+        # ── STEP 2b: SPLIT MULTI-ITEM TO-DOS ─────────────────────
+        # If this looks like a list of tasks, split and save each independently
+        if bucket_name == "To-Do" and message_type == "text":
+            todo_items = await self._split_todo_items(content, understanding)
+            if todo_items and len(todo_items) > 1:
+                return await self._process_todo_batch(
+                    user=user,
+                    items=todo_items,
+                    original_content=content,
+                    understanding=understanding,
+                    db=db,
+                )
+            # Single item — fall through to normal flow below
+
         # ── STEP 3: GET OR CREATE THE BUCKET CATEGORY ────────────
         category = await self._get_or_create_category(
-            user_id=(await self._get_user(user_phone, db)).id,
+            user_id=user.id,
             name=bucket_name,
             auto_description=INTENT_BUCKETS.get(bucket_name, ""),
             db=db,
@@ -261,8 +275,146 @@ Return ONLY this JSON:
         return bucket
 
     # ─────────────────────────────────────────────────────────────
-    # Due date extraction for To-Do messages
+    # Multi-item To-Do splitting
     # ─────────────────────────────────────────────────────────────
+
+    async def _split_todo_items(
+        self,
+        content: str,
+        understanding: Dict,
+    ) -> Optional[List[Dict]]:
+        """
+        Detect if a message contains multiple to-do tasks and split them.
+
+        Returns a list of dicts: [{task, due_date}, ...] or None if single task.
+
+        Examples that trigger splitting:
+          "Todo for monday: * do A * do b * do c"
+          "for today: do this, do that, do this"
+          "- buy milk\n- call dentist\n- pay rent"
+          "1. fix bug  2. write tests  3. deploy"
+        """
+
+        # Fast pre-check: if no list-like signals, skip LLM call
+        list_signals = ["\n-", "\n*", "\n•", "\n1.", "* ", "• ", "- ", ", do ", ": do "]
+        has_signal = any(s in content for s in list_signals) or content.count("\n") >= 2
+        if not has_signal and content.count(",") < 2:
+            return None  # Likely a single task — no need to split
+
+        today = datetime.utcnow().strftime("%Y-%m-%d (%A, %d %B %Y)")
+        tomorrow = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        prompt = f"""You split a message containing multiple to-do tasks into individual tasks.
+
+TODAY: {today}
+
+MESSAGE: "{content}"
+
+RULES:
+1. Extract each individual task as a clean, standalone sentence.
+2. If a date/day is mentioned for ALL tasks ("Todo for monday: ..."), apply that date to each.
+3. If no date is mentioned for a task → use today: {datetime.utcnow().strftime('%Y-%m-%d')}
+4. Clean up the task text — remove bullet chars (*, -, •), numbering, prefixes like "todo:".
+5. If the message is actually just ONE task (not a list), return a single item.
+6. Ignore preamble like "for today:", "todos:", "my tasks:" — extract only the actual tasks.
+
+Return ONLY this JSON (no markdown):
+{{
+  "items": [
+    {{"task": "clean task text", "due_date": "YYYY-MM-DD"}},
+    {{"task": "clean task text", "due_date": "YYYY-MM-DD"}}
+  ]
+}}"""
+
+        try:
+            response = await self.cerebras.chat(prompt)
+            items = response.get("items", [])
+
+            # Validate each item
+            valid = []
+            import re as _re
+            for item in items:
+                task = str(item.get("task", "")).strip()
+                due  = item.get("due_date", "")
+                if not task:
+                    continue
+                if not due or not _re.match(r"^\d{4}-\d{2}-\d{2}$", str(due)):
+                    due = datetime.utcnow().strftime("%Y-%m-%d")
+                valid.append({"task": task, "due_date": due})
+
+            return valid if valid else None
+
+        except Exception as e:
+            print(f"⚠ Todo split failed: {e}")
+            return None
+
+    async def _process_todo_batch(
+        self,
+        user: User,
+        items: List[Dict],
+        original_content: str,
+        understanding: Dict,
+        db: AsyncSession,
+    ) -> Dict:
+        """
+        Save each split to-do task as an independent Message row.
+        Returns a summary response.
+        """
+        # Get (or create) the To-Do category once
+        category = await self._get_or_create_category(
+            user_id=user.id,
+            name="To-Do",
+            auto_description=INTENT_BUCKETS.get("To-Do", ""),
+            db=db,
+        )
+
+        saved_ids = []
+        for item in items:
+            task     = item["task"]
+            due_date = item["due_date"]
+
+            message = Message(
+                user_id=user.id,
+                category_id=category.id,
+                content=task,
+                message_type=MessageType("text"),
+                media_url=None,
+                summary=task[:100],
+                tags={
+                    "keywords":       understanding.get("keywords", []),
+                    "entities":       understanding.get("entities", {}),
+                    "concepts":       understanding.get("concepts", []),
+                    "actionables":    [task],
+                    "sentiment":      "neutral",
+                    "time_reference": "none",
+                    "intent_bucket":  "To-Do",
+                    "due_date":       due_date,
+                    "events":         [],
+                    "split_from":     original_content[:200],  # audit trail
+                },
+                created_at=datetime.utcnow(),
+            )
+            db.add(message)
+            await db.flush()   # get message.id without full commit
+            saved_ids.append(message.id)
+
+            # Embedding per task
+            await self._save_embedding(message.id, task, understanding, db)
+
+        await db.commit()
+
+        return {
+            "message_id":    saved_ids[0] if saved_ids else None,
+            "split_count":   len(saved_ids),
+            "message_ids":   saved_ids,
+            "category":      "To-Do",
+            "intent_bucket": "To-Do",
+            "tags":          understanding.get("keywords", []),
+            "essence":       f"Saved {len(saved_ids)} tasks: " + ", ".join(i["task"] for i in items[:3]),
+            "connections":   [],
+            "due_date":      items[0]["due_date"] if items else None,
+            "events":        [],
+        }
 
     async def _extract_due_date(
         self,
