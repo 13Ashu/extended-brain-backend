@@ -224,7 +224,7 @@ Think: What is the user REALLY trying to find?
                 "content": message.content,
                 "essence": message.summary,
                 "category": category.name if category else "Uncategorized",
-                "tags": message.tags.get("keywords", []) if isinstance(message.tags, dict) else [],
+                "tags": message.tags if isinstance(message.tags, dict) else {},
                 "created_at": message.created_at.isoformat(),
                 "relevance": score,
                 "preview": self._generate_preview(message.content, understanding["keywords"])
