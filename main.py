@@ -267,6 +267,18 @@ async def forgot_password(
     return result
 
 
+@app.delete("/api/auth/delete-account")
+async def delete_account(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    phone = current_user.phone_number
+    await db.delete(current_user)
+    await db.commit()
+    print(f"🗑 Account deleted: {phone}")
+    return {"success": True, "message": "Account and all associated data permanently deleted."}
+
+
 @app.post("/api/auth/link-telegram")
 async def link_telegram(
     request: TelegramLinkRequest,
