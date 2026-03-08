@@ -5,7 +5,7 @@ Natural language search that understands INTENT, TIME, and BUCKET context.
 
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, func, text
+from sqlalchemy import select, or_, and_, func, text
 from datetime import datetime, timedelta, date
 import re
 
