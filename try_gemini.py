@@ -3,7 +3,7 @@ from google import genai
 
 # The client automatically picks up the API key from the environment variable GEMINI_API_KEY
 # Alternatively, you can pass the key explicitly: client = genai.Client(api_key="YOUR_API_KEY")
-client = genai.Client(api_key="AIzaSyAu_y_ffx4NJmQi0wUpGAq8tGoASf58iug")
+client = genai.Client(api_key="")
 
 # Select a model, for example, 'gemini-2.5-flash'
 # model_name = "gemini-2.5-flash"

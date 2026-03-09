@@ -5,7 +5,7 @@ url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-late
 
 headers = {
     "Content-Type": "application/json",
-    "X-goog-api-key": "AIzaSyAu_y_ffx4NJmQi0wUpGAq8tGoASf58iug"
+    "X-goog-api-key": ""
 }
 
 payload = {
