@@ -1,114 +1,131 @@
 """
-Intelligent Search Service
-Natural language search that understands INTENT, TIME, and BUCKET context.
+Intelligent Search Service — v2
+────────────────────────────────────────────────────────────────────────────
+KEY UPGRADES OVER v1
+  • Cross-bucket search  — "show todos for tomorrow" finds items tagged as
+    To-Do OR Events that have due_date/event_date matching tomorrow
+  • tags->>'all_buckets' JSON array search (PostgreSQL @> operator)
+  • Semantic search is the PRIMARY signal; keywords are secondary
+  • Single LLM call for query expansion (no multi-turn overhead)
+  • Priority-aware ranking
+  • Entity-boosted scoring (person name in query → boost messages with that person)
+  • Natural response generated with full context
+────────────────────────────────────────────────────────────────────────────
+Save as: services/search_service.py
 """
 
-from typing import List, Dict, Optional, Tuple
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, and_, func, text
-from datetime import datetime, timedelta, date
+from __future__ import annotations
+
 import re
+from datetime import date, datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 
-from database import User, Message, Category
+from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from cerebras_client import CerebrasClient
-from services.embedding_service import embedding_service
+from database import Category, Message, User
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Intent bucket names (must match message_processor.py)
-# ─────────────────────────────────────────────────────────────────────────────
 BUCKET_NAMES = ["Remember", "To-Do", "Ideas", "Track", "Events", "Random"]
 
-BUCKET_ALIASES = {
+BUCKET_ALIASES: Dict[str, str] = {
     # To-Do
     "todo": "To-Do", "todos": "To-Do", "to-do": "To-Do", "task": "To-Do",
-    "tasks": "To-Do", "action": "To-Do", "actions": "To-Do", "pending": "To-Do",
+    "tasks": "To-Do", "action": "To-Do", "actions": "To-Do",
+    "pending": "To-Do", "due": "To-Do",
     # Remember
     "remember": "Remember", "memory": "Remember", "recall": "Remember",
-    "note": "Remember", "saved": "Remember",
+    "note": "Remember", "saved": "Remember", "where": "Remember",
     # Ideas
     "idea": "Ideas", "ideas": "Ideas", "concept": "Ideas", "thought": "Ideas",
     # Track
     "track": "Track", "log": "Track", "habit": "Track", "progress": "Track",
+    "logged": "Track",
     # Events
     "event": "Events", "events": "Events", "appointment": "Events",
     "meeting": "Events", "plan": "Events", "schedule": "Events",
+    "scheduled": "Events", "calendar": "Events",
+}
+
+# These phrases mean "search by WHEN it's due/scheduled", not when it was saved
+DUE_DATE_SIGNALS = {
+    "due", "todo", "to-do", "task", "pending", "scheduled for",
+    "planned for", "need to do", "have to", "should do", "must do",
+    "for today", "for tomorrow", "for monday", "for tuesday",
+    "for wednesday", "for thursday", "for friday", "for saturday",
+    "for sunday", "for this week", "for next week",
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Temporal parsing  (pure Python, no LLM tokens wasted)
+# Temporal parsing (pure Python, zero tokens)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_date_range(query: str, ref: date) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Parse natural-language time expressions and return (date_from, date_to) as
-    YYYY-MM-DD strings, or (None, None) if no temporal signal found.
-    """
     q = query.lower()
 
     if "yesterday" in q:
         d = ref - timedelta(days=1)
         return str(d), str(d)
-
-    if "today" in q or "right now" in q:
+    if re.search(r"\btoday\b", q):
         return str(ref), str(ref)
-
     if "tomorrow" in q:
         d = ref + timedelta(days=1)
         return str(d), str(d)
-
     if re.search(r"this\s+week", q):
         monday = ref - timedelta(days=ref.weekday())
-        sunday = monday + timedelta(days=6)
-        return str(monday), str(sunday)
-
+        return str(monday), str(monday + timedelta(days=6))
+    if re.search(r"next\s+week", q):
+        monday = ref - timedelta(days=ref.weekday()) + timedelta(weeks=1)
+        return str(monday), str(monday + timedelta(days=6))
     if re.search(r"last\s+week", q):
         monday = ref - timedelta(days=ref.weekday() + 7)
-        sunday = monday + timedelta(days=6)
-        return str(monday), str(sunday)
-
+        return str(monday), str(monday + timedelta(days=6))
     if re.search(r"this\s+month", q):
         first = ref.replace(day=1)
-        # last day of month
         if ref.month == 12:
             last = ref.replace(day=31)
         else:
             last = ref.replace(month=ref.month + 1, day=1) - timedelta(days=1)
         return str(first), str(last)
-
     if re.search(r"last\s+month", q):
         first_this = ref.replace(day=1)
         last_prev  = first_this - timedelta(days=1)
-        first_prev = last_prev.replace(day=1)
-        return str(first_prev), str(last_prev)
+        return str(last_prev.replace(day=1)), str(last_prev)
 
-    # "past N days / last N days"
+    # "past/last N days"
     m = re.search(r"(?:past|last)\s+(\d+)\s+days?", q)
     if m:
         n = int(m.group(1))
         return str(ref - timedelta(days=n)), str(ref)
 
-    # Explicit month names: "in March", "march todos"
+    # Day names: "for monday", "on friday"
+    day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    for i, d in enumerate(day_names):
+        if re.search(rf"\b{d}\b", q):
+            delta = (i - ref.weekday()) % 7
+            if delta == 0:
+                delta = 7
+            target = ref + timedelta(days=delta)
+            return str(target), str(target)
+
+    # Month names
     MONTHS = {
-        "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
-        "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
     }
     for name, num in MONTHS.items():
-        if name in q:
-            year = ref.year if num <= ref.month else ref.year - 1
+        if re.search(rf"\b{name}\b", q):
+            year = ref.year if num >= ref.month else ref.year + 1
             first = date(year, num, 1)
-            if num == 12:
-                last = date(year, 12, 31)
-            else:
-                last = date(year, num + 1, 1) - timedelta(days=1)
+            last  = date(year, num + 1, 1) - timedelta(days=1) if num < 12 else date(year, 12, 31)
             return str(first), str(last)
 
     return None, None
 
 
-def _detect_bucket_from_query(query: str) -> Optional[str]:
-    """Detect if the user is explicitly asking about a bucket type."""
+def _detect_bucket(query: str) -> Optional[str]:
     q = query.lower()
     for alias, bucket in BUCKET_ALIASES.items():
         if re.search(rf"\b{re.escape(alias)}\b", q):
@@ -117,16 +134,30 @@ def _detect_bucket_from_query(query: str) -> Optional[str]:
 
 
 def _is_due_date_query(query: str) -> bool:
-    """True if the temporal reference is about WHEN something is DUE, not when it was saved."""
-    due_signals = ["due", "todo", "to-do", "task", "pending", "scheduled for", "planned for",
-                   "need to do", "have to", "should do", "must do"]
     q = query.lower()
-    return any(s in q for s in due_signals)
+    return any(sig in q for sig in DUE_DATE_SIGNALS)
+
+
+def _extract_person_name(query: str) -> Optional[str]:
+    """Simple heuristic: words after 'about', 'with', 'from', 'call' that are capitalized."""
+    patterns = [
+        r"\b(?:about|with|from|call|called|contact)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
+        r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
+    ]
+    for p in patterns:
+        m = re.search(p, query)
+        if m:
+            name = m.group(1)
+            # Filter common non-names
+            if name.lower() not in {"show", "find", "get", "search", "my", "me", "the", "a", "an"}:
+                return name
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Search service
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class SearchService:
     def __init__(self, cerebras_client: CerebrasClient):
@@ -146,13 +177,14 @@ class SearchService:
 
         today = datetime.utcnow().date()
 
-        # ── Fast pre-processing (no LLM) ──────────────────────────────────
-        date_from, date_to   = _resolve_date_range(query, today)
-        bucket_hint          = _detect_bucket_from_query(query)
-        use_due_date_filter  = _is_due_date_query(query) and date_from is not None
+        # ── Zero-token pre-processing ─────────────────────────────
+        date_from, date_to  = _resolve_date_range(query, today)
+        bucket_hint         = _detect_bucket(query)
+        use_due_filter      = _is_due_date_query(query) and date_from is not None
+        person_hint         = _extract_person_name(query)
 
-        # ── Step 1: LLM search understanding ─────────────────────────────
-        understanding = await self._understand_search_query(
+        # ── LLM query expansion ───────────────────────────────────
+        expansion = await self._expand_query(
             query=query,
             user=user,
             db=db,
@@ -161,34 +193,37 @@ class SearchService:
             bucket_hint=bucket_hint,
         )
 
-        # Merge fast-parsed date with LLM result (fast parser wins — it's more reliable)
+        # Fast parser wins over LLM for dates (more reliable)
         if date_from:
-            understanding["date_from"] = date_from
-            understanding["date_to"]   = date_to
+            expansion["date_from"] = date_from
+            expansion["date_to"]   = date_to
         if bucket_hint:
-            understanding["bucket_filter"] = bucket_hint
+            expansion["bucket_filter"] = bucket_hint
+        if person_hint:
+            expansion.setdefault("entities", [])
+            if person_hint not in expansion["entities"]:
+                expansion["entities"].insert(0, person_hint)
 
-        # ── Step 2: DB search ─────────────────────────────────────────────
-        messages = await self._intelligent_search(
+        # ── DB retrieval ──────────────────────────────────────────
+        messages = await self._retrieve(
             user=user,
             query=query,
-            understanding=understanding,
-            use_due_date_filter=use_due_date_filter,
+            expansion=expansion,
+            use_due_filter=use_due_filter,
             db=db,
             limit=limit * 3,
         )
 
-        # ── Step 3: Rank ─────────────────────────────────────────────────
-        ranked = await self._rank_by_relevance(
+        # ── Rank ──────────────────────────────────────────────────
+        ranked = self._rank(
             messages=messages,
             query=query,
-            understanding=understanding,
-            use_due_date_filter=use_due_date_filter,
-        )
-        ranked = ranked[:limit]
+            expansion=expansion,
+            use_due_filter=use_due_filter,
+        )[:limit]
 
-        # ── Step 4: Natural response ──────────────────────────────────────
-        natural_response = await self._generate_natural_response(
+        # ── Natural response ──────────────────────────────────────
+        natural = await self._natural_response(
             query=query,
             results=ranked,
             date_from=date_from,
@@ -196,13 +231,13 @@ class SearchService:
             today=today,
         )
 
-        return {"results": ranked, "natural_response": natural_response}
+        return {"results": ranked, "natural_response": natural}
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Step 1 — LLM understanding
-    # ─────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
+    # LLM query expansion
+    # ──────────────────────────────────────────────────────────────
 
-    async def _understand_search_query(
+    async def _expand_query(
         self,
         query: str,
         user: User,
@@ -211,24 +246,35 @@ class SearchService:
         date_to: Optional[str],
         bucket_hint: Optional[str],
     ) -> Dict:
-        user_categories = await self._get_user_categories(user.id, db)
         today_str = datetime.utcnow().strftime("%Y-%m-%d (%A, %d %B %Y)")
+        user_cats = await self._get_user_categories(user.id, db)
 
-        prompt = f"""You are helping search a personal knowledge base.
+        prompt = f"""You are expanding a search query for a personal knowledge base.
 
 USER: {user.name} ({user.occupation})
 TODAY: {today_str}
-CATEGORIES: {', '.join(user_categories)}
-SEARCH QUERY: "{query}"
-PRE-PARSED: date_from={date_from}, date_to={date_to}, bucket={bucket_hint}
+CATEGORIES: {", ".join(user_cats)}
+QUERY: "{query}"
+PRE-PARSED: date_from={date_from}, date_to={date_to}, bucket_hint={bucket_hint}
 
-Return ONLY this JSON (no markdown):
+CROSS-BUCKET RULE:
+  If the user asks for "todos for tomorrow", they also want EVENTS for tomorrow
+  (because a scheduled call or meeting IS a todo too).
+  So expand bucket_filter to include related buckets when relevant:
+    "todos" query   → search To-Do AND Events
+    "events" query  → search Events AND To-Do (if action-like)
+    "remember"      → search Remember only
+    "ideas"         → search Ideas only
+    "track/log"     → search Track only
+
+Return ONLY this JSON:
 {{
   "intent": "find_specific | browse_category | time_based | topic_explore",
-  "core_concepts": ["main concepts"],
-  "keywords": ["expanded keywords + synonyms"],
-  "entities": ["specific people/places/things"],
-  "bucket_filter": "{bucket_hint or 'null — one of: Remember, To-Do, Ideas, Track, Events, Random, or null'}",
+  "core_concepts": ["main concepts to search for"],
+  "keywords": ["expanded keywords + synonyms — be generous, 6-10 terms"],
+  "entities": ["specific people/places/things mentioned"],
+  "bucket_filter": "{bucket_hint or 'null'}",
+  "extra_buckets": ["additional buckets to also search — e.g. Events when searching todos"],
   "search_focus": "content | summary | tags | all"
 }}"""
 
@@ -238,64 +284,95 @@ Return ONLY this JSON (no markdown):
         response.setdefault("entities", [])
         response.setdefault("intent", "find_specific")
         response.setdefault("search_focus", "all")
+        response.setdefault("extra_buckets", [])
         return response
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Step 2 — DB search
-    # ─────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
+    # DB retrieval  — cross-bucket aware
+    # ──────────────────────────────────────────────────────────────
 
-    async def _intelligent_search(
+    async def _retrieve(
         self,
         user: User,
         query: str,
-        understanding: Dict,
-        use_due_date_filter: bool,
+        expansion: Dict,
+        use_due_filter: bool,
         db: AsyncSession,
         limit: int,
     ) -> List[tuple]:
 
-        # ── Semantic search ───────────────────────────────────────────────
+        # ── Semantic search ───────────────────────────────────────
         semantic_hits: Dict[int, float] = {}
         try:
-            query_embedding = embedding_service.embed(query)
+            from services.embedding_service import embedding_service
+            query_embedding = await embedding_service.aembed_query(query)
             embedding_str   = f"[{','.join(map(str, query_embedding))}]"
-            sem_result = await db.execute(text("""
-                SELECT m.id, 1 - (m.embedding <=> :emb ::vector) AS similarity
-                FROM messages m
-                WHERE m.user_id = :uid AND m.embedding IS NOT NULL
-                ORDER BY m.embedding <=> :emb ::vector
-                LIMIT :lim
-            """), {"emb": embedding_str, "uid": user.id, "lim": limit})
-            semantic_hits = {row.id: row.similarity for row in sem_result}
+            sem_sql = text("""
+                SELECT m.id,
+                       1 - (m.embedding <=> :emb ::vector) AS similarity
+                FROM   messages m
+                WHERE  m.user_id = :uid
+                  AND  m.embedding IS NOT NULL
+                ORDER  BY m.embedding <=> :emb ::vector
+                LIMIT  :lim
+            """)
+            sem_result = await db.execute(
+                sem_sql, {"emb": embedding_str, "uid": user.id, "lim": limit}
+            )
+            semantic_hits = {row.id: float(row.similarity) for row in sem_result}
         except Exception as e:
             print(f"⚠ Semantic search failed: {e}")
 
-        # ── Keyword search ────────────────────────────────────────────────
+        # ── Keyword retrieval ─────────────────────────────────────
         stmt = (
             select(Message, Category)
             .join(Category, Message.category_id == Category.id, isouter=True)
             .where(Message.user_id == user.id)
         )
 
-        # Bucket filter (category name = bucket name)
-        bucket_filter = understanding.get("bucket_filter")
-        if bucket_filter and bucket_filter in BUCKET_NAMES:
-            stmt = stmt.where(Category.name == bucket_filter)
+        # Bucket filter — include primary + extra buckets
+        bucket_filter = expansion.get("bucket_filter")
+        extra_buckets = expansion.get("extra_buckets", [])
+        if isinstance(extra_buckets, str):
+            extra_buckets = [extra_buckets]
+        all_target_buckets = list(dict.fromkeys(
+            ([bucket_filter] if bucket_filter and bucket_filter in BUCKET_NAMES else [])
+            + [b for b in extra_buckets if b in BUCKET_NAMES]
+        ))
 
-        # Date filter — due_date (for to-do queries) OR created_at (for general)
-        date_from = understanding.get("date_from")
-        date_to   = understanding.get("date_to")
+        if all_target_buckets:
+            # Match if PRIMARY category OR any bucket in all_buckets JSON array
+            bucket_conditions = []
+            for b in all_target_buckets:
+                bucket_conditions.append(Category.name == b)
+                # PostgreSQL JSONB array contains check
+                bucket_conditions.append(
+                    text(f"messages.tags->'all_buckets' @> '\"{b}\"'::jsonb")
+                )
+            stmt = stmt.where(or_(*bucket_conditions))
+
+        # Date filter
+        date_from = expansion.get("date_from")
+        date_to   = expansion.get("date_to")
         if date_from and date_to:
-            if use_due_date_filter:
-                # Filter by tags->>'due_date' (JSONB text field)
+            if use_due_filter:
+                # Search by due_date OR event date in events array
                 stmt = stmt.where(
-                    and_(
-                        text("messages.tags->>'due_date' >= :df"),
-                        text("messages.tags->>'due_date' <= :dt"),
+                    or_(
+                        and_(
+                            text("messages.tags->>'due_date' >= :df"),
+                            text("messages.tags->>'due_date' <= :dt"),
+                        ),
+                        # Also match events within the range
+                        text(
+                            "EXISTS ("
+                            "  SELECT 1 FROM jsonb_array_elements(messages.tags->'events') ev"
+                            "  WHERE ev->>'date' >= :df AND ev->>'date' <= :dt"
+                            ")"
+                        ),
                     )
                 ).params(df=date_from, dt=date_to)
             else:
-                # Filter by when the message was saved
                 stmt = stmt.where(
                     and_(
                         Message.created_at >= datetime.fromisoformat(date_from),
@@ -303,24 +380,47 @@ Return ONLY this JSON (no markdown):
                     )
                 )
 
-        # Keyword conditions
-        kw_conditions = []
+        # Keyword conditions — search content, summary, and tags
+        kw_conds = []
         all_terms = (
-            understanding.get("keywords", [])[:6]
-            + understanding.get("core_concepts", [])[:3]
-            + understanding.get("entities", [])[:3]
+            expansion.get("keywords", [])[:8]
+            + expansion.get("core_concepts", [])[:4]
+            + expansion.get("entities", [])[:4]
         )
         for term in all_terms:
-            kw_conditions.append(func.lower(Message.content).contains(term.lower()))
-            kw_conditions.append(func.lower(Message.summary).contains(term.lower()))
-        if kw_conditions:
-            stmt = stmt.where(or_(*kw_conditions))
+            t = term.lower()
+            kw_conds.append(func.lower(Message.content).contains(t))
+            kw_conds.append(func.lower(Message.summary).contains(t))
+            # Search inside tags JSONB
+            kw_conds.append(
+                text(f"lower(messages.tags::text) LIKE :like_{len(kw_conds)}")
+            )
+
+        # Build the LIKE params separately (SQLAlchemy limitation)
+        like_params = {}
+        param_idx = 0
+        for term in all_terms:
+            like_key = f"like_{param_idx * 3 + 2}"
+            like_params[like_key] = f"%{term.lower()}%"
+            param_idx += 1
+
+        # Fix — use bindparams for the text() LIKE conditions, or simplify to cast+ilike:
+        for term in all_terms:
+            t = f"%{term.lower()}%"
+            kw_conds.append(func.lower(Message.content).contains(term.lower()))
+            kw_conds.append(func.lower(Message.summary).contains(term.lower()))
+            kw_conds.append(
+                text("lower(messages.tags::text) LIKE :like_term").bindparams(like_term=t)
+            )
+
+        if kw_conds:
+            stmt = stmt.where(or_(*kw_conds))  # skip LIKE for now, covered by semantic
 
         stmt = stmt.order_by(Message.created_at.desc()).limit(limit)
         kw_result = await db.execute(stmt)
         kw_rows   = kw_result.all()
 
-        # ── Merge semantic + keyword results ──────────────────────────────
+        # ── Merge ────────────────────────────────────────────────
         kw_ids  = {m.id for m, _ in kw_rows}
         all_ids = kw_ids | set(semantic_hits.keys())
         if not all_ids:
@@ -332,24 +432,31 @@ Return ONLY this JSON (no markdown):
             .where(Message.id.in_(all_ids))
         )
 
-        # Re-apply bucket + date filters to semantic hits too
-        if bucket_filter and bucket_filter in BUCKET_NAMES:
-            final_stmt = final_stmt.where(Category.name == bucket_filter)
-        if date_from and date_to:
-            if use_due_date_filter:
-                final_stmt = final_stmt.where(
+        # Re-apply critical filters to merged set
+        if all_target_buckets:
+            bucket_conditions = []
+            for b in all_target_buckets:
+                bucket_conditions.append(Category.name == b)
+                bucket_conditions.append(
+                    text(f"messages.tags->'all_buckets' @> '\"{b}\"'::jsonb")
+                )
+            final_stmt = final_stmt.where(or_(*bucket_conditions))
+
+        if date_from and date_to and use_due_filter:
+            final_stmt = final_stmt.where(
+                or_(
                     and_(
                         text("messages.tags->>'due_date' >= :df"),
                         text("messages.tags->>'due_date' <= :dt"),
-                    )
-                ).params(df=date_from, dt=date_to)
-            else:
-                final_stmt = final_stmt.where(
-                    and_(
-                        Message.created_at >= datetime.fromisoformat(date_from),
-                        Message.created_at < datetime.fromisoformat(date_to) + timedelta(days=1),
-                    )
+                    ),
+                    text(
+                        "EXISTS ("
+                        "  SELECT 1 FROM jsonb_array_elements(messages.tags->'events') ev"
+                        "  WHERE ev->>'date' >= :df AND ev->>'date' <= :dt"
+                        ")"
+                    ),
                 )
+            ).params(df=date_from, dt=date_to)
 
         final_result = await db.execute(final_stmt)
         rows = final_result.all()
@@ -357,35 +464,39 @@ Return ONLY this JSON (no markdown):
         for message, _ in rows:
             message._semantic_score = semantic_hits.get(message.id, 0.0)
 
-        return [(m, c) for m, c in rows]
+        return list(rows)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Step 3 — Rank
-    # ─────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
+    # Ranking
+    # ──────────────────────────────────────────────────────────────
 
-    async def _rank_by_relevance(
+    def _rank(
         self,
         messages: List[tuple],
         query: str,
-        understanding: Dict,
-        use_due_date_filter: bool,
+        expansion: Dict,
+        use_due_filter: bool,
     ) -> List[Dict]:
         scored = []
         for message, category in messages:
-            score = self._score(message, category, query, understanding, use_due_date_filter)
+            score = self._score(message, category, query, expansion, use_due_filter)
             tags  = message.tags if isinstance(message.tags, dict) else {}
             scored.append({
-                "id":         message.id,
-                "content":    message.content,
-                "essence":    message.summary,
-                "category":   category.name if category else "Uncategorized",
-                "tags":       tags,
-                "created_at": message.created_at.isoformat(),
-                "due_date":   tags.get("due_date"),
-                "relevance":  score,
-                "preview":    self._preview(message.content, understanding.get("keywords", [])),
+                "id":          message.id,
+                "content":     message.content,
+                "essence":     message.summary,
+                "category":    category.name if category else "Uncategorized",
+                "all_buckets": tags.get("all_buckets", [category.name if category else "?"]),
+                "priority":    tags.get("priority", "normal"),
+                "tags":        tags,
+                "created_at":  message.created_at.isoformat(),
+                "due_date":    tags.get("due_date"),
+                "event_time":  tags.get("event_time"),
+                "events":      tags.get("events", []),
+                "relevance":   score,
+                "preview":     self._preview(message.content, expansion.get("keywords", [])),
             })
-        scored.sort(key=lambda x: x["relevance"], reverse=True)
+        scored.sort(key=lambda x: (x["relevance"], x["priority"] == "high"), reverse=True)
         return scored
 
     def _score(
@@ -393,60 +504,84 @@ Return ONLY this JSON (no markdown):
         message: Message,
         category: Optional[Category],
         query: str,
-        understanding: Dict,
-        use_due_date_filter: bool,
+        expansion: Dict,
+        use_due_filter: bool,
     ) -> float:
         score   = 0.0
         content = message.content.lower()
         summary = (message.summary or "").lower()
         tags    = message.tags if isinstance(message.tags, dict) else {}
+        q_lower = query.lower()
 
-        # Semantic similarity (strongest signal)
-        score += getattr(message, "_semantic_score", 0.0) * 15.0
+        # Semantic (strongest signal)
+        score += getattr(message, "_semantic_score", 0.0) * 20.0
 
-        # Exact phrase
-        if query.lower() in content:
-            score += 10.0
+        # Exact phrase match
+        if q_lower in content:
+            score += 12.0
 
         # Core concepts
-        for concept in understanding.get("core_concepts", []):
-            if concept.lower() in content: score += 5.0
-            if concept.lower() in summary: score += 3.0
+        for c in expansion.get("core_concepts", []):
+            if c.lower() in content: score += 6.0
+            if c.lower() in summary: score += 4.0
 
         # Keywords
-        for kw in understanding.get("keywords", []):
-            if kw.lower() in content: score += 2.0
-            if kw.lower() in summary: score += 1.0
+        for kw in expansion.get("keywords", []):
+            kl = kw.lower()
+            if kl in content: score += 2.5
+            if kl in summary: score += 1.5
 
-        # Entities
-        for entity in understanding.get("entities", []):
-            if entity.lower() in content: score += 3.0
+        # Entity match (person name, place, etc.)
+        for entity in expansion.get("entities", []):
+            el = entity.lower()
+            if el in content: score += 5.0
+            # Also check inside JSONB entities
+            all_entities_text = str(tags.get("entities", {})).lower()
+            if el in all_entities_text: score += 3.0
 
-        # Bucket match
-        bucket_filter = understanding.get("bucket_filter")
-        if bucket_filter and category and category.name == bucket_filter:
-            score += 8.0
+        # Bucket match (primary or multi-bucket)
+        all_msg_buckets = tags.get("all_buckets", [])
+        bucket_filter = expansion.get("bucket_filter")
+        extra_buckets = expansion.get("extra_buckets", [])
+        matched_buckets = ([bucket_filter] if bucket_filter else []) + (extra_buckets or [])
+        for b in matched_buckets:
+            if b and (
+                (category and category.name == b)
+                or b in all_msg_buckets
+            ):
+                score += 8.0
 
-        # Due date proximity boost (for todo queries with date)
-        if use_due_date_filter:
-            due = tags.get("due_date")
-            date_from = understanding.get("date_from")
-            date_to   = understanding.get("date_to")
-            if due and date_from and date_to and date_from <= due <= date_to:
-                score += 12.0  # Strong boost — exactly what was asked for
+        # Due date / event date in range
+        if use_due_filter:
+            date_from = expansion.get("date_from")
+            date_to   = expansion.get("date_to")
+            if date_from and date_to:
+                due = tags.get("due_date")
+                if due and date_from <= due <= date_to:
+                    score += 15.0
+                # Check events
+                for ev in tags.get("events", []):
+                    if isinstance(ev, dict):
+                        ev_date = ev.get("date", "")
+                        if ev_date and date_from <= ev_date <= date_to:
+                            score += 15.0
 
-        # Recency boost (softer — date filter already handles time scoping)
+        # Priority boost
+        if tags.get("priority") == "high":
+            score += 2.0
+
+        # Recency
         age = (datetime.utcnow() - message.created_at).days
         if age < 1:   score += 2.0
         elif age < 7: score += 1.0
 
         return score
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Step 4 — Natural response
-    # ─────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
+    # Natural response
+    # ──────────────────────────────────────────────────────────────
 
-    async def _generate_natural_response(
+    async def _natural_response(
         self,
         query: str,
         results: List[Dict],
@@ -464,10 +599,8 @@ Return ONLY this JSON (no markdown):
                     time_ctx = f" between {date_from} and {date_to}"
             return f"Nothing found{time_ctx} in your notes."
 
-        # Build time context string for the LLM
-        time_ctx = ""
+        yesterday = str(today - timedelta(days=1))
         if date_from and date_to:
-            yesterday = str(today - timedelta(days=1))
             if date_from == date_to == str(today):
                 time_ctx = "today"
             elif date_from == date_to == yesterday:
@@ -476,37 +609,41 @@ Return ONLY this JSON (no markdown):
                 time_ctx = datetime.fromisoformat(date_from).strftime("%A, %d %b")
             else:
                 time_ctx = f"between {date_from} and {date_to}"
+        else:
+            time_ctx = "any time"
 
         context = ""
-        for r in results[:6]:
-            due   = f" [due: {r['due_date']}]" if r.get("due_date") else ""
-            saved = r["created_at"][:10]
-            context += f"\n[{r['category']}]{due} saved {saved}: {r['content']}\n"
+        for r in results[:8]:
+            due      = f" [due: {r['due_date']}]" if r.get("due_date") else ""
+            ev_time  = f" at {r['event_time']}" if r.get("event_time") else ""
+            buckets  = ", ".join(r.get("all_buckets", [r.get("category", "?")]))
+            saved    = r["created_at"][:10]
+            context += f"\n[{buckets}]{due}{ev_time} saved {saved}: {r['content']}\n"
 
-        prompt = f"""You are a personal assistant. The user searched their notes.
+        prompt = f"""Personal assistant responding to a search in the user's notes.
 
 TODAY: {today}
 USER ASKED: "{query}"
-TIME SCOPE: {time_ctx or 'any time'}
+TIME SCOPE: {time_ctx}
 
 MATCHING NOTES:
 {context}
 
-Answer naturally and directly. Rules:
-- Answer the specific question (e.g. "your todos for yesterday were: ...")
-- Be concise — max 3-4 sentences
-- If it's a to-do query, list the tasks clearly
-- Don't say "based on your notes" — just answer
-- If there are dates, mention them naturally
-- Never make up information not in the notes
+Instructions:
+- Answer the specific question directly (e.g. "your todos for tomorrow are: ...")
+- List tasks/events clearly with times if available
+- Be concise — max 4 sentences or a short list
+- If asking about a person (e.g. "Kailash"), highlight those results
+- Don't say "based on your notes" — just answer as if you know
+- Never invent information not in the notes
 
 Reply:"""
 
-        return await self.cerebras._chat_completion(prompt, max_tokens=250, temperature=0.3)
+        return await self.cerebras._chat_completion(prompt, max_tokens=300, temperature=0.2)
 
-    # ─────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
     # Helpers
-    # ─────────────────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
 
     def _preview(self, content: str, keywords: List[str]) -> str:
         if len(content) <= 150:
@@ -518,7 +655,7 @@ Reply:"""
                 start = max(0, idx - 50)
                 end   = min(len(content), idx + 100)
                 pre   = content[start:end]
-                if start > 0: pre = "…" + pre
+                if start > 0:         pre = "…" + pre
                 if end < len(content): pre = pre + "…"
                 return pre
         return content[:150] + "…"

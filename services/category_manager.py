@@ -68,6 +68,8 @@ class CategoryManager:
         name: str,
         db: AsyncSession,
         description: Optional[str] = None,
+        color: Optional[str] = None,   # add
+        icon: Optional[str] = None,    # add
     ) -> Dict:
         """Create a new category"""
         
@@ -92,7 +94,9 @@ class CategoryManager:
         category = Category(
             user_id=user.id,
             name=name,
-            description=description
+            description=description,
+            color=color,   # add
+            icon=icon,
         )
         
         db.add(category)

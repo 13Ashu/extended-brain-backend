@@ -169,7 +169,7 @@ class Message(Base):
     summary: Mapped[Optional[str]] = mapped_column(Text)
     tags: Mapped[Optional[dict]] = mapped_column(JSON)  # List of tags
     entities: Mapped[Optional[dict]] = mapped_column(JSON)  # Extracted entities
-    embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(384), nullable=True)  # Vector embedding for search
+    embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(1536), nullable=True)  # Vector embedding for search
     
     # Timestamps
     original_timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime)
