@@ -196,23 +196,28 @@ class CerebrasClient:
         max_tokens: int = 400,
         temperature: float = 0.1,
     ) -> Dict[str, Any]:
-        """Use Flash-Lite for simpler, cheaper calls."""
+        """Use Flash-Lite for Gemini, or standard path for other providers."""
         cache_key = hashlib.md5(prompt.encode()).hexdigest()
         if cache_key in _response_cache:
             return _response_cache[cache_key]
 
-        text = await self._gemini(prompt, max_tokens, temperature, model_override=GEMINI_LITE_MODEL)
+        # Route based on provider
+        if self.provider == "gemini":
+            text = await self._gemini(prompt, max_tokens, temperature, model_override=GEMINI_LITE_MODEL)
+        else:
+            # Cerebras/OpenRouter — just use normal completion, no lite variant
+            text = await self._openai_compat(prompt, max_tokens, temperature)
+
         text = self._clean_json(text)
         try:
             result = json.loads(text)
         except json.JSONDecodeError:
             result = self._extract_json(text) or {"error": "parse_failed"}
-        
+
         _response_cache[cache_key] = result
         if len(_response_cache) > 200:
             _response_cache.clear()
         return result
-
 
     async def _openai_compat(self, prompt: str, max_tokens: int, temperature: float) -> str:
         headers = self._build_headers()
