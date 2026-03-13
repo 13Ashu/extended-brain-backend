@@ -29,9 +29,14 @@ GEMINI_BASE_URL     = "https://generativelanguage.googleapis.com/v1beta/models"
 
 CEREBRAS_DEFAULT_MODEL   = "llama3.1-8b"
 OPENROUTER_DEFAULT_MODEL = "google/gemma-3-4b-it:free"
-GEMINI_DEFAULT_MODEL     = "gemini-2.0-flash"   # faster than 2.5-flash-lite, better JSON
+GEMINI_DEFAULT_MODEL     = "gemini-2.0-flash-lite"   # faster than 2.5-flash-lite, better JSON
 
 _response_cache: dict = {}  # simple TTL-less cache for identical prompts
+
+import time
+
+_last_request_time: float = 0.0
+_min_request_gap: float = 4.0  # seconds between requests (free tier: ~15 RPM)
 
 class CerebrasClient:
     """
@@ -123,6 +128,15 @@ class CerebrasClient:
     # ──────────────────────────────────────────────────────────────
 
     async def _gemini(self, prompt: str, max_tokens: int, temperature: float) -> str:
+        global _last_request_time
+
+        # Throttle — enforce minimum gap between requests
+        now = time.monotonic()
+        gap = now - _last_request_time
+        if gap < _min_request_gap:
+            await asyncio.sleep(_min_request_gap - gap)
+        _last_request_time = time.monotonic()
+
         url = f"{self.base_url}/{self.model}:generateContent"
         headers = {"Content-Type": "application/json", "X-goog-api-key": self.api_key}
         payload = {

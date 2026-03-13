@@ -102,6 +102,8 @@ def _tomorrow_str() -> str:
     return (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
 
 
+REMINDER_KEYWORDS = {"remind", "reminder", "don't forget", "alert", "notify", "ping"}
+
 def _sniff_buckets_fast(content: str) -> List[str]:
     """
     Zero-LLM fast pre-classification.
@@ -109,6 +111,15 @@ def _sniff_buckets_fast(content: str) -> List[str]:
     Used to warm up the prompt with hints.
     """
     lc = content.lower()
+
+     # Reminder override — if explicit remind keyword, force To-Do first
+    if any(kw in lc for kw in REMINDER_KEYWORDS):
+        buckets = ["To-Do"]
+        if re.search(r"\b(today|tomorrow|tonight|morning|afternoon|evening|noon|\d{1,2}(am|pm)|\d{1,2}:\d{2}|after\s+\d+\s*(min|hour))\b", lc):
+            buckets.append("Events")
+        return buckets
+
+
     buckets: List[str] = []
 
     words = set(re.findall(r"\b\w+\b", lc))
