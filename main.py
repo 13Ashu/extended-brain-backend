@@ -17,6 +17,7 @@ from datetime import datetime
 from enum import Enum
 from contextlib import asynccontextmanager
 import os
+import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Import configuration and messaging
@@ -25,41 +26,52 @@ from messaging_factory import create_messaging_client, get_platform_name
 from messaging_interface import MessagingClient
 
 # Import our modules
-from database import get_db, init_db
+from database import get_db, init_db, engine, Base
 from models import User, Message, Category, MessageType
 from cerebras_client import CerebrasClient
 from services.message_processor import MessageProcessor
 from services.search_service import SearchService
 from services.category_manager import CategoryManager
 from services.auth_service import AuthService, get_current_user
+from services.reminder_service import ReminderService
 
 
 # ================== Lifespan Events ==================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan event handler for startup and shutdown"""
-    # Startup
     print("🚀 Starting Extended Brain API...")
-    print(f"📱 Messaging Platform: {get_platform_name().upper()}")
     
     await init_db()
     print("✓ Database initialized")
-    
-    # Setup webhook if Telegram
+
+    # Create reminders table
+    from services.reminder_service import Reminder
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    # Start reminder scheduler
+    scheduler_task = asyncio.create_task(
+        reminder_service.run_scheduler(poll_interval=30)
+    )
+    print("✅ Reminder scheduler running")
+
+    # Setup Telegram webhook
     if Config.get_messaging_platform() == MessagingPlatform.TELEGRAM and Config.TELEGRAM_WEBHOOK_URL:
         try:
             result = await messaging_client.setup_webhook(Config.TELEGRAM_WEBHOOK_URL)
             print(f"✓ Telegram webhook configured: {result}")
         except Exception as e:
             print(f"⚠ Telegram webhook setup failed: {e}")
-    
+
     print("✓ Extended Brain API started successfully")
-    
-    yield  # Application runs here
-    
-    # Shutdown
+    yield
+
+    # Cleanup on shutdown
+    scheduler_task.cancel()
     print("✓ Extended Brain API shutdown")
+
+# DELETE the entire @app.on_event("startup") block at the bottom
 
 
 # ================== FastAPI App ==================
@@ -84,13 +96,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize services
+
+# Initialize services — ORDER MATTERS
 cerebras_client = CerebrasClient()
 messaging_client: MessagingClient = create_messaging_client()
-message_processor = MessageProcessor(cerebras_client)
 search_service = SearchService(cerebras_client)
 category_manager = CategoryManager(cerebras_client)
 auth_service = AuthService(messaging_client)
+reminder_service = ReminderService(cerebras_client)  # must be before message_processor
+message_processor = MessageProcessor(cerebras_client, reminder_service=reminder_service)
 
 
 # ================== Pydantic Models ==================

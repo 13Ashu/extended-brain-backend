@@ -381,6 +381,8 @@ Return ONLY this JSON:
                 )
 
         # Keyword conditions — search content, summary, and tags
+
+        # Keyword conditions — clean single pass
         kw_conds = []
         all_terms = (
             expansion.get("keywords", [])[:8]
@@ -391,30 +393,9 @@ Return ONLY this JSON:
             t = term.lower()
             kw_conds.append(func.lower(Message.content).contains(t))
             kw_conds.append(func.lower(Message.summary).contains(t))
-            # Search inside tags JSONB
-            kw_conds.append(
-                text(f"lower(messages.tags::text) LIKE :like_{len(kw_conds)}")
-            )
-
-        # Build the LIKE params separately (SQLAlchemy limitation)
-        like_params = {}
-        param_idx = 0
-        for term in all_terms:
-            like_key = f"like_{param_idx * 3 + 2}"
-            like_params[like_key] = f"%{term.lower()}%"
-            param_idx += 1
-
-        # Fix — use bindparams for the text() LIKE conditions, or simplify to cast+ilike:
-        for term in all_terms:
-            t = f"%{term.lower()}%"
-            kw_conds.append(func.lower(Message.content).contains(term.lower()))
-            kw_conds.append(func.lower(Message.summary).contains(term.lower()))
-            kw_conds.append(
-                text("lower(messages.tags::text) LIKE :like_term").bindparams(like_term=t)
-            )
 
         if kw_conds:
-            stmt = stmt.where(or_(*kw_conds))  # skip LIKE for now, covered by semantic
+            stmt = stmt.where(or_(*kw_conds))
 
         stmt = stmt.order_by(Message.created_at.desc()).limit(limit)
         kw_result = await db.execute(stmt)

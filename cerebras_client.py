@@ -18,6 +18,8 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional
+import hashlib
+from functools import lru_cache
 
 import httpx
 
@@ -29,6 +31,7 @@ CEREBRAS_DEFAULT_MODEL   = "llama3.1-8b"
 OPENROUTER_DEFAULT_MODEL = "google/gemma-3-4b-it:free"
 GEMINI_DEFAULT_MODEL     = "gemini-2.0-flash"   # faster than 2.5-flash-lite, better JSON
 
+_response_cache: dict = {}  # simple TTL-less cache for identical prompts
 
 class CerebrasClient:
     """
@@ -74,6 +77,13 @@ class CerebrasClient:
         temperature: float = 0.1,   # low temp for deterministic JSON
         response_format: str = "json",
     ) -> Dict[str, Any]:
+        
+
+        # Cache identical prompts (helps when user resends same message)
+        cache_key = hashlib.md5(prompt.encode()).hexdigest()
+        if cache_key in _response_cache:
+            return _response_cache[cache_key]
+
         if "Return ONLY" not in prompt and "Return ONLY this JSON" not in prompt:
             prompt += (
                 "\n\nIMPORTANT: Return ONLY valid JSON. "
@@ -89,6 +99,11 @@ class CerebrasClient:
             # Try to extract JSON from messy response
             extracted = self._extract_json(text)
             if extracted:
+                # Store result before returning
+                _response_cache[cache_key] = extracted  # add this before every return
+                if len(_response_cache) > 200:       # prevent unbounded growth
+                    _response_cache.clear()
+
                 return extracted
             print(f"[CerebrasClient] JSON parse failed. Raw: {text[:300]}")
             return {"error": "parse_failed", "raw": text[:300]}
@@ -112,38 +127,45 @@ class CerebrasClient:
         headers = {"Content-Type": "application/json", "X-goog-api-key": self.api_key}
         payload = {
             "system_instruction": {
-                "parts": [{
-                    "text": (
-                        "You are a precise assistant. "
-                        "When asked for JSON, output ONLY the JSON object — "
-                        "no markdown, no explanation, no ``` fences."
-                    )
-                }]
+                "parts": [{"text": (
+                    "You are a precise assistant. "
+                    "When asked for JSON, output ONLY the JSON object — "
+                    "no markdown, no explanation, no ``` fences."
+                )}]
             },
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "maxOutputTokens": max_tokens,
                 "temperature": temperature,
-                "responseMimeType": "application/json",  # Gemini native JSON mode
+                "responseMimeType": "application/json",
             },
         }
 
-        for attempt in range(3):
+        delays = [2, 5, 15]  # more patient backoff
+        for attempt in range(4):
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     resp = await client.post(url, headers=headers, json=payload)
+                    
+                    if resp.status_code == 429:
+                        # Respect Retry-After header if present
+                        retry_after = int(resp.headers.get("Retry-After", delays[min(attempt, 2)]))
+                        print(f"[gemini] 429 rate limit — waiting {retry_after}s (attempt {attempt+1})")
+                        await asyncio.sleep(retry_after)
+                        continue
+                        
                     resp.raise_for_status()
-                    data = resp.json()
-                    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    
             except httpx.HTTPStatusError as e:
-                if e.response.status_code in (429, 500, 503) and attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
+                if e.response.status_code in (500, 503) and attempt < 3:
+                    await asyncio.sleep(delays[min(attempt, 2)])
                     continue
                 print(f"[gemini] HTTP {e.response.status_code}: {e.response.text[:200]}")
                 raise
             except Exception as e:
-                if attempt < 2:
-                    await asyncio.sleep(1)
+                if attempt < 3:
+                    await asyncio.sleep(delays[min(attempt, 2)])
                     continue
                 raise
 

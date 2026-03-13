@@ -197,8 +197,9 @@ def _extract_time_mention(content: str, ref: datetime) -> Tuple[Optional[str], O
 class MessageProcessor:
     """Transform messages into structured multi-bucket knowledge."""
 
-    def __init__(self, cerebras_client: CerebrasClient):
+    def __init__(self, cerebras_client: CerebrasClient, reminder_service=None):
         self.cerebras = cerebras_client
+        self.reminder_service = reminder_service
 
     # ──────────────────────────────────────────────────────────────
     # Public entry point
@@ -298,19 +299,34 @@ class MessageProcessor:
         await db.commit()
         await db.refresh(message)
 
-        await self._save_embedding(message.id, content, analysis, db)
-
-        return {
-            "message_id":    message.id,
-            "category":      primary_bucket,
-            "all_buckets":   buckets,
-            "tags":          analysis.get("keywords", []),
-            "essence":       analysis.get("essence", ""),
-            "connections":   analysis.get("related_concepts", []),
-            "due_date":      due_date,
-            "events":        events,
-            "priority":      analysis.get("priority", "normal"),
+        result = {
+            "message_id":  message.id,
+            "category":    primary_bucket,
+            "all_buckets": buckets,
+            "tags":        analysis.get("keywords", []),
+            "essence":     analysis.get("essence", ""),
+            "connections": analysis.get("related_concepts", []),
+            "due_date":    due_date,
+            "events":      events,
+            "priority":    analysis.get("priority", "normal"),
         }
+
+        # THEN handle reminder
+        if "To-Do" in buckets or "Events" in buckets:
+            reminder_keywords = {"remind", "reminder", "don't forget", "alert", "notify", "ping"}
+            is_explicit_reminder = any(kw in content.lower() for kw in reminder_keywords)
+            has_time = analysis.get("event_time") or analysis.get("due_date")
+            if is_explicit_reminder and has_time and self.reminder_service:
+                reminder = await self.reminder_service.create(
+                    user=user, content=content, analysis=analysis,
+                    message_id=message.id, db=db,
+                )
+                if reminder:
+                    result["reminder_id"] = reminder.id
+                    result["remind_at"] = reminder.remind_at.isoformat()
+
+        await self._save_embedding(message.id, content, analysis, db)
+        return result
 
     # ──────────────────────────────────────────────────────────────
     # Single LLM analysis call (replaces 3-4 separate calls)
@@ -475,6 +491,7 @@ Return ONLY this JSON (no markdown):
         )
 
         saved_ids = []
+        saved_items = []  # track (message_id, task, evt_time, due_date) for post-commit work
         ref = datetime.utcnow()
 
         for item in items:
@@ -521,28 +538,57 @@ Return ONLY this JSON (no markdown):
                 created_at=ref,
             )
             db.add(message)
-            await db.flush()
-            saved_ids.append(message.id)
-            await self._save_embedding(message.id, task, analysis, db)
+            await db.flush()  # get message.id without committing
 
+            saved_ids.append(message.id)
+            saved_items.append({
+                "id":       message.id,
+                "task":     task,
+                "evt_time": evt_time,
+                "due_date": due_date,
+            })
+
+        # Single commit for all messages
         await db.commit()
 
-        return {
-            "message_id":    saved_ids[0] if saved_ids else None,
-            "split_count":   len(saved_ids),
-            "message_ids":   saved_ids,
-            "category":      "To-Do",
-            "all_buckets":   ["To-Do"],
-            "tags":          analysis.get("keywords", []),
-            "essence":       f"Saved {len(saved_ids)} tasks: " + ", ".join(
-                i["task"] for i in items[:3]
-            ),
-            "connections":   [],
-            "due_date":      items[0].get("due_date") if items else None,
-            "events":        [],
-            "priority":      analysis.get("priority", "normal"),
-        }
+        # Post-commit: embeddings + reminders (safe now that IDs are stable)
+        for saved in saved_items:
+            # Embeddings
+            await self._save_embedding(saved["id"], saved["task"], analysis, db)
 
+            # Reminders — only if has a time and reminder_service is wired
+            if self.reminder_service and saved["evt_time"]:
+                item_analysis = {
+                    **analysis,
+                    "event_time": saved["evt_time"],
+                    "due_date":   saved["due_date"],
+                }
+                try:
+                    await self.reminder_service.create(
+                        user=user,
+                        content=saved["task"],
+                        analysis=item_analysis,
+                        message_id=saved["id"],
+                        db=db,
+                    )
+                except Exception as e:
+                    print(f"⚠ Reminder creation failed for task '{saved['task']}': {e}")
+
+        return {
+            "message_id":  saved_ids[0] if saved_ids else None,
+            "split_count": len(saved_ids),
+            "message_ids": saved_ids,
+            "category":    "To-Do",
+            "all_buckets": ["To-Do"],
+            "tags":        analysis.get("keywords", []),
+            "essence":     f"Saved {len(saved_ids)} tasks: " + ", ".join(
+                i["task"] for i in items[:3] if i.get("task")
+            ),
+            "connections": [],
+            "due_date":    items[0].get("due_date") if items else None,
+            "events":      [],
+            "priority":    analysis.get("priority", "normal"),
+        }
     # ──────────────────────────────────────────────────────────────
     # DB helpers
     # ──────────────────────────────────────────────────────────────
