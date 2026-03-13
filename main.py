@@ -404,6 +404,11 @@ async def _refresh_checklist_message(chat_id: str, tg_message_id: int, db: Async
             "tags":       tags,
         })
 
+    items = [
+        item for item in items
+        if not item.get("tags", {}).get("done", False)
+    ]
+
     text, reply_markup = format_todo_checklist(items)
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -420,9 +425,9 @@ async def _refresh_checklist_message(chat_id: str, tg_message_id: int, db: Async
 
 
 # ================== Checklist Helpers ==================
-
 def format_todo_checklist(results: List[Dict]) -> tuple[str, dict]:
     """Returns (text, reply_markup) for Telegram inline checklist."""
+    # Simple header only — no duplicate bullet list above the buttons
     text = "📋 *Your To-Do List*\n\n"
     buttons = []
 
@@ -434,25 +439,31 @@ def format_todo_checklist(results: List[Dict]) -> tuple[str, dict]:
         tags     = item.get("tags", {})
         is_done  = tags.get("done", False)
         due_time = item.get("event_time") or tags.get("event_time", "")
-        time_str = f" _{due_time}_" if due_time else ""
+        time_str = f" {due_time}" if due_time else ""
 
         if is_done:
-            text += f"~{item['content']}~{time_str}\n"
+            # Strike-through done items in the header text only
+            text += f"~✓ {item['content'][:40]}{time_str}~\n"
         else:
-            text += f"• {item['content']}{time_str}\n"
+            # Each button is its own row — left aligned by default in Telegram
             buttons.append([{
-                "text":          f"✓ {item['content'][:30]}",
+                "text":          f"☐ {item['content'][:40]}{time_str}",
                 "callback_data": f"done:{item['id']}"
             }])
 
     if all(item.get("tags", {}).get("done") for item in results):
-        text += "\n_All done! 🎉_"
+        text += "_All done! 🎉_"
 
     return text, {"inline_keyboard": buttons}
+
 
 async def send_todo_checklist(chat_id: str, results: List[Dict]):
     """Send todo results as an interactive checklist to Telegram."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    
+    # Filter out already-done items
+    results = [r for r in results if not r.get("tags", {}).get("done", False)]
+    
     text, reply_markup = format_todo_checklist(results)
     async with httpx.AsyncClient(timeout=10.0) as client:
         await client.post(
@@ -464,7 +475,6 @@ async def send_todo_checklist(chat_id: str, results: List[Dict]):
                 "reply_markup": reply_markup,
             }
         )
-
 
 # ================== Unified Message Processing ==================
 

@@ -183,6 +183,14 @@ class SearchService:
         use_due_filter      = _is_due_date_query(query) and date_from is not None
         person_hint         = _extract_person_name(query)
 
+        # Default todo queries (no date specified) to today only
+        q_lower = query.lower()
+        is_future_query = any(kw in q_lower for kw in {"upcoming", "future", "all", "everything"})
+        if not date_from and bucket_hint == "To-Do" and not is_future_query:
+            date_from = str(today)
+            date_to   = str(today)
+            use_due_filter = True  # ← important: activate the due_date filter path
+
         # ── LLM query expansion ───────────────────────────────────
         expansion = await self._expand_query(
             query=query,
