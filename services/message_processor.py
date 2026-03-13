@@ -323,14 +323,15 @@ class MessageProcessor:
         }
 
         # THEN handle reminder
-        if "To-Do" in buckets or "Events" in buckets:
-            reminder_keywords = {"remind", "reminder", "don't forget", "alert", "notify", "ping"}
-            is_explicit_reminder = any(kw in content.lower() for kw in reminder_keywords)
-            has_time = analysis.get("event_time") or analysis.get("due_date")
-            if is_explicit_reminder and has_time and self.reminder_service:
+        if ("To-Do" in buckets or "Events" in buckets) and self.reminder_service:
+            has_time = analysis.get("event_time") and analysis.get("due_date")
+            if has_time:
                 reminder = await self.reminder_service.create(
-                    user=user, content=content, analysis=analysis,
-                    message_id=message.id, db=db,
+                    user=user,
+                    content=content,
+                    analysis=analysis,
+                    message_id=message.id,
+                    db=db,
                 )
                 if reminder:
                     result["reminder_id"] = reminder.id

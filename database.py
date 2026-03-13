@@ -83,7 +83,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))  # Store hashed password
     
     # Settings
-    timezone: Mapped[str] = mapped_column(String(50), default="UTC")
+    timezone: Mapped[str] = mapped_column(String(50), default="Asia/Kolkata")
     is_active: Mapped[bool] = mapped_column(default=True)
     is_verified: Mapped[bool] = mapped_column(default=False)
     
