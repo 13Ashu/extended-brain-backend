@@ -278,7 +278,8 @@ Return ONLY this JSON:
   "search_focus": "content | summary | tags | all"
 }}"""
 
-        response = await self.cerebras.chat(prompt)
+        # response = await self.cerebras.chat(prompt)
+        response = await self.cerebras.chat_lite(prompt, max_tokens=400)
         response.setdefault("core_concepts", [])
         response.setdefault("keywords", [])
         response.setdefault("entities", [])

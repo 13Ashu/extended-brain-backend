@@ -5,7 +5,8 @@ Updated with full user registration fields
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Text, DateTime, ForeignKey, JSON, Enum as SQLEnum, Integer
+from sqlalchemy import String, Text, DateTime, ForeignKey, Enum as SQLEnum, Integer
+from sqlalchemy.dialects.postgresql import JSON, JSONB
 from datetime import datetime
 from typing import Optional, List, AsyncGenerator
 from pgvector.sqlalchemy import Vector
@@ -167,8 +168,8 @@ class Message(Base):
     
     # AI-generated metadata
     summary: Mapped[Optional[str]] = mapped_column(Text)
-    tags: Mapped[Optional[dict]] = mapped_column(JSON)  # List of tags
-    entities: Mapped[Optional[dict]] = mapped_column(JSON)  # Extracted entities
+    tags: Mapped[Optional[dict]] = mapped_column(JSONB)  # List of tags
+    entities: Mapped[Optional[dict]] = mapped_column(JSONB)  # Extracted entities
     embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(1536), nullable=True)  # Vector embedding for search
     
     # Timestamps

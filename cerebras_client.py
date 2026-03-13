@@ -30,13 +30,14 @@ GEMINI_BASE_URL     = "https://generativelanguage.googleapis.com/v1beta/models"
 CEREBRAS_DEFAULT_MODEL   = "llama3.1-8b"
 OPENROUTER_DEFAULT_MODEL = "google/gemma-3-4b-it:free"
 GEMINI_DEFAULT_MODEL     = "gemini-2.0-flash-lite"   # faster than 2.5-flash-lite, better JSON
+GEMINI_LITE_MODEL = "gemini-2.0-flash-lite"
 
 _response_cache: dict = {}  # simple TTL-less cache for identical prompts
 
-import time
 
+import time
 _last_request_time: float = 0.0
-_min_request_gap: float = 4.0  # seconds between requests (free tier: ~15 RPM)
+_min_request_gap: float = 2.0  # safe for 30 RPM combined
 
 class CerebrasClient:
     """
@@ -127,8 +128,10 @@ class CerebrasClient:
     # Provider implementations
     # ──────────────────────────────────────────────────────────────
 
-    async def _gemini(self, prompt: str, max_tokens: int, temperature: float) -> str:
+    async def _gemini(self, prompt: str, max_tokens: int, temperature: float, model_override: Optional[str] = None,) -> str:
         global _last_request_time
+
+        model = model_override or self.model
 
         # Throttle — enforce minimum gap between requests
         now = time.monotonic()
@@ -137,7 +140,7 @@ class CerebrasClient:
             await asyncio.sleep(_min_request_gap - gap)
         _last_request_time = time.monotonic()
 
-        url = f"{self.base_url}/{self.model}:generateContent"
+        url = f"{self.base_url}/{model}:generateContent"
         headers = {"Content-Type": "application/json", "X-goog-api-key": self.api_key}
         payload = {
             "system_instruction": {
@@ -184,6 +187,32 @@ class CerebrasClient:
                 raise
 
         return "{}"
+
+
+    # Add a lite method
+    async def chat_lite(
+        self,
+        prompt: str,
+        max_tokens: int = 400,
+        temperature: float = 0.1,
+    ) -> Dict[str, Any]:
+        """Use Flash-Lite for simpler, cheaper calls."""
+        cache_key = hashlib.md5(prompt.encode()).hexdigest()
+        if cache_key in _response_cache:
+            return _response_cache[cache_key]
+
+        text = await self._gemini(prompt, max_tokens, temperature, model_override=GEMINI_LITE_MODEL)
+        text = self._clean_json(text)
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            result = self._extract_json(text) or {"error": "parse_failed"}
+        
+        _response_cache[cache_key] = result
+        if len(_response_cache) > 200:
+            _response_cache.clear()
+        return result
+
 
     async def _openai_compat(self, prompt: str, max_tokens: int, temperature: float) -> str:
         headers = self._build_headers()
