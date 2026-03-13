@@ -27,7 +27,7 @@ CEREBRAS_BASE_URL   = "https://api.cerebras.ai/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 GEMINI_BASE_URL     = "https://generativelanguage.googleapis.com/v1beta/models"
 
-CEREBRAS_DEFAULT_MODEL   = "llama3.1-8b"
+CEREBRAS_DEFAULT_MODEL   = "gpt-oss-120b"
 OPENROUTER_DEFAULT_MODEL = "google/gemma-3-4b-it:free"
 GEMINI_DEFAULT_MODEL     = "gemini-2.0-flash-lite"   # faster than 2.5-flash-lite, better JSON
 GEMINI_LITE_MODEL = "gemini-2.0-flash-lite"
@@ -48,7 +48,7 @@ class CerebrasClient:
     def __init__(
         self,
         api_key:   Optional[str] = None,
-        provider:  str = "gemini",
+        provider:  str = "cerebras",
         model:     Optional[str] = None,
         site_url:  Optional[str] = None,
         site_name: Optional[str] = None,
