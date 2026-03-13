@@ -1,7 +1,7 @@
 from openai import OpenAI
 
 # Replace with your Cerebras API key
-API_KEY = "csk-rx2ep54n9pcd52vccjhhdmfnxjjptw5jptpvjkcyjc6ykp6c"
+API_KEY = ""
 
 client = OpenAI(
     api_key=API_KEY,
