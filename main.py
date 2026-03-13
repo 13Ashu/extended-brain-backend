@@ -18,6 +18,7 @@ from enum import Enum
 from contextlib import asynccontextmanager
 import os
 import asyncio
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Import configuration and messaging
@@ -26,7 +27,7 @@ from messaging_factory import create_messaging_client, get_platform_name
 from messaging_interface import MessagingClient
 
 # Import our modules
-from database import get_db, init_db, engine, Base
+from database import get_db, init_db, engine, Base, async_session_maker
 from models import User, Message, Category, MessageType
 from cerebras_client import CerebrasClient
 from services.message_processor import MessageProcessor
@@ -41,11 +42,11 @@ from services.reminder_service import ReminderService
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Starting Extended Brain API...")
-    
+
     await init_db()
     print("✓ Database initialized")
 
-    # Create reminders table
+    # Create reminders table (safe — won't recreate if exists)
     from services.reminder_service import Reminder
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -71,8 +72,6 @@ async def lifespan(app: FastAPI):
     scheduler_task.cancel()
     print("✓ Extended Brain API shutdown")
 
-# DELETE the entire @app.on_event("startup") block at the bottom
-
 
 # ================== FastAPI App ==================
 
@@ -96,14 +95,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # Initialize services — ORDER MATTERS
 cerebras_client = CerebrasClient()
 messaging_client: MessagingClient = create_messaging_client()
 search_service = SearchService(cerebras_client)
 category_manager = CategoryManager(cerebras_client)
 auth_service = AuthService(messaging_client)
-reminder_service = ReminderService(cerebras_client)  # must be before message_processor
+reminder_service = ReminderService(cerebras_client)       # must be before message_processor
 message_processor = MessageProcessor(cerebras_client, reminder_service=reminder_service)
 
 
@@ -118,29 +116,25 @@ class MessageTypeEnum(str, Enum):
 
 
 class UserRegistrationRequest(BaseModel):
-    """Full user registration data"""
     name: str = Field(..., min_length=2, max_length=100)
     email: EmailStr
     age: int = Field(..., ge=13, le=120)
     occupation: str = Field(..., min_length=2, max_length=100)
     phone_number: str = Field(..., min_length=10, max_length=20)
     password: str = Field(..., min_length=6)
-    timezone: Optional[str] = "UTC"
+    timezone: Optional[str] = "Asia/Kolkata"
 
 
 class OTPSendRequest(BaseModel):
-    """Request to send OTP"""
     phone_number: str = Field(..., min_length=10, max_length=20)
 
 
 class OTPVerifyRequest(BaseModel):
-    """Request to verify OTP"""
     phone_number: str = Field(..., min_length=10, max_length=20)
     otp: str = Field(..., min_length=6, max_length=6)
 
 
 class LoginRequest(BaseModel):
-    """User login request"""
     phone_number: str
     password: str
 
@@ -151,7 +145,6 @@ class ForgotPasswordRequest(BaseModel):
 
 
 class TelegramLinkRequest(BaseModel):
-    """Link Telegram chat ID to user account"""
     phone_number: str
     telegram_chat_id: str
 
@@ -180,7 +173,6 @@ class CategoryOperation(BaseModel):
 
 @app.get("/")
 async def root():
-    """API root endpoint"""
     return {
         "message": "Extended Brain API",
         "version": "3.0.0",
@@ -193,14 +185,14 @@ async def root():
             "Multi-format Support (Text/Image/Audio/PDF)",
             "Dynamic Category Management",
             "OTP Authentication",
-            "Multi-Platform Support"
+            "Reminders",
+            "Interactive Todo Checklist",
         ]
     }
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
@@ -216,61 +208,31 @@ async def health_check():
 # ================== Authentication Endpoints ==================
 
 @app.post("/api/auth/send-otp")
-async def send_otp(
-    request: OTPSendRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """Send OTP to phone number"""
+async def send_otp(request: OTPSendRequest, db: AsyncSession = Depends(get_db)):
     result = await auth_service.send_otp(request.phone_number, db)
-    
     if not result['success']:
         raise HTTPException(status_code=400, detail=result['message'])
-    
     return result
 
 
 @app.post("/api/auth/verify-otp")
-async def verify_otp(
-    request: OTPVerifyRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """Verify OTP code"""
-    result = await auth_service.verify_otp(
-        request.phone_number,
-        request.otp,
-        db
-    )
-    
+async def verify_otp(request: OTPVerifyRequest, db: AsyncSession = Depends(get_db)):
+    result = await auth_service.verify_otp(request.phone_number, request.otp, db)
     if not result['verified']:
         raise HTTPException(status_code=400, detail=result['message'])
-    
     return result
 
 
 @app.post("/api/auth/login")
-async def login(
-    request: LoginRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """User login"""
-    result = await auth_service.login_user(
-        request.phone_number,
-        request.password,
-        db
-    )
-    
+async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
+    result = await auth_service.login_user(request.phone_number, request.password, db)
     if not result['success']:
         raise HTTPException(status_code=401, detail=result['message'])
-    
     return result
 
 
 @app.post("/api/auth/forgot-password")
-async def forgot_password(
-    request: ForgotPasswordRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """Reset user password"""
+async def forgot_password(request: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
     result = await auth_service.reset_password(
         phone_number=request.phone_number,
         new_password=request.new_password,
@@ -294,35 +256,20 @@ async def delete_account(
 
 
 @app.post("/api/auth/link-telegram")
-async def link_telegram(
-    request: TelegramLinkRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """Link Telegram chat ID to user account"""
+async def link_telegram(request: TelegramLinkRequest, db: AsyncSession = Depends(get_db)):
     from sqlalchemy import select
-    
-    user = await db.scalar(
-        select(User).where(User.phone_number == request.phone_number)
-    )
-    
+    user = await db.scalar(select(User).where(User.phone_number == request.phone_number))
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
     user.telegram_chat_id = request.telegram_chat_id
     await db.commit()
-    
     return {"success": True, "message": "Telegram linked successfully"}
 
 
 # ================== User Registration ==================
 
 @app.post("/api/users/register")
-async def register_user(
-    user_data: UserRegistrationRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """Register a new user with full details"""
-    
+async def register_user(user_data: UserRegistrationRequest, db: AsyncSession = Depends(get_db)):
     result = await auth_service.register_user(
         phone_number=user_data.phone_number,
         name=user_data.name,
@@ -333,14 +280,12 @@ async def register_user(
         timezone=user_data.timezone,
         db=db
     )
-    
     if not result['success']:
         raise HTTPException(status_code=400, detail=result['message'])
-    
     return result
 
 
-# ================== WhatsApp Webhook Endpoints ==================
+# ================== WhatsApp Webhook ==================
 
 @app.get("/webhook/whatsapp")
 async def verify_whatsapp_webhook(
@@ -348,15 +293,11 @@ async def verify_whatsapp_webhook(
     hub_verify_token: str | None = None,
     hub_challenge: str | None = None
 ):
-    """Verify WhatsApp webhook"""
     if Config.get_messaging_platform() != MessagingPlatform.WHATSAPP:
         raise HTTPException(status_code=400, detail="WhatsApp not configured")
-    
     verify_token = Config.WHATSAPP_VERIFY_TOKEN
-    
     if hub_mode == "subscribe" and hub_verify_token == verify_token:
         return int(hub_challenge)
-    
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
@@ -366,22 +307,14 @@ async def handle_whatsapp_webhook(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
-    """Handle incoming WhatsApp messages"""
     if Config.get_messaging_platform() != MessagingPlatform.WHATSAPP:
         raise HTTPException(status_code=400, detail="WhatsApp not configured")
-    
     webhook_data = await request.json()
-    
-    background_tasks.add_task(
-        process_webhook_message,
-        webhook_data,
-        db
-    )
-    
+    background_tasks.add_task(process_webhook_message, webhook_data, db)
     return {"status": "received"}
 
 
-# ================== Telegram Webhook Endpoint ==================
+# ================== Telegram Webhook ==================
 
 @app.post("/webhook/telegram")
 async def handle_telegram_webhook(
@@ -389,123 +322,226 @@ async def handle_telegram_webhook(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
-    """Handle incoming Telegram messages"""
     if Config.get_messaging_platform() != MessagingPlatform.TELEGRAM:
         raise HTTPException(status_code=400, detail="Telegram not configured")
-    
+
     webhook_data = await request.json()
-    
-    background_tasks.add_task(
-        process_webhook_message,
-        webhook_data,
-        db
-    )
-    
+
+    # Callback queries (button taps) need synchronous handling for fast ack
+    if "callback_query" in webhook_data:
+        await _handle_callback_query(webhook_data["callback_query"], db)
+        return {"ok": True}
+
+    background_tasks.add_task(process_webhook_message, webhook_data, db)
     return {"ok": True}
 
 
+# ================== Telegram Callback Handler ==================
+
+async def _handle_callback_query(callback: Dict, db: AsyncSession):
+    """Handle inline keyboard button presses (todo checklist taps)"""
+    callback_id  = callback["id"]
+    chat_id      = str(callback["from"]["id"])
+    callback_data = callback.get("data", "")
+    tg_message_id = callback["message"]["message_id"]
+
+    if not callback_data.startswith("done:"):
+        await _answer_callback(callback_id, "Unknown action")
+        return
+
+    msg_db_id = int(callback_data.split(":")[1])
+
+    # Mark message as done in DB
+    async with async_session_maker() as session:
+        from sqlalchemy import select, update
+        msg = await session.scalar(select(Message).where(Message.id == msg_db_id))
+        if msg:
+            tags = dict(msg.tags or {})
+            tags["done"] = True
+            tags["done_at"] = datetime.utcnow().isoformat()
+            await session.execute(
+                update(Message).where(Message.id == msg_db_id).values(tags=tags)
+            )
+            await session.commit()
+
+    # Acknowledge button press immediately
+    await _answer_callback(callback_id, "✓ Done!")
+
+    # Rebuild and update the checklist message
+    await _refresh_checklist_message(chat_id, tg_message_id, db)
+
+
+async def _answer_callback(callback_id: str, text: str = "✓ Done!"):
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.post(
+            f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+            json={"callback_query_id": callback_id, "text": text}
+        )
+
+
+async def _refresh_checklist_message(chat_id: str, tg_message_id: int, db: AsyncSession):
+    from sqlalchemy import select
+
+    async with async_session_maker() as session:  # use own session, not request-scoped db
+        user = await session.scalar(select(User).where(User.telegram_chat_id == chat_id))
+        if not user:
+            return
+
+    # Reuse search_service instead of raw SQL
+    search_result = await search_service.search(
+        user_phone=user.phone_number,
+        query="todo tasks pending",
+        db=db
+    )
+    items = []
+    for r in search_result.get("results", []):
+        tags = r.get("tags", {}) if isinstance(r.get("tags"), dict) else {}
+        items.append({
+            "id":         r["id"],
+            "content":    r["content"],
+            "event_time": r.get("event_time") or tags.get("event_time"),
+            "tags":       tags,
+        })
+
+    text, reply_markup = format_todo_checklist(items)
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.post(
+            f"https://api.telegram.org/bot{token}/editMessageText",
+            json={
+                "chat_id":      chat_id,
+                "message_id":   tg_message_id,
+                "text":         text,
+                "parse_mode":   "Markdown",
+                "reply_markup": reply_markup,
+            }
+        )
+
+
+# ================== Checklist Helpers ==================
+
+def format_todo_checklist(results: List[Dict]) -> tuple[str, dict]:
+    """Returns (text, reply_markup) for Telegram inline checklist."""
+    text = "📋 *Your To-Do List*\n\n"
+    buttons = []
+
+    if not results:
+        text += "_Nothing here yet!_"
+        return text, {"inline_keyboard": buttons}
+
+    for item in results:
+        tags     = item.get("tags", {})
+        is_done  = tags.get("done", False)
+        due_time = item.get("event_time") or tags.get("event_time", "")
+        time_str = f" _{due_time}_" if due_time else ""
+
+        if is_done:
+            text += f"~{item['content']}~{time_str}\n"
+        else:
+            text += f"• {item['content']}{time_str}\n"
+            buttons.append([{
+                "text":          f"✓ {item['content'][:30]}",
+                "callback_data": f"done:{item['id']}"
+            }])
+
+    if all(item.get("tags", {}).get("done") for item in results):
+        text += "\n_All done! 🎉_"
+
+    return text, {"inline_keyboard": buttons}
+
+async def send_todo_checklist(chat_id: str, results: List[Dict]):
+    """Send todo results as an interactive checklist to Telegram."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    text, reply_markup = format_todo_checklist(results)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id":      chat_id,
+                "text":         text,
+                "parse_mode":   "Markdown",
+                "reply_markup": reply_markup,
+            }
+        )
+
+
 # ================== Unified Message Processing ==================
+
+TODO_SEARCH_KEYWORDS = {
+    "todo", "to-do", "to do", "task", "tasks",
+    "pending", "checklist", "check list"
+}
+
 
 async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
     """Process incoming message from any platform"""
     try:
         from sqlalchemy import select
-        
-        # Extract messages using platform-specific logic
+
         messages = messaging_client.extract_message_data(webhook_data)
-        
+
         for msg_data in messages:
-            chat_id = msg_data["user_id"]  # Telegram chat_id or WhatsApp phone
-            content = msg_data["content"]
+            chat_id      = msg_data["user_id"]
+            content      = msg_data["content"]
             message_type = msg_data["message_type"]
-            message_id = msg_data["message_id"]
-            metadata = msg_data.get("metadata", {})
-            
-            # Check if this chat_id is linked to a registered user
+            metadata     = msg_data.get("metadata", {})
+
+            # Look up user
             if Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
-                result = await db.execute(
-                    select(User).where(User.telegram_chat_id == chat_id)
-                )
-            else:  # WhatsApp uses phone number directly
-                result = await db.execute(
-                    select(User).where(User.phone_number == chat_id)
-                )
-            
+                result = await db.execute(select(User).where(User.telegram_chat_id == chat_id))
+            else:
+                result = await db.execute(select(User).where(User.phone_number == chat_id))
             user = result.scalar_one_or_none()
-            
-            # Handle /start command
+
+            # ── /start ────────────────────────────────────────────
             if content.lower().strip() == "/start":
                 if user:
                     response = (
                         f"👋 Welcome back, {user.name}!\n\n"
                         f"Your Extended Brain is ready.\n\n"
-                        f"📝 Send me anything:\n"
-                        f"• Text notes\n"
-                        f"• Voice messages\n"
-                        f"• Images\n"
-                        f"• Documents\n\n"
+                        f"📝 Send me anything to save it.\n\n"
                         f"🔍 Commands:\n"
-                        f"• search: <query> - Find your notes\n"
-                        f"• categories - View all categories"
+                        f"• search: <query>\n"
+                        f"• categories"
                     )
                 else:
                     response = (
                         f"👋 Welcome to Extended Brain!\n\n"
-                        f"To get started:\n"
                         f"1. Register at: https://your-digital-mind.vercel.app\n"
-                        f"2. Link your Telegram by sending:\n"
-                        f"   /link +919876543210\n\n"
-                        f"(Replace with your registered phone number)"
+                        f"2. Link Telegram: /link +919876543210"
                     )
                 await messaging_client.send_message(chat_id, response)
                 continue
-            
-            # Handle /link command (Telegram only)
+
+            # ── /link ─────────────────────────────────────────────
             if content.lower().startswith("/link"):
                 parts = content.split()
                 if len(parts) != 2:
-                    response = "Usage: /link +919876543210"
-                    await messaging_client.send_message(chat_id, response)
+                    await messaging_client.send_message(chat_id, "Usage: /link +919876543210")
                     continue
-                
                 phone = parts[1].strip()
-                
-                # Find user by phone
-                user_to_link = await db.scalar(
-                    select(User).where(User.phone_number == phone)
-                )
-                
+                user_to_link = await db.scalar(select(User).where(User.phone_number == phone))
                 if not user_to_link:
-                    response = f"❌ No account found with {phone}\n\nPlease register first at:\nhttps://your-digital-mind.vercel.app"
+                    response = f"❌ No account found with {phone}\n\nPlease register first."
                 else:
                     user_to_link.telegram_chat_id = chat_id
                     await db.commit()
-                    response = f"✅ Account linked!\n\nHi {user_to_link.name}, you can now start using Extended Brain.\n\nSend me anything to save it!"
-                
+                    response = f"✅ Linked! Hi {user_to_link.name}, you're all set."
                 await messaging_client.send_message(chat_id, response)
                 continue
-            
-            # Block unregistered/unlinked users
+
+            # ── Unregistered user ─────────────────────────────────
             if not user:
-                if Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
-                    response = (
-                        "🚫 Please link your account first.\n\n"
-                        "Send: /link +919876543210\n"
-                        "(with your registered phone number)"
-                    )
-                else:
-                    response = (
-                        "🚫 You are not registered yet.\n\n"
-                        "Please register on the web app first.\n"
-                        "After registration, you can use this bot."
-                    )
-                await messaging_client.send_message(chat_id, response)
+                await messaging_client.send_message(
+                    chat_id,
+                    "🚫 Please link your account first.\n\nSend: /link +919876543210"
+                )
                 continue
-            
-            # FROM HERE ON, USER IS REGISTERED AND LINKED
+
             user_phone = user.phone_number
-            
-            # Get media URL if applicable
+
+            # ── Media handling ────────────────────────────────────
             media_url = None
             if metadata.get("media_id") or metadata.get("file_id"):
                 media_id = metadata.get("media_id") or metadata.get("file_id")
@@ -513,39 +549,48 @@ async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
                     media_url = await messaging_client.get_media_url(media_id)
                 except Exception as e:
                     print(f"Error getting media URL: {e}")
-            
-            # Handle audio transcription
+
             if message_type == "audio" and media_url:
                 try:
-                    transcription = await cerebras_client.transcribe_audio(media_url)
-                    content = transcription
+                    content = await cerebras_client.transcribe_audio(media_url)
                 except Exception as e:
                     print(f"Error transcribing audio: {e}")
                     content = "[Audio - transcription failed]"
-            
-            # Handle document text extraction
+
             if message_type == "document" and media_url:
                 try:
                     from services.document_processor import extract_document_text
-                    text = await extract_document_text(media_url)
-                    filename = metadata.get("file_name", "document")
-                    content = f"{filename}: {text}"
+                    extracted = await extract_document_text(media_url)
+                    filename  = metadata.get("file_name", "document")
+                    content   = f"{filename}: {extracted}"
                 except Exception as e:
                     print(f"Error extracting document text: {e}")
-            
-            # Process the message
+
+            # ── Route message ─────────────────────────────────────
             try:
+                # SEARCH
                 if content.lower().startswith(("search:", "find:", "get:")):
+                    query = content.split(":", 1)[1].strip()
                     search_result = await search_service.search(
                         user_phone=user_phone,
-                        query=content.split(":", 1)[1].strip(),
+                        query=query,
                         db=db
                     )
+                    results = search_result.get("results", [])
+
+                    # Todo query → interactive checklist
+                    is_todo_query = any(kw in query.lower() for kw in TODO_SEARCH_KEYWORDS)
+                    if is_todo_query and results and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                        await send_todo_checklist(chat_id, results)
+                        continue
+
                     response = format_search_results(search_result)
 
+                # CATEGORIES
                 elif content.lower().startswith(("category:", "categories")):
                     response = await handle_category_command(user_phone, content, db)
 
+                # SAVE
                 else:
                     result = await message_processor.process(
                         user_phone=user_phone,
@@ -554,12 +599,7 @@ async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
                         media_url=media_url,
                         db=db
                     )
-
-                    response = (
-                        f"✓ Saved to '{result['category']}'!\n\n"
-                        f"📊 Tags: {', '.join(result['tags'])}\n\n"
-                        f"💡 Tip: Search with 'search: your query'"
-                    )
+                    response = _build_save_response(result)
 
             except Exception as e:
                 print(f"Processing error: {e}")
@@ -567,13 +607,53 @@ async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
                 traceback.print_exc()
                 response = "⚠ Something went wrong. Please try again."
 
-            # Send response
             await messaging_client.send_message(chat_id, response)
-    
+
     except Exception as e:
         print(f"Error processing webhook: {e}")
         import traceback
         traceback.print_exc()
+
+
+def _build_save_response(result: Dict) -> str:
+    """Build a smart, context-aware save confirmation."""
+    from zoneinfo import ZoneInfo
+
+    category    = result.get("category", "Notes")
+    all_buckets = result.get("all_buckets", [category])
+    remind_at   = result.get("remind_at")
+    due_date    = result.get("due_date")
+    essence     = result.get("essence", "")
+    split_count = result.get("split_count", 0)
+
+    if remind_at:
+        remind_dt = datetime.fromisoformat(remind_at).replace(
+            tzinfo=ZoneInfo("UTC")
+        ).astimezone(ZoneInfo("Asia/Kolkata"))
+        time_str = remind_dt.strftime("%I:%M %p, %d %b")
+        return (
+            f"✓ Saved & reminder set!\n\n"
+            f"⏰ {time_str} IST\n"
+            f"📝 {essence}"
+        )
+
+    if split_count > 1:
+        return (
+            f"✓ Saved {split_count} tasks!\n\n"
+            f"📝 {essence}"
+        )
+
+    if "To-Do" in all_buckets and due_date:
+        return (
+            f"✓ Added to To-Do!\n\n"
+            f"📝 {essence}\n"
+            f"📅 {due_date}"
+        )
+
+    return (
+        f"✓ Saved to '{category}'!\n\n"
+        f"📝 {essence}"
+    )
 
 
 # ================== Message Management Endpoints ==================
@@ -591,12 +671,7 @@ async def capture_message(
         media_url=message.media_url,
         db=db
     )
-
-    return {
-        "success": True,
-        "message": "Content captured successfully",
-        "data": result
-    }
+    return {"success": True, "message": "Content captured successfully", "data": result}
 
 
 @app.post("/api/search")
@@ -612,13 +687,12 @@ async def search_messages(
         category_filter=search.category_filter,
         db=db
     )
-
     return {
         "success": True,
-        "query": search.query,
+        "query":            search.query,
         "natural_response": search_data.get("natural_response", ""),
-        "results": search_data.get("results", []),
-        "total": len(search_data.get("results", []))
+        "results":          search_data.get("results", []),
+        "total":            len(search_data.get("results", []))
     }
 
 
@@ -635,68 +709,43 @@ async def manage_categories(
     if operation.operation == "list":
         categories = await category_manager.list_categories(phone, db)
         return {"success": True, "categories": categories}
-
     elif operation.operation == "create":
-        result = await category_manager.create_category(
-            phone,
-            operation.category_name,
-            operation.description,
-            db
-        )
+        result = await category_manager.create_category(phone, operation.category_name, operation.description, db)
         return {"success": True, "data": result}
-
     elif operation.operation == "edit":
-        result = await category_manager.edit_category(
-            phone,
-            operation.category_name,
-            operation.new_name,
-            operation.description,
-            db
-        )
+        result = await category_manager.edit_category(phone, operation.category_name, operation.new_name, operation.description, db)
         return {"success": True, "data": result}
-
     elif operation.operation == "delete":
-        result = await category_manager.delete_category(
-            phone,
-            operation.category_name,
-            db
-        )
+        result = await category_manager.delete_category(phone, operation.category_name, db)
         return {"success": True, "data": result}
 
     raise HTTPException(status_code=400, detail="Invalid operation")
 
 
 async def handle_category_command(phone: str, content: str, db: AsyncSession) -> str:
-    """Handle category-related commands"""
-    content_lower = content.lower()
-    
-    if content_lower == "categories":
+    if content.lower() == "categories":
         categories = await category_manager.list_categories(phone, db)
         if not categories:
             return "You don't have any categories yet!"
-        
-        response = "📁 Your Categories:\n\n"
+        response = "📁 *Your Categories*\n\n"
         for cat in categories:
             response += f"• {cat['name']} ({cat['count']} items)\n"
         return response
-    
-    return "Category command recognized. Use 'categories' to list all."
+    return "Send 'categories' to list all your categories."
 
 
 def format_search_results(search_data) -> str:
-    """Format search results for messaging"""
-    # Handle both old list format and new dict format
     if isinstance(search_data, list):
-        results = search_data
-        return "No results found." if not results else f"Found {len(results)} result(s)."
-    
+        return "No results found." if not search_data else f"Found {len(search_data)} result(s)."
     natural = search_data.get("natural_response", "")
     results = search_data.get("results", [])
-    
     if not results:
         return "I couldn't find anything related to that in your notes."
-    
+    # Guard against fallback string from failed LLM call
+    if not natural or natural.strip() in ("{}", ""):
+        return "\n".join(f"• {r['content']}" for r in results[:5])
     return natural
+
 
 # ================== Analytics ==================
 
@@ -705,38 +754,28 @@ async def get_user_analytics(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    phone_number = current_user.phone_number
-
-    """Get user analytics"""
-    
     from sqlalchemy import select, func
-    
+
+    phone_number = current_user.phone_number
     total_messages = await db.scalar(
-        select(func.count(Message.id))
-        .join(User)
-        .where(User.phone_number == phone_number)
+        select(func.count(Message.id)).join(User).where(User.phone_number == phone_number)
     )
-    
     category_stats = await db.execute(
         select(Category.name, func.count(Message.id))
-        .join(Message.category)
-        .join(User)
+        .join(Message.category).join(User)
         .where(User.phone_number == phone_number)
         .group_by(Category.name)
     )
-    
     type_stats = await db.execute(
         select(Message.message_type, func.count(Message.id))
-        .join(User)
-        .where(User.phone_number == phone_number)
+        .join(User).where(User.phone_number == phone_number)
         .group_by(Message.message_type)
     )
-    
     return {
         "total_messages": total_messages,
-        "by_category": dict(category_stats.all()),
-        "by_type": dict(type_stats.all()),
-        "user": phone_number
+        "by_category":    dict(category_stats.all()),
+        "by_type":        dict(type_stats.all()),
+        "user":           phone_number
     }
 
 
@@ -744,31 +783,26 @@ async def get_user_analytics(
 
 @app.get("/api/webhook/info")
 async def get_webhook_info():
-    """Get webhook configuration information"""
-    
     platform = Config.get_messaging_platform()
-    
     if platform == MessagingPlatform.WHATSAPP:
         return {
-            "platform": "whatsapp",
+            "platform":         "whatsapp",
             "webhook_endpoint": "/webhook/whatsapp",
-            "verify_token": Config.WHATSAPP_VERIFY_TOKEN,
-            "instructions": "Configure in Meta Business Suite > WhatsApp > Configuration > Webhooks"
+            "verify_token":     Config.WHATSAPP_VERIFY_TOKEN,
         }
-    
     elif platform == MessagingPlatform.TELEGRAM:
         try:
             info = await messaging_client.get_webhook_info()
             return {
-                "platform": "telegram",
+                "platform":         "telegram",
                 "webhook_endpoint": "/webhook/telegram",
-                "current_webhook": info.get("result", {}),
-                "configured_url": Config.TELEGRAM_WEBHOOK_URL
+                "current_webhook":  info.get("result", {}),
+                "configured_url":   Config.TELEGRAM_WEBHOOK_URL
             }
-        except:
+        except Exception:
             return {
-                "platform": "telegram",
+                "platform":         "telegram",
                 "webhook_endpoint": "/webhook/telegram",
-                "configured_url": Config.TELEGRAM_WEBHOOK_URL,
-                "status": "not_configured"
+                "configured_url":   Config.TELEGRAM_WEBHOOK_URL,
+                "status":           "not_configured"
             }
