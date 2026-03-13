@@ -27,7 +27,8 @@ CEREBRAS_BASE_URL   = "https://api.cerebras.ai/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 GEMINI_BASE_URL     = "https://generativelanguage.googleapis.com/v1beta/models"
 
-CEREBRAS_DEFAULT_MODEL   = "gpt-oss-120b"
+CEREBRAS_DEFAULT_MODEL = "qwen-3-235b-a22b-instruct-2507"
+CEREBRAS_FALLBACK_MODELS = ["llama3.1-8b"]
 OPENROUTER_DEFAULT_MODEL = "google/gemma-3-4b-it:free"
 GEMINI_DEFAULT_MODEL     = "gemini-2.0-flash-lite"   # faster than 2.5-flash-lite, better JSON
 GEMINI_LITE_MODEL = "gemini-2.0-flash-lite"
@@ -221,45 +222,73 @@ class CerebrasClient:
 
     async def _openai_compat(self, prompt: str, max_tokens: int, temperature: float) -> str:
         headers = self._build_headers()
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a precise assistant. "
-                        "When asked for JSON, return ONLY valid JSON with no extra text."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
+        
+        # Build model chain: primary + fallbacks (only for Cerebras)
+        if self.provider == "cerebras":
+            models_to_try = [self.model] + CEREBRAS_FALLBACK_MODELS
+        else:
+            models_to_try = [self.model]
 
-        for attempt in range(3):
-            try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    resp = await client.post(
-                        f"{self.base_url}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                    )
-                    resp.raise_for_status()
-                    return resp.json()["choices"][0]["message"]["content"].strip()
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in (429, 500) and attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                raise
-            except Exception as e:
-                if attempt < 2:
-                    await asyncio.sleep(1)
-                    continue
-                raise
+        for model in models_to_try:
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a precise assistant. "
+                            "When asked for JSON, return ONLY valid JSON with no extra text."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
 
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        resp = await client.post(
+                            f"{self.base_url}/chat/completions",
+                            headers=headers,
+                            json=payload,
+                        )
+                        resp.raise_for_status()
+
+                        data = resp.json()
+                        choices = data.get("choices", [])
+                        if not choices:
+                            print(f"[cerebras] Empty choices for model {model}: {data}")
+                            break  # try next model
+
+                        content = choices[0].get("message", {}).get("content")
+                        if not content:
+                            print(f"[cerebras] No content for model {model}")
+                            break  # try next model
+
+                        if model != self.model:
+                            print(f"[cerebras] Succeeded with fallback model: {model}")
+
+                        return content.strip()
+
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code in (429, 500) and attempt < 2:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    if e.response.status_code in (400, 404):
+                        # Model doesn't exist or bad request — skip to next model immediately
+                        print(f"[cerebras] Model {model} failed ({e.response.status_code}), trying next...")
+                        break
+                    raise
+                except Exception as e:
+                    if attempt < 2:
+                        await asyncio.sleep(1)
+                        continue
+                    raise
+
+        print("[cerebras] All models exhausted, returning empty")
         return "{}"
-
     # ──────────────────────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────────────────────
