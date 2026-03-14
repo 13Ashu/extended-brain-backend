@@ -10,6 +10,7 @@ jwt
 sqlalchemy
 asyncpg
 alembic
+upstash-redis
 
 # HTTP Client
 httpx
@@ -35,3 +36,5 @@ loguru
 # AI/Embeddings
 fastembed
 pgvector
+
+
