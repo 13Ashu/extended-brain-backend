@@ -325,8 +325,10 @@ async def handle_telegram_webhook(
         raise HTTPException(status_code=400, detail="Telegram not configured")
 
     webhook_data = await request.json()
+    print(f"[webhook] Keys received: {list(webhook_data.keys())}")
 
     if "callback_query" in webhook_data:
+        print(f"[webhook] Callback: {webhook_data['callback_query'].get('data')}")
         await _handle_callback_query(webhook_data["callback_query"], db)
         return {"ok": True}
 
