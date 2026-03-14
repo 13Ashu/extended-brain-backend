@@ -1338,6 +1338,18 @@ def _format_todo_plain(results: list) -> str:
 
     return "\n".join(lines)
 
+def _date_label(saved_date: str, today_date) -> str:
+    """Human-readable date label for multi-source display."""
+    from datetime import date as dt_date
+    try:
+        d     = dt_date.fromisoformat(saved_date)
+        delta = (today_date - d).days
+        if delta == 0:  return "today"
+        if delta == 1:  return "yesterday"
+        if delta <= 6:  return f"{delta}d ago"
+        return d.strftime("%d %b")
+    except Exception:
+        return saved_date
 
 def _format_results_plain(results: list, today_date=None) -> str:
     """Format general results with smart timestamp logic."""
