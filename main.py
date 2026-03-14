@@ -797,14 +797,15 @@ async def _build_status(user: User, db: AsyncSession) -> str:
     pending = pending_res.scalar() or 0
 
     # Done today
+    today_dt = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     done_res = await db.execute(
         select(func.count(Message.id))
         .where(
             Message.user_id == user.id,
             text("(messages.tags->>'done')::boolean IS TRUE"),
-            text("(messages.tags->>'done_at')::timestamp >= :today::timestamp"),
+            text("(messages.tags->>'done_at')::timestamp >= :today"),
         )
-        .params(today=f"{today}T00:00:00")
+        .params(today=today_dt)
     )
     done_today = done_res.scalar() or 0
 
