@@ -1,16 +1,11 @@
 """
-Intelligent Message Processor — v2
+Intelligent Message Processor — v3
 ────────────────────────────────────────────────────────────────────────────
-KEY UPGRADES OVER v1
-  • Multi-bucket assignment  — a note can live in MULTIPLE buckets at once
-    e.g. "call Kailash at 12pm tomorrow" → To-Do + Events
-  • Richer entity extraction — phone, time, URL, product, emotion, priority
-  • Computed due_date always present (fallback = today for To-Do)
-  • Action-verb detection for smarter To-Do vs Remember separation
-  • Embeddings at 3072 dims (full Gemini gemini-embedding-001)
-  • All LLM calls are single-pass where possible (fewer API round-trips)
+KEY CHANGES over v2:
+  • "List" bucket — named lists (shopping, bag, packing) routed to list_service
+  • Priority detection — urgent/high affects reminder re-fire frequency
+  • List intent detected BEFORE todo batch splitting
 ────────────────────────────────────────────────────────────────────────────
-Save as: services/message_processor.py
 """
 
 from __future__ import annotations
@@ -35,37 +30,36 @@ from models import MessageType
 INTENT_BUCKETS: Dict[str, str] = {
     "Remember": (
         "Recall a fact, location, credential, or piece of information for later. "
-        "Examples: parked at C3, nailcutter in 3rd drawer, wifi password 1234, "
-        "mom's birthday June 3rd, meeting room 4B."
+        "Examples: parked at C3, nailcutter in 3rd drawer, wifi password 1234."
     ),
     "To-Do": (
-        "A task, action item, or reminder the user must act on. "
-        "Examples: buy milk, call dentist, submit report by Friday, "
-        "renew passport, send invoice, call Kailash at noon tomorrow."
+        "A task or action item the user must act on. "
+        "Examples: buy milk, call dentist, submit report by Friday, call Kailash at noon."
     ),
     "Ideas": (
-        "A new idea, thought, concept, insight, or creative spark. "
-        "Examples: startup idea, feature suggestion, book concept, "
-        "blog post topic, interesting question to explore."
+        "A new idea, thought, concept, or creative spark. "
+        "Examples: startup idea, feature suggestion, book concept."
     ),
     "Track": (
-        "Log or monitor something over time — health, habits, progress, mood. "
-        "Examples: weight 74 kg, ran 5 km, mood anxious, slept 6 hours, steps 8000."
+        "Log or monitor something — health, habits, progress, mood. "
+        "Examples: weight 74kg, ran 5km, mood anxious, slept 6 hours."
     ),
     "Events": (
-        "A time-anchored event, appointment, meeting, or plan with a specific date/time. "
-        "Examples: mom visiting 10th March, dentist appointment Friday 3 pm, "
-        "flight to Delhi on 20th, call Kailash at 12 pm tomorrow."
+        "A time-anchored event or appointment with a specific date/time. "
+        "Examples: dentist Friday 3pm, flight to Delhi on 20th."
+    ),
+    "List": (
+        "A named collection of items — shopping list, packing list, bag list, reading list. "
+        "Examples: shopping list with groceries, packing list for trip, bag list for exam."
     ),
     "Random": (
-        "Casual, venting, conversational, or clearly unclear intent. "
-        "Examples: heyy, lol okay, ugh today was rough, testing 123, hi."
+        "Casual, venting, conversational, or unclear. "
+        "Examples: heyy, lol okay, ugh today was rough."
     ),
 }
 
 BUCKET_NAMES = list(INTENT_BUCKETS.keys())
 
-# Signals that strongly imply To-Do regardless of other buckets
 ACTION_VERBS = {
     "call", "email", "message", "text", "ping", "contact",
     "buy", "get", "pick", "order", "purchase",
@@ -86,9 +80,20 @@ TRACK_SIGNALS = {
     "walked", "weight", "bp", "sugar", "water", "drank",
 }
 
+REMINDER_KEYWORDS = {"remind", "reminder", "don't forget", "alert", "notify", "ping"}
+
+PRIORITY_HIGH_SIGNALS = {
+    "urgent", "asap", "critical", "important", "must", "definitely",
+    "don't forget", "cannot miss", "high priority",
+}
+
+PRIORITY_URGENT_SIGNALS = {
+    "emergency", "immediately", "right now", "super urgent", "very urgent",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pure helpers
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -98,92 +103,84 @@ def _today_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d")
 
 
-def _tomorrow_str() -> str:
-    return (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
+def _detect_priority(content: str) -> str:
+    lc = content.lower()
+    if any(sig in lc for sig in PRIORITY_URGENT_SIGNALS):
+        return "urgent"
+    if any(sig in lc for sig in PRIORITY_HIGH_SIGNALS):
+        return "high"
+    return "normal"
 
-
-REMINDER_KEYWORDS = {"remind", "reminder", "don't forget", "alert", "notify", "ping"}
 
 def _sniff_buckets_fast(content: str) -> List[str]:
-    """
-    Zero-LLM fast pre-classification.
-    Returns a list of LIKELY buckets (may be wrong — LLM will refine).
-    Used to warm up the prompt with hints.
-    """
     lc = content.lower()
 
-     # Reminder override — if explicit remind keyword, force To-Do first
+    # Reminder override
     if any(kw in lc for kw in REMINDER_KEYWORDS):
         buckets = ["To-Do"]
-        if re.search(r"\b(today|tomorrow|tonight|morning|afternoon|evening|noon|\d{1,2}(am|pm)|\d{1,2}:\d{2}|after\s+\d+\s*(min|hour))\b", lc):
+        if re.search(
+            r"\b(today|tomorrow|tonight|morning|afternoon|evening|noon"
+            r"|\d{1,2}(am|pm)|\d{1,2}:\d{2}|after\s+\d+\s*(min|hour))\b", lc
+        ):
             buckets.append("Events")
         return buckets
 
-
-    buckets: List[str] = []
-
-    words = set(re.findall(r"\b\w+\b", lc))
-
-    # Random: very short or pure greeting
+    # Short/greeting
     if len(lc.strip()) < 6 or lc.strip() in {"hi", "hey", "heyy", "ok", "okay", "lol", "test"}:
         return ["Random"]
 
-    # Track: numeric + health unit
+    buckets: List[str] = []
+
+    # Track
     if any(sig in lc for sig in TRACK_SIGNALS) and re.search(r"\d", lc):
         buckets.append("Track")
 
-    # To-Do: action verb at start
+    # To-Do
     if any(lc.startswith(v) or f" {v} " in lc for v in ACTION_VERBS):
-        buckets.append("To-Do")
+        if "To-Do" not in buckets:
+            buckets.append("To-Do")
 
-    # Events: time anchor
+    # Events
     if re.search(
         r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday"
         r"|tonight|morning|afternoon|evening|noon|\d{1,2}(am|pm)|\d{1,2}:\d{2})\b",
         lc,
     ):
-        buckets.append("Events")
+        if "Events" not in buckets:
+            buckets.append("Events")
         if not buckets:
             buckets.append("To-Do")
 
-    # Ideas: idea/concept language
+    # Ideas
     if re.search(r"\b(idea|concept|what if|imagine|startup|feature|build|create)\b", lc):
-        buckets.append("Ideas")
+        if "Ideas" not in buckets:
+            buckets.append("Ideas")
 
-    # Remember: location/credential/fact (no strong action verb)
+    # Remember
     if re.search(r"\b(parked|password|code|pin|address|at|in|located)\b", lc):
-        if "To-Do" not in buckets:
+        if "To-Do" not in buckets and "Remember" not in buckets:
             buckets.append("Remember")
 
     return list(dict.fromkeys(buckets)) or ["Random"]
 
 
 def _extract_time_mention(content: str, ref: datetime) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Quick regex-based time extraction.
-    Returns (date_str YYYY-MM-DD, time_str HH:MM) — both optional.
-    """
     lc = content.lower()
     date_str: Optional[str] = None
     time_str: Optional[str] = None
 
-    # Relative day
     if "today" in lc:
         date_str = ref.strftime("%Y-%m-%d")
     elif "tomorrow" in lc:
         date_str = (ref + timedelta(days=1)).strftime("%Y-%m-%d")
     else:
-        # Day name
         days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
         for i, d in enumerate(days):
             if d in lc:
-                delta = (i - ref.weekday()) % 7
-                if delta == 0:
-                    delta = 7
+                delta = (i - ref.weekday()) % 7 or 7
                 date_str = (ref + timedelta(days=delta)).strftime("%Y-%m-%d")
                 break
 
-    # Time: "12 pm", "3:30pm", "noon", "midnight"
     m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", lc)
     if m:
         h, mins, meridian = int(m.group(1)), int(m.group(2) or 0), m.group(3)
@@ -196,6 +193,13 @@ def _extract_time_mention(content: str, ref: datetime) -> Tuple[Optional[str], O
         time_str = "12:00"
     elif "midnight" in lc:
         time_str = "00:00"
+    elif re.search(r"\baround\s+(\d{1,2})\s*(pm|am)\b", lc):
+        m2 = re.search(r"\baround\s+(\d{1,2})\s*(pm|am)\b", lc)
+        if m2:
+            h = int(m2.group(1))
+            if m2.group(2) == "pm" and h != 12:
+                h += 12
+            time_str = f"{h:02d}:00"
 
     return date_str, time_str
 
@@ -204,13 +208,19 @@ def _extract_time_mention(content: str, ref: datetime) -> Tuple[Optional[str], O
 # Main processor
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 class MessageProcessor:
-    """Transform messages into structured multi-bucket knowledge."""
 
     def __init__(self, cerebras_client: CerebrasClient, reminder_service=None):
-        self.cerebras = cerebras_client
+        self.cerebras         = cerebras_client
         self.reminder_service = reminder_service
+        self._list_service    = None  # injected lazily to avoid circular import
+
+    @property
+    def list_service(self):
+        if self._list_service is None:
+            from services.list_service import ListService
+            self._list_service = ListService(self.cerebras)
+        return self._list_service
 
     # ──────────────────────────────────────────────────────────────
     # Public entry point
@@ -230,69 +240,67 @@ class MessageProcessor:
 
         ref = datetime.utcnow()
 
-        # ── Fast hints (zero tokens) ──────────────────────────────
+        # ── 1. Check for list intent FIRST ────────────────────────
+        list_intent = self.list_service.detect_list_intent(content)
+        if list_intent and list_intent["intent"] in ("create", "add"):
+            return await self._handle_list_save(user, list_intent, content, db)
+
+        # ── 2. Fast hints ─────────────────────────────────────────
         fast_buckets = _sniff_buckets_fast(content)
         fast_date, fast_time = _extract_time_mention(content, ref)
+        priority = _detect_priority(content)
 
-        # ── Single LLM call: full understanding + multi-bucket ────
+        # ── 3. Full LLM analysis ──────────────────────────────────
         analysis = await self._full_analysis(
-            content=content,
-            user=user,
-            db=db,
-            fast_buckets=fast_buckets,
-            fast_date=fast_date,
-            fast_time=fast_time,
-            ref=ref,
+            content=content, user=user, db=db,
+            fast_buckets=fast_buckets, fast_date=fast_date,
+            fast_time=fast_time, ref=ref,
         )
 
-        buckets: List[str] = analysis.get("buckets", fast_buckets)
-        # Validate
-        buckets = [b for b in buckets if b in BUCKET_NAMES]
+        # Inject detected priority if LLM didn't catch it
+        if priority != "normal" and analysis.get("priority") == "normal":
+            analysis["priority"] = priority
+
+        buckets = [b for b in analysis.get("buckets", fast_buckets) if b in BUCKET_NAMES]
         if not buckets:
             buckets = ["Random"]
 
-        # ── Handle To-Do list splitting ───────────────────────────
+        # ── 4. Todo batch splitting ───────────────────────────────
         if "To-Do" in buckets and message_type == "text":
             todo_items = analysis.get("todo_items", [])
             if todo_items and len(todo_items) > 1:
                 return await self._process_todo_batch(
-                    user=user,
-                    items=todo_items,
-                    original_content=content,
-                    analysis=analysis,
-                    all_buckets=buckets,
-                    db=db,
+                    user=user, items=todo_items,
+                    original_content=content, analysis=analysis,
+                    all_buckets=buckets, db=db,
                 )
 
-        # ── Persist (one row, multiple bucket tags) ───────────────
+        # ── 5. Single message persist ─────────────────────────────
         primary_bucket = buckets[0]
         category = await self._get_or_create_category(
-            user_id=user.id,
-            name=primary_bucket,
-            auto_description=INTENT_BUCKETS.get(primary_bucket, ""),
-            db=db,
+            user_id=user.id, name=primary_bucket,
+            auto_description=INTENT_BUCKETS.get(primary_bucket, ""), db=db,
         )
 
         due_date: Optional[str] = analysis.get("due_date")
         if not due_date and "To-Do" in buckets:
             due_date = _today_str()
 
-        events: List[Dict] = analysis.get("events", [])
+        events = analysis.get("events", [])
 
-        # Build rich tags
         tags = {
-            "keywords":        analysis.get("keywords", []),
-            "entities":        analysis.get("entities", {}),
-            "concepts":        analysis.get("concepts", []),
-            "actionables":     analysis.get("actionables", []),
-            "sentiment":       analysis.get("sentiment", "neutral"),
-            "priority":        analysis.get("priority", "normal"),
-            "time_reference":  analysis.get("time_reference", "none"),
-            "event_time":      analysis.get("event_time"),
-            "all_buckets":     buckets,           # ← multi-bucket
-            "primary_bucket":  primary_bucket,
-            "due_date":        due_date,
-            "events":          events,
+            "keywords":       analysis.get("keywords", []),
+            "entities":       analysis.get("entities", {}),
+            "concepts":       analysis.get("concepts", []),
+            "actionables":    analysis.get("actionables", []),
+            "sentiment":      analysis.get("sentiment", "neutral"),
+            "priority":       analysis.get("priority", "normal"),
+            "time_reference": analysis.get("time_reference", "none"),
+            "event_time":     analysis.get("event_time"),
+            "all_buckets":    buckets,
+            "primary_bucket": primary_bucket,
+            "due_date":       due_date,
+            "events":         events,
         }
 
         message = Message(
@@ -322,47 +330,67 @@ class MessageProcessor:
             "priority":    analysis.get("priority", "normal"),
         }
 
-        # THEN handle reminder
+        # ── 6. Reminder ───────────────────────────────────────────
         if ("To-Do" in buckets or "Events" in buckets) and self.reminder_service:
             has_time = analysis.get("event_time") and analysis.get("due_date")
             if has_time:
                 reminder = await self.reminder_service.create(
-                    user=user,
-                    content=content,
-                    analysis=analysis,
-                    message_id=message.id,
-                    db=db,
+                    user=user, content=content, analysis=analysis,
+                    message_id=message.id, db=db,
                 )
                 if reminder:
                     result["reminder_id"] = reminder.id
-                    result["remind_at"] = reminder.remind_at.isoformat()
+                    result["remind_at"]   = reminder.remind_at.isoformat()
 
         await self._save_embedding(message.id, content, analysis, db)
         return result
 
     # ──────────────────────────────────────────────────────────────
-    # Single LLM analysis call (replaces 3-4 separate calls)
+    # List save handler
+    # ──────────────────────────────────────────────────────────────
+
+    async def _handle_list_save(
+        self, user: User, intent: Dict, original_content: str, db: AsyncSession
+    ) -> Dict:
+        list_type = intent["list_type"]
+        list_name = intent["list_name"]
+        items     = intent["items"]
+
+        msg, added = await self.list_service.add_items(
+            user.id, list_type, list_name, items, db
+        )
+
+        tags     = msg.tags if isinstance(msg.tags, dict) else {}
+        total    = len(tags.get("subtasks", []))
+
+        return {
+            "message_id":  msg.id,
+            "category":    "List",
+            "all_buckets": ["List"],
+            "list_type":   list_type,
+            "list_name":   list_name,
+            "items_added": added,
+            "total_items": total,
+            "tags":        [],
+            "essence":     f"{list_name} — {added} item(s) added ({total} total)",
+            "connections": [],
+            "due_date":    None,
+            "events":      [],
+            "priority":    "normal",
+        }
+
+    # ──────────────────────────────────────────────────────────────
+    # LLM analysis
     # ──────────────────────────────────────────────────────────────
 
     async def _full_analysis(
-        self,
-        content: str,
-        user: User,
-        db: AsyncSession,
-        fast_buckets: List[str],
-        fast_date: Optional[str],
-        fast_time: Optional[str],
-        ref: datetime,
+        self, content: str, user: User, db: AsyncSession,
+        fast_buckets: List[str], fast_date: Optional[str],
+        fast_time: Optional[str], ref: datetime,
     ) -> Dict:
         recent_topics = await self._get_recent_topics(user.id, db)
-        ref_str = ref.strftime("%Y-%m-%d (%A, %d %B %Y)")
+        ref_str  = ref.strftime("%Y-%m-%d (%A, %d %B %Y)")
         tomorrow = (ref + timedelta(days=1)).strftime("%Y-%m-%d")
-        next_days = {
-            d: (ref + timedelta(days=i)).strftime("%Y-%m-%d")
-            for i, d in enumerate(
-                ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"], 1
-            )
-        }
 
         bucket_defs = "\n".join(
             f'  "{name}": {desc}' for name, desc in INTENT_BUCKETS.items()
@@ -375,72 +403,49 @@ RECENT TOPICS: {", ".join(recent_topics[:10])}
 
 NOTE: "{content}"
 
-────────────────────────────────────────────────────────
-TASK: Return a rich JSON analysis. Every field is required.
-────────────────────────────────────────────────────────
-
-BUCKET DEFINITIONS (choose 1-3 that apply):
+BUCKET DEFINITIONS (choose 1-3):
 {bucket_defs}
 
 MULTI-BUCKET RULE:
-  "call Kailash at 12 pm tomorrow"  → ["To-Do", "Events"]   (it's both an action AND a scheduled event)
-  "buy milk"                        → ["To-Do"]
-  "parked at C3"                    → ["Remember"]
-  "weight 74kg"                     → ["Track"]
-  "mom visiting 10th March"         → ["Events"]
-  "startup idea: X"                 → ["Ideas"]
-  "heyy"                            → ["Random"]
-  "dentist at 3pm friday, also call john"  → ["To-Do", "Events"]
+  "call Kailash at 12pm tomorrow" → ["To-Do", "Events"]
+  "buy milk" → ["To-Do"]
+  "parked at C3" → ["Remember"]
+  "weight 74kg" → ["Track"]
+  "dentist Friday 3pm" → ["Events"]
+  "startup idea" → ["Ideas"]
+  "heyy" → ["Random"]
 
-FAST HINTS (may be wrong, use as input only):
-  fast_buckets = {fast_buckets}
-  fast_date    = {fast_date}
-  fast_time    = {fast_time}
+PRIORITY:
+  urgent/asap/critical/important → "high"
+  emergency/immediately → "urgent"
+  normal → "normal"
 
-DATE RESOLUTION:
-  today    = {ref.strftime("%Y-%m-%d")}
-  tomorrow = {tomorrow}
-  Day names resolve to the NEXT upcoming occurrence from today.
+FAST HINTS: fast_buckets={fast_buckets}, fast_date={fast_date}, fast_time={fast_time}
+DATE: today={ref.strftime("%Y-%m-%d")}, tomorrow={tomorrow}
 
-PRIORITY DETECTION:
-  urgent/asap/important/critical → "high"
-  normal note                    → "normal"
-  someday/eventually             → "low"
-
-Return ONLY this JSON (no markdown):
+Return ONLY this JSON:
 {{
-  "buckets": ["Primary", "Secondary?"],
-  "essence": "one clear sentence capturing core meaning",
-  "keywords": ["3-6 searchable keywords"],
+  "buckets": ["Primary"],
+  "essence": "one clear sentence",
+  "keywords": ["3-6 keywords"],
   "entities": {{
-    "people":        [],
-    "places":        [],
-    "organizations": [],
-    "products":      [],
-    "times":         [],
-    "phone_numbers": [],
-    "emails":        [],
-    "urls":          []
+    "people": [], "places": [], "organizations": [],
+    "products": [], "times": [], "phone_numbers": [], "emails": [], "urls": []
   }},
-  "concepts":       ["abstract themes"],
-  "actionables":    ["specific action items"],
-  "sentiment":      "neutral | positive | excited | urgent | anxious | contemplative",
-  "priority":       "high | normal | low",
-  "time_reference": "now | today | tomorrow | this_week | future | none",
+  "concepts":       [],
+  "actionables":    [],
+  "sentiment":      "neutral",
+  "priority":       "normal",
+  "time_reference": "today | tomorrow | this_week | future | none",
   "event_time":     "HH:MM or null",
   "due_date":       "YYYY-MM-DD or null",
-  "events": [
-    {{"date": "YYYY-MM-DD", "time": "HH:MM or null", "label": "short human title"}}
-  ],
-  "todo_items": [
-    {{"task": "clean task", "due_date": "YYYY-MM-DD", "time": "HH:MM or null"}}
-  ],
-  "related_concepts": ["from user's recent topics this connects to"]
+  "events": [{{"date": "YYYY-MM-DD", "time": "HH:MM or null", "label": "short title"}}],
+  "todo_items": [{{"task": "clean task", "due_date": "YYYY-MM-DD", "time": "HH:MM or null"}}],
+  "related_concepts": []
 }}"""
 
         response = await self.cerebras.chat(prompt, max_tokens=1500)
 
-        # Defaults
         response.setdefault("buckets", fast_buckets)
         response.setdefault("essence", content[:100])
         response.setdefault("keywords", [])
@@ -456,20 +461,16 @@ Return ONLY this JSON (no markdown):
         response.setdefault("todo_items", [])
         response.setdefault("related_concepts", [])
 
-        # Ensure entities sub-keys
         ent = response["entities"]
         if not isinstance(ent, dict):
             response["entities"] = {}
-        for k in ("people", "places", "organizations", "products", "times",
-                  "phone_numbers", "emails", "urls"):
+        for k in ("people","places","organizations","products","times","phone_numbers","emails","urls"):
             response["entities"].setdefault(k, [])
 
-        # Validate due_date format
         dd = response.get("due_date")
         if dd and not _DATE_RE.match(str(dd)):
             response["due_date"] = None
 
-        # Validate events
         valid_events = []
         for e in response.get("events", []):
             if isinstance(e, dict) and _DATE_RE.match(str(e.get("date", ""))):
@@ -483,43 +484,35 @@ Return ONLY this JSON (no markdown):
         return response
 
     # ──────────────────────────────────────────────────────────────
-    # Multi To-Do splitting
+    # Todo batch
     # ──────────────────────────────────────────────────────────────
 
     async def _process_todo_batch(
-        self,
-        user: User,
-        items: List[Dict],
-        original_content: str,
-        analysis: Dict,
-        all_buckets: List[str],
-        db: AsyncSession,
+        self, user: User, items: List[Dict], original_content: str,
+        analysis: Dict, all_buckets: List[str], db: AsyncSession,
     ) -> Dict:
         category = await self._get_or_create_category(
-            user_id=user.id,
-            name="To-Do",
-            auto_description=INTENT_BUCKETS["To-Do"],
-            db=db,
+            user_id=user.id, name="To-Do",
+            auto_description=INTENT_BUCKETS["To-Do"], db=db,
         )
 
-        saved_ids = []
-        saved_items = []  # track (message_id, task, evt_time, due_date) for post-commit work
-        ref = datetime.utcnow()
+        saved_ids   = []
+        saved_items = []
+        ref         = datetime.utcnow()
 
         for item in items:
             task     = str(item.get("task", "")).strip()
             due_date = item.get("due_date") or _today_str()
             evt_time = item.get("time")
+            priority = _detect_priority(task) or analysis.get("priority", "normal")
 
             if not task:
                 continue
-
             if not _DATE_RE.match(str(due_date)):
                 due_date = _today_str()
 
-            # Does this task item also qualify as an Event?
             item_buckets = ["To-Do"]
-            if evt_time or item.get("date"):
+            if evt_time:
                 item_buckets.append("Events")
 
             message = Message(
@@ -527,7 +520,6 @@ Return ONLY this JSON (no markdown):
                 category_id=category.id,
                 content=task,
                 message_type=MessageType("text"),
-                media_url=None,
                 summary=task[:100],
                 tags={
                     "keywords":       analysis.get("keywords", []),
@@ -535,56 +527,53 @@ Return ONLY this JSON (no markdown):
                     "concepts":       analysis.get("concepts", []),
                     "actionables":    [task],
                     "sentiment":      "neutral",
-                    "priority":       analysis.get("priority", "normal"),
+                    "priority":       priority,
                     "time_reference": "none",
                     "event_time":     evt_time,
                     "all_buckets":    item_buckets,
                     "primary_bucket": "To-Do",
                     "due_date":       due_date,
-                    "events":         (
+                    "events": (
                         [{"date": due_date, "time": evt_time, "label": task[:40]}]
                         if "Events" in item_buckets else []
                     ),
-                    "split_from":     original_content[:200],
+                    "split_from": original_content[:200],
                 },
                 created_at=ref,
             )
             db.add(message)
-            await db.flush()  # get message.id without committing
+            await db.flush()
 
             saved_ids.append(message.id)
             saved_items.append({
-                "id":       message.id,
-                "task":     task,
-                "evt_time": evt_time,
-                "due_date": due_date,
+                "id": message.id, "task": task,
+                "evt_time": evt_time, "due_date": due_date,
+                "priority": priority,
             })
 
-        # Single commit for all messages
         await db.commit()
 
-        # Post-commit: embeddings + reminders (safe now that IDs are stable)
         for saved in saved_items:
-            # Embeddings
             await self._save_embedding(saved["id"], saved["task"], analysis, db)
 
-            # Reminders — only if has a time and reminder_service is wired
             if self.reminder_service and saved["evt_time"]:
                 item_analysis = {
                     **analysis,
                     "event_time": saved["evt_time"],
                     "due_date":   saved["due_date"],
+                    "priority":   saved["priority"],
                 }
                 try:
                     await self.reminder_service.create(
-                        user=user,
-                        content=saved["task"],
-                        analysis=item_analysis,
-                        message_id=saved["id"],
-                        db=db,
+                        user=user, content=saved["task"],
+                        analysis=item_analysis, message_id=saved["id"], db=db,
                     )
                 except Exception as e:
-                    print(f"⚠ Reminder creation failed for task '{saved['task']}': {e}")
+                    print(f"⚠ Reminder failed for '{saved['task']}': {e}")
+
+        timed   = [s for s in saved_items if s["evt_time"]]
+        untimed = [s for s in saved_items if not s["evt_time"]]
+        reminder_note = f" · {len(timed)} reminder(s) set" if timed else ""
 
         return {
             "message_id":  saved_ids[0] if saved_ids else None,
@@ -593,38 +582,31 @@ Return ONLY this JSON (no markdown):
             "category":    "To-Do",
             "all_buckets": ["To-Do"],
             "tags":        analysis.get("keywords", []),
-            "essence":     f"Saved {len(saved_ids)} tasks: " + ", ".join(
-                i["task"] for i in items[:3] if i.get("task")
+            "essence":     (
+                f"Saved {len(saved_ids)} tasks{reminder_note}: "
+                + ", ".join(i["task"] for i in saved_items[:3])
             ),
             "connections": [],
             "due_date":    items[0].get("due_date") if items else None,
             "events":      [],
             "priority":    analysis.get("priority", "normal"),
         }
+
     # ──────────────────────────────────────────────────────────────
     # DB helpers
     # ──────────────────────────────────────────────────────────────
 
     async def _get_or_create_category(
-        self,
-        user_id: int,
-        name: str,
-        auto_description: str,
-        db: AsyncSession,
+        self, user_id: int, name: str, auto_description: str, db: AsyncSession,
     ) -> Category:
         result = await db.execute(
             select(Category).where(
-                Category.user_id == user_id,
-                Category.name == name,
+                Category.user_id == user_id, Category.name == name,
             )
         )
         category = result.scalar_one_or_none()
         if not category:
-            category = Category(
-                user_id=user_id,
-                name=name,
-                description=auto_description,
-            )
+            category = Category(user_id=user_id, name=name, description=auto_description)
             db.add(category)
             await db.flush()
         return category
@@ -648,36 +630,27 @@ Return ONLY this JSON (no markdown):
         return list(topics)[:15]
 
     async def _save_embedding(
-        self,
-        message_id: int,
-        content: str,
-        analysis: Dict,
-        db: AsyncSession,
+        self, message_id: int, content: str, analysis: Dict, db: AsyncSession,
     ):
         try:
             from services.embedding_service import embedding_service
-
-            # Enrich the text before embedding for better retrieval
-            people    = analysis.get("entities", {}).get("people", [])
-            keywords  = analysis.get("keywords", [])
-            essence   = analysis.get("essence", "")
-            buckets   = analysis.get("buckets", [])
+            people      = analysis.get("entities", {}).get("people", [])
+            keywords    = analysis.get("keywords", [])
+            essence     = analysis.get("essence", "")
+            buckets     = analysis.get("buckets", [])
             actionables = analysis.get("actionables", [])
 
             enriched = " ".join(filter(None, [
-                content,
-                essence,
-                " ".join(keywords),
-                " ".join(people),
-                " ".join(actionables),
-                " ".join(buckets),
+                content, essence,
+                " ".join(keywords), " ".join(people),
+                " ".join(actionables), " ".join(buckets),
             ]))
 
-            embedding = await embedding_service.aembed(enriched.strip(), task_type="RETRIEVAL_DOCUMENT")
+            embedding = await embedding_service.aembed(
+                enriched.strip(), task_type="RETRIEVAL_DOCUMENT"
+            )
             await db.execute(
-                update(Message)
-                .where(Message.id == message_id)
-                .values(embedding=embedding)
+                update(Message).where(Message.id == message_id).values(embedding=embedding)
             )
             await db.commit()
         except Exception as e:
