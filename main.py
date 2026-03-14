@@ -665,7 +665,7 @@ async def send_list_display(chat_id: str, search_result: dict):
 
     results = search_result.get("results", [])
     if not results:
-        list_name = search_result.get("list_name", "List")
+        list_name = search_result.get("list_name", "Shopping List")  # use actual name
         async with httpx.AsyncClient(timeout=10.0) as client:
             await client.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
@@ -674,7 +674,8 @@ async def send_list_display(chat_id: str, search_result: dict):
                     "text":       (
                         f"📋 *{list_name}*\n\n"
                         f"_Nothing here yet!_\n\n"
-                        f"Start by sending:\n`{list_name.lower()}:\\n- item1\\n- item2`"
+                        f"Start by sending:\n"
+                        f"`{list_name.lower()}:`\n`- item1`\n`- item2`"
                     ),
                     "parse_mode": "Markdown",
                 },

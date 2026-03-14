@@ -133,11 +133,22 @@ class ListService:
                 if sig in lc:
                     return list_type, self._normalize_name(sig)
 
-        # Fallback: look for "X list" or "X bag" pattern
-        m = re.search(r"([\w\s]+?)(?:list|bag|checklist)", lc)
+        # More flexible: look for known type words anywhere in query
+        type_words = {
+            "shopping": "shopping", "grocery": "shopping", "groceries": "shopping",
+            "bag": "bag", "packing": "packing", "travel": "packing",
+            "reading": "reading", "watch": "watching",
+        }
+        for word, list_type in type_words.items():
+            if re.search(rf"\b{word}\b", lc):
+                display = self._normalize_name(f"{word} list")
+                return list_type, display
+
+        # Fallback: "X list" or "X bag" pattern
+        m = re.search(r"([\w]+)\s+(?:list|bag|checklist)", lc)
         if m:
             raw = m.group(1).strip()
-            if raw and len(raw) < 30:
+            if raw and len(raw) < 30 and raw not in {"my", "the", "a", "an", "your", "show", "get"}:
                 return "custom", self._normalize_name(raw + " list")
 
         return None, ""
