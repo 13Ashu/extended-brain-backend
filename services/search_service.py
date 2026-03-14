@@ -20,7 +20,7 @@ from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cerebras_client import CerebrasClient
-from database import Category, Message, User
+from database import Category, Message, User, async_session_maker
 
 BUCKET_NAMES = ["Remember", "To-Do", "Ideas", "Track", "Events", "List", "Random"]
 
