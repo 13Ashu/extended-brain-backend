@@ -285,6 +285,10 @@ class MessageProcessor:
         due_date: Optional[str] = analysis.get("due_date")
         if not due_date and "To-Do" in buckets:
             due_date = _today_str()
+        # Also set today if we have a time reference but no date
+        # "pay sabziwala at 10pm" implies today
+        if not due_date and analysis.get("event_time"):
+            due_date = _today_str()
 
         events = analysis.get("events", [])
 
@@ -502,7 +506,12 @@ Return ONLY this JSON:
 
         for item in items:
             task     = str(item.get("task", "")).strip()
-            due_date = item.get("due_date") or _today_str()
+            # Use item due_date, then analysis-level due_date (e.g. "tomorrow"), then today
+            due_date = (
+                item.get("due_date")
+                or analysis.get("due_date")
+                or _today_str()
+            )
             evt_time = item.get("time")
             priority = _detect_priority(task) or analysis.get("priority", "normal")
 

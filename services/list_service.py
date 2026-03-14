@@ -155,6 +155,12 @@ class ListService:
         # Fast pre-filter: skip obvious non-list messages before hitting LLM
         if lc.startswith(("search:", "find:", "/", "remind", "briefing:")):
             return None
+        # CRITICAL: never intercept todo/task queries as list operations
+        # "New todo list for tomorrow" must go to message_processor, not list_service
+        TODO_BLOCK = {"todo", "to-do", "to do", "task", "tasks", "pending"}
+        if any(kw in lc for kw in TODO_BLOCK):
+            return None
+
         list_signals = [
             "list", "bag", "packing", "shopping", "grocery",
             "groceries", "checklist", "add to", "add in",

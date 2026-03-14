@@ -20,7 +20,7 @@ from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cerebras_client import CerebrasClient
-from database import Category, Message, User, async_session_maker
+from database import Category, Message, User
 
 BUCKET_NAMES = ["Remember", "To-Do", "Ideas", "Track", "Events", "List", "Random"]
 
@@ -250,39 +250,13 @@ class SearchService:
         from services.list_service import ListService
         ls = ListService(self.cerebras)
 
-        # Handles "dmart?" even without "list" keyword
-        q_clean = query.lower().strip().rstrip("?").strip()
-        if q_clean:
-            async with async_session_maker() as session:  # use fresh session
-                candidate = await ls.find_best_matching_list(user_id, q_clean, db)
-                if candidate:
-                    # Confirmed list match — render it directly
-                    tags     = candidate.tags if isinstance(candidate.tags, dict) else {}
-                    subtasks = tags.get("subtasks", [])
-                    list_name = tags.get("list_name", candidate.content)
-                    return {
-                        "results": [{
-                            "id":           candidate.id,
-                            "content":      candidate.content,
-                            "essence":      list_name,
-                            "category":     "List",
-                            "all_buckets":  ["List"],
-                            "priority":     "normal",
-                            "tags":         tags,
-                            "created_at":   candidate.created_at.isoformat(),
-                            "due_date":     None,
-                            "event_time":   None,
-                            "events":       [],
-                            "relevance":    100.0,
-                            "preview":      f"{len(subtasks)} items",
-                            "is_list":      True,
-                            "list_message": candidate,
-                        }],
-                        "natural_response": "",
-                        "is_list":          True,
-                        "list_name":        list_name,
-                        "list_message_id":  candidate.id,
-                    }
+        # CRITICAL: todo/task/pending queries must NEVER be treated as named list queries
+        # "todo list today?", "todo list for tomorrow?" must route to _fetch_todos_direct
+        q_lower = query.lower().strip()
+        TODO_BLOCK = {"todo", "to-do", "to do", "task", "tasks", "pending"}
+        if any(kw in q_lower for kw in TODO_BLOCK):
+            return None
+
 
         intent = await ls.detect_list_intent(query)
         if not intent or intent["intent"] != "show":
@@ -392,6 +366,20 @@ class SearchService:
             else:
                 untimed.append(item)
 
+        # Deduplicate by content (case-insensitive) — prevents duplicates from re-saving
+        def _dedup(items):
+            seen = set()
+            out  = []
+            for item in items:
+                key = item["content"].lower().strip()
+                if key not in seen:
+                    seen.add(key)
+                    out.append(item)
+            return out
+
+        timed   = _dedup(timed)
+        untimed = _dedup(untimed)
+
         # Sort timed by event_time
         timed.sort(key=lambda x: x["event_time"] or "00:00")
 
@@ -401,6 +389,8 @@ class SearchService:
             "results":          results[:limit],
             "natural_response": "",
             "is_direct_todo":   True,
+            "date_from":        date_from,
+            "date_to":          date_to,
             "timed_count":      len(timed),
             "untimed_count":    len(untimed),
         }

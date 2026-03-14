@@ -36,7 +36,6 @@ from services.context_service import context_service
 from services.project_service import ProjectService
 from services.subtask_service import SubtaskService
 from services.recurrence_service import RecurrenceService, Recurrence
-from services.list_service import ListService
 
 
 # ================== Lifespan ==================
@@ -129,16 +128,6 @@ message_processor  = MessageProcessor(cerebras_client, reminder_service=reminder
 project_service    = ProjectService(cerebras_client)
 subtask_service    = SubtaskService(cerebras_client)
 recurrence_service = RecurrenceService(cerebras_client)
-list_service = ListService(cerebras_client)
-
-
-
-
-LIST_SEARCH_KEYWORDS = {
-    "shopping list", "grocery list", "bag list", "packing list",
-    "travel list", "reading list", "watch list",
-    "shopping", "grocery",
-}
 
 
 # ================== Pydantic Models ==================
@@ -336,10 +325,8 @@ async def handle_telegram_webhook(
         raise HTTPException(status_code=400, detail="Telegram not configured")
 
     webhook_data = await request.json()
-    print(f"[webhook] Keys received: {list(webhook_data.keys())}")
 
     if "callback_query" in webhook_data:
-        print(f"[webhook] Callback: {webhook_data['callback_query'].get('data')}")
         await _handle_callback_query(webhook_data["callback_query"], db)
         return {"ok": True}
 
@@ -355,103 +342,81 @@ async def _handle_callback_query(callback: Dict, db: AsyncSession):
     callback_data = callback.get("data", "")
     tg_message_id = callback["message"]["message_id"]
 
-    try:
-        # ── done:<id> ─────────────────────────────────────────────────
-        if callback_data.startswith("done:"):
-            msg_db_id = int(callback_data.split(":")[1])
-            async with async_session_maker() as session:
-                from sqlalchemy import select, update
-                msg = await session.scalar(select(Message).where(Message.id == msg_db_id))
-                if msg:
-                    tags = dict(msg.tags or {})
-                    tags["done"]    = True
-                    tags["done_at"] = datetime.utcnow().isoformat()
-                    await session.execute(
-                        update(Message).where(Message.id == msg_db_id).values(tags=tags)
-                    )
-                    await session.commit()
-            await _answer_callback(callback_id, "✓ Done!")
-            await _refresh_checklist_message(chat_id, tg_message_id)
-
-        # ── snooze:<id>:<minutes> ─────────────────────────────────────
-        elif callback_data.startswith("snooze:"):
-            parts   = callback_data.split(":")
-            msg_id  = int(parts[1])
-            minutes = int(parts[2]) if len(parts) > 2 else 1440
-            await nudge_service.snooze_message(msg_id, minutes)
-            await _answer_callback(callback_id, f"⏰ Snoozed for {minutes // 60}h")
-
-        # ── subtask:<message_id>:<index> ──────────────────────────────
-        elif callback_data.startswith("subtask:"):
-            parts  = callback_data.split(":")
-            msg_id = int(parts[1])
-            idx    = int(parts[2])
-            await subtask_service.complete_subtask(msg_id, idx)
-            await _answer_callback(callback_id, "✓ Subtask done!")
-            await _refresh_subtask_message(chat_id, tg_message_id, msg_id)
-
-        # ── pause_rec:<rec_id> ────────────────────────────────────────
-        elif callback_data.startswith("pause_rec:"):
-            rec_id = int(callback_data.split(":")[1])
-            await recurrence_service.pause(rec_id)
-            await _answer_callback(callback_id, "⏸ Recurring task paused")
-
-        # ── set_briefing_time ─────────────────────────────────────────
-        elif callback_data == "set_briefing_time":
-            await _answer_callback(callback_id, "")
-            token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={
-                        "chat_id":    chat_id,
-                        "text":       (
-                            "⏰ *Set your morning briefing time*\n\n"
-                            "Reply with the time in IST, e.g.:\n"
-                            "`briefing: 07:30`\n`briefing: 08:00`"
-                        ),
-                        "parse_mode": "Markdown",
-                    },
+    # ── done:<id> ─────────────────────────────────────────────────
+    if callback_data.startswith("done:"):
+        msg_db_id = int(callback_data.split(":")[1])
+        async with async_session_maker() as session:
+            from sqlalchemy import select, update
+            msg = await session.scalar(select(Message).where(Message.id == msg_db_id))
+            if msg:
+                tags = dict(msg.tags or {})
+                tags["done"]    = True
+                tags["done_at"] = datetime.utcnow().isoformat()
+                await session.execute(
+                    update(Message).where(Message.id == msg_db_id).values(tags=tags)
                 )
+                await session.commit()
+        await _answer_callback(callback_id, "✓ Done!")
+        await _refresh_checklist_message(chat_id, tg_message_id)
 
-        # ── project confirm ───────────────────────────────────────────
-        elif callback_data.startswith("proj_yes:"):
-            parts     = callback_data.split(":", 2)
-            msg_id    = int(parts[1])
-            proj_name = parts[2]
-            await project_service.assign_project(msg_id, proj_name)
-            await _answer_callback(callback_id, f"📁 Added to {proj_name}")
-            await context_service.clear_pending_confirmation(int(chat_id))
+    # ── snooze:<id>:<minutes> ─────────────────────────────────────
+    elif callback_data.startswith("snooze:"):
+        parts     = callback_data.split(":")
+        msg_id    = int(parts[1])
+        minutes   = int(parts[2]) if len(parts) > 2 else 1440
+        await nudge_service.snooze_message(msg_id, minutes)
+        await _answer_callback(callback_id, f"⏰ Snoozed for {minutes // 60}h")
 
-        elif callback_data.startswith("proj_no:"):
-            await _answer_callback(callback_id, "OK, not grouped")
-            await context_service.clear_pending_confirmation(int(chat_id))
+    # ── subtask:<message_id>:<index> ──────────────────────────────
+    elif callback_data.startswith("subtask:"):
+        parts   = callback_data.split(":")
+        msg_id  = int(parts[1])
+        idx     = int(parts[2])
+        await subtask_service.complete_subtask(msg_id, idx)
+        await _answer_callback(callback_id, "✓ Subtask done!")
+        # Refresh subtask view
+        await _refresh_subtask_message(chat_id, tg_message_id, msg_id)
 
-        elif callback_data.startswith("list_done:"):
-            parts = callback_data.split(":")
-            msg_id = int(parts[1])
-            idx    = int(parts[2])
-            await list_service.complete_item(msg_id, idx)
-            await _answer_callback(callback_id, "✓ Done!")
-            await _refresh_list_message(chat_id, tg_message_id, msg_id)
-        
-        elif callback_data.startswith("list_clear:"):
-            msg_id  = int(callback_data.split(":")[1])
-            removed = await list_service.clear_done_items(msg_id)
-            await _answer_callback(callback_id, f"🗑 Cleared {removed} done items")
-            await _refresh_list_message(chat_id, tg_message_id, msg_id)
+    # ── pause_rec:<rec_id> ────────────────────────────────────────
+    elif callback_data.startswith("pause_rec:"):
+        rec_id = int(callback_data.split(":")[1])
+        await recurrence_service.pause(rec_id)
+        await _answer_callback(callback_id, "⏸ Recurring task paused")
 
-        else:
-            await _answer_callback(callback_id, "Unknown action")
+    # ── set_briefing_time ─────────────────────────────────────────
+    elif callback_data == "set_briefing_time":
+        await _answer_callback(callback_id, "")
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id":    chat_id,
+                    "text":       (
+                        "⏰ *Set your morning briefing time*\n\n"
+                        "Reply with the time in IST, e.g.:\n"
+                        "`briefing: 07:30`\n`briefing: 08:00`"
+                    ),
+                    "parse_mode": "Markdown",
+                },
+            )
 
-    except Exception as e:
-        print(f"[callback] ERROR for data='{callback_data}': {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            await _answer_callback(callback_id, "⚠ Error")
-        except Exception:
-            pass
+    # ── project confirm: yes:<msg_id>:<project> ───────────────────
+    elif callback_data.startswith("proj_yes:"):
+        parts      = callback_data.split(":", 2)
+        msg_id     = int(parts[1])
+        proj_name  = parts[2]
+        await project_service.assign_project(msg_id, proj_name)
+        await _answer_callback(callback_id, f"📁 Added to {proj_name}")
+        await context_service.clear_pending_confirmation(int(chat_id))
+
+    elif callback_data.startswith("proj_no:"):
+        await _answer_callback(callback_id, "OK, not grouped")
+        await context_service.clear_pending_confirmation(int(chat_id))
+
+    else:
+        await _answer_callback(callback_id, "Unknown action")
+
 
 async def _answer_callback(callback_id: str, text: str = ""):
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -522,27 +487,6 @@ async def _refresh_subtask_message(chat_id: str, tg_message_id: int, message_id:
         )
 
 
-async def _refresh_list_message(chat_id: str, tg_message_id: int, message_id: int):
-    """Re-render a list message in place after item completion."""
-    async with async_session_maker() as session:
-        from sqlalchemy import select as sel
-        msg = await session.scalar(sel(Message).where(Message.id == message_id))
-        if not msg:
-            return
-
-    text_, reply_markup = list_service.format_for_telegram(msg)
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        await client.post(
-            f"https://api.telegram.org/bot{token}/editMessageText",
-            json={
-                "chat_id":      chat_id,
-                "message_id":   tg_message_id,
-                "text":         text_,
-                "parse_mode":   "Markdown",
-                "reply_markup": reply_markup,
-            },
-        )
 # ================== Checklist Helpers ==================
 
 def format_todo_checklist(results: List[Dict]) -> tuple[str, dict]:
@@ -575,147 +519,27 @@ def format_todo_checklist(results: List[Dict]) -> tuple[str, dict]:
     return text, {"inline_keyboard": buttons}
 
 
-async def send_todo_checklist(chat_id: str, results: list, date_from: str = None, date_to: str = None):
-    """
-    Send todo results as an interactive checklist.
-    Timed todos first, untimed after a divider.
-    Zero LLM — pure render from DB results.
-    """
-    from datetime import datetime as dt
+async def send_todo_checklist(chat_id: str, results: List[Dict]):
     token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
     results = [r for r in results if not r.get("tags", {}).get("done", False)]
-
-    if not results:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id":    chat_id,
-                    "text":       "📋 *Your To-Do List*\n\n_Nothing here yet!_",
-                    "parse_mode": "Markdown",
-                },
-            )
-        return
-
-    # Build header
-    today = dt.utcnow().strftime("%Y-%m-%d")
-    if date_from == date_to == today or (not date_from):
-        date_label = "today"
-    elif date_from:
-        try:
-            date_label = dt.fromisoformat(date_from).strftime("%a, %d %b")
-        except Exception:
-            date_label = date_from
-    else:
-        date_label = ""
-
-    text_   = f"📋 *Your To-Do List*"
-    if date_label:
-        text_ += f"  ·  _{date_label}_"
-    text_ += f"\n_{len(results)} pending_\n\n"
-
-    buttons = []
-    timed   = [r for r in results if r.get("event_time")]
-    untimed = [r for r in results if not r.get("event_time")]
-
-    # Timed items
-    if timed:
-        for item in timed:
-            t      = item["event_time"]
-            prio   = item.get("priority", "normal")
-            prefix = "🔴" if prio in ("high", "urgent") else ""
-            has_subs = bool(item.get("tags", {}).get("subtasks"))
-            sub_icon = " 📎" if has_subs else ""
-            buttons.append([{
-                "text":          f"☐  {t}  {prefix}{item['content'][:35]}{sub_icon}",
-                "callback_data": f"done:{item['id']}",
-            }])
-
-    # Divider in text if both timed and untimed exist
-    if timed and untimed:
-        text_ += "─────────────────\n"
-
-    # Untimed items
-    for item in untimed:
-        prio     = item.get("priority", "normal")
-        prefix   = "🔴 " if prio in ("high", "urgent") else ""
-        has_subs = bool(item.get("tags", {}).get("subtasks"))
-        sub_icon = " 📎" if has_subs else ""
-        buttons.append([{
-            "text":          f"☐  {prefix}{item['content'][:40]}{sub_icon}",
-            "callback_data": f"done:{item['id']}",
-        }])
-
+    text, reply_markup = format_todo_checklist(results)
     async with httpx.AsyncClient(timeout=10.0) as client:
         await client.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={
                 "chat_id":      chat_id,
-                "text":         text_,
-                "parse_mode":   "Markdown",
-                "reply_markup": {"inline_keyboard": buttons},
-            },
-        )
-
-
-async def send_list_display(chat_id: str, search_result: dict):
-    """Send a named list (shopping/bag/packing) as interactive checklist."""
-    from sqlalchemy import select as sel
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-
-    results = search_result.get("results", [])
-    if not results:
-        list_name = search_result.get("list_name", "Shopping List")  # use actual name
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id":    chat_id,
-                    "text":       (
-                        f"📋 *{list_name}*\n\n"
-                        f"_Nothing here yet!_\n\n"
-                        f"Start by sending:\n"
-                        f"`{list_name.lower()}:`\n`- item1`\n`- item2`"
-                    ),
-                    "parse_mode": "Markdown",
-                },
-            )
-        return
-
-    # Get the raw message for formatting
-    list_message = results[0].get("list_message")
-    if not list_message:
-        # Fetch from DB
-        async with async_session_maker() as session:
-            list_message = await session.scalar(
-                sel(Message).where(Message.id == results[0]["id"])
-            )
-
-    if not list_message:
-        return
-
-    text_, reply_markup = list_service.format_for_telegram(list_message)
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        await client.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={
-                "chat_id":      chat_id,
-                "text":         text_,
+                "text":         text,
                 "parse_mode":   "Markdown",
                 "reply_markup": reply_markup,
             },
         )
+
+
 # ================== Message Processing ==================
 
 TODO_SEARCH_KEYWORDS = {
     "todo", "to-do", "to do", "task", "tasks",
     "pending", "checklist", "check list",
-}
-
-LIST_SEARCH_KEYWORDS = {
-    "shopping list", "grocery list", "bag list", "packing list",
-    "travel list", "reading list", "watch list",
-    "shopping", "grocery",
 }
 
 
@@ -876,31 +700,34 @@ async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
             try:
                 # ── SEARCH (search: prefix OR ends with ?) ─────────
                 if _is_search_query(content):
-                    query    = _extract_query(content)
-                    prev_ctx = await context_service.get_search_context(user.id)
+                    query         = _extract_query(content)
+                    prev_ctx      = await context_service.get_search_context(user.id)
 
-                    # Follow-up: ends with ? and no explicit search: prefix → prepend previous context
+                    # If this is a follow-up, prepend previous context
                     if prev_ctx and not content.lower().startswith(("search:", "find:", "get:")):
+                        # Ends with ? and there's a previous search — it's a follow-up
                         query = f"{prev_ctx['query']} {query}"
 
                     search_result = await search_service.search(
                         user_phone=user_phone, query=query, db=db
                     )
-                    results = search_result.get("results", [])
+                    results       = search_result.get("results", [])
 
                     # Store context for follow-up
-                    await context_service.set_search_context(user.id, query, "")
+                    natural = search_result.get("natural_response", "")
+                    await context_service.set_search_context(user.id, query, natural[:300])
 
-                    # Named list query → list checklist display
+                    # Named list query → list checklist display (zero LLM render)
                     if search_result.get("is_list") and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
                         await send_list_display(chat_id, search_result)
                         continue
 
                     # Todo query → todo checklist display
-                    is_todo_q = any(kw in query.lower() for kw in TODO_SEARCH_KEYWORDS)
-                    if is_todo_q and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
-                        date_from = search_result.get("date_from")  # populated by direct fetch
-                        await send_todo_checklist(chat_id, results, date_from, date_from)
+                    is_todo_query = any(kw in query.lower() for kw in TODO_SEARCH_KEYWORDS)
+                    if is_todo_query and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                        date_from = search_result.get("date_from")
+                        date_to   = search_result.get("date_to")
+                        await send_todo_checklist(chat_id, results, date_from, date_to)
                         continue
 
                     response = format_search_results(search_result)
@@ -961,7 +788,7 @@ async def _build_status(user: User, db: AsyncSession) -> str:
     from datetime import date, timedelta
 
     today      = datetime.utcnow().strftime("%Y-%m-%d")
-    week_start = datetime.utcnow() - timedelta(days=7)
+    week_start = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
 
     # Pending todos today
     pending_res = await db.execute(
@@ -977,15 +804,14 @@ async def _build_status(user: User, db: AsyncSession) -> str:
     pending = pending_res.scalar() or 0
 
     # Done today
-    today_dt = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     done_res = await db.execute(
         select(func.count(Message.id))
         .where(
             Message.user_id == user.id,
             text("(messages.tags->>'done')::boolean IS TRUE"),
-            text("(messages.tags->>'done_at')::timestamp >= :today"),
+            text("messages.tags->>'done_at' >= :today"),
         )
-        .params(today=today_dt)
+        .params(today=f"{today}T00:00:00")
     )
     done_today = done_res.scalar() or 0
 
@@ -1241,19 +1067,8 @@ async def _handle_confirmation_yes(
 
 # ================== Helpers ==================
 
-def _build_save_response(result: dict) -> str:
+def _build_save_response(result: Dict) -> str:
     from zoneinfo import ZoneInfo
-
-    # List save
-    if result.get("category") == "List":
-        list_name   = result.get("list_name", "List")
-        items_added = result.get("items_added", 0)
-        total       = result.get("total_items", 0)
-        return (
-            f"✓ *{list_name}* updated!\n\n"
-            f"➕ {items_added} item(s) added · {total} total\n\n"
-            f"_Say '{list_name.lower()}?' to view_"
-        )
 
     category    = result.get("category", "Notes")
     all_buckets = result.get("all_buckets", [category])
@@ -1261,120 +1076,33 @@ def _build_save_response(result: dict) -> str:
     due_date    = result.get("due_date")
     essence     = result.get("essence") or result.get("summary", "")
     split_count = result.get("split_count", 0)
-    priority    = result.get("priority", "normal")
-
-    priority_note = ""
-    if priority == "urgent":
-        priority_note = "\n⚡ Marked urgent — I'll keep reminding you"
-    elif priority == "high":
-        priority_note = "\n🔴 High priority"
 
     if remind_at:
-        remind_dt = (
-            __import__("datetime").datetime.fromisoformat(remind_at)
-            .replace(tzinfo=ZoneInfo("UTC"))
-            .astimezone(ZoneInfo("Asia/Kolkata"))
-        )
+        remind_dt = datetime.fromisoformat(remind_at).replace(
+            tzinfo=ZoneInfo("UTC")
+        ).astimezone(ZoneInfo("Asia/Kolkata"))
         time_str = remind_dt.strftime("%I:%M %p, %d %b")
-        return f"✓ Saved & reminder set!\n\n⏰ {time_str} IST\n📝 {essence}{priority_note}"
+        return f"✓ Saved & reminder set!\n\n⏰ {time_str} IST\n📝 {essence}"
 
     if split_count > 1:
-        return f"✓ Saved {split_count} tasks!\n\n📝 {essence}{priority_note}"
+        return f"✓ Saved {split_count} tasks!\n\n📝 {essence}"
 
     if "To-Do" in all_buckets and due_date:
-        return f"✓ Added to To-Do!\n\n📝 {essence}\n📅 {due_date}{priority_note}"
+        return f"✓ Added to To-Do!\n\n📝 {essence}\n📅 {due_date}"
 
     return f"✓ Saved to '{category}'!\n\n📝 {essence}"
 
 
-def format_search_results(search_data, today_date=None) -> str:
-    """
-    Format search results with smart timestamp logic.
-    Shows timestamps only when results span multiple dates.
-    Never hallucinates — uses only what's in the results.
-    """
-    from datetime import datetime as dt, date as dt_date
-
+def format_search_results(search_data) -> str:
     if isinstance(search_data, list):
         return "No results found." if not search_data else f"Found {len(search_data)} result(s)."
-
     natural = search_data.get("natural_response", "")
     results = search_data.get("results", [])
-
     if not results:
         return "I couldn't find anything related to that in your notes."
-
-    # For direct todo fetches, format ourselves without LLM
-    if search_data.get("is_direct_todo"):
-        return _format_todo_plain(results)
-
-    # For standard results, check if we have a natural response
     if not natural or natural.strip() in ("{}", ""):
-        return _format_results_plain(results, today_date)
-
+        return "\n".join(f"• {r['content']}" for r in results[:5])
     return natural
-
-
-def _format_todo_plain(results: list) -> str:
-    """Format todos as plain text — timed first, untimed after."""
-    if not results:
-        return "No pending todos found."
-
-    timed   = [r for r in results if r.get("event_time")]
-    untimed = [r for r in results if not r.get("event_time")]
-
-    lines = []
-    if timed:
-        for r in timed:
-            prio   = r.get("priority", "normal")
-            prefix = "🔴 " if prio in ("high", "urgent") else ""
-            lines.append(f"⏰ {r['event_time']}  {prefix}{r['content']}")
-    if timed and untimed:
-        lines.append("─────────")
-    if untimed:
-        for r in untimed:
-            prio   = r.get("priority", "normal")
-            prefix = "🔴 " if prio in ("high", "urgent") else ""
-            lines.append(f"•  {prefix}{r['content']}")
-
-    return "\n".join(lines)
-
-def _date_label(saved_date: str, today_date) -> str:
-    """Human-readable date label for multi-source display."""
-    from datetime import date as dt_date
-    try:
-        d     = dt_date.fromisoformat(saved_date)
-        delta = (today_date - d).days
-        if delta == 0:  return "today"
-        if delta == 1:  return "yesterday"
-        if delta <= 6:  return f"{delta}d ago"
-        return d.strftime("%d %b")
-    except Exception:
-        return saved_date
-
-def _format_results_plain(results: list, today_date=None) -> str:
-    """Format general results with smart timestamp logic."""
-    from datetime import datetime as dt, date as dt_date
-
-    if not today_date:
-        today_date = dt.utcnow().date()
-
-    saved_dates  = {r.get("_saved_date", r["created_at"][:10]) for r in results}
-    multi_source = len(saved_dates) > 1
-
-    lines = []
-    for r in results[:10]:
-        content = r["content"]
-        line    = f"• {content}"
-
-        if multi_source:
-            saved = r.get("_saved_date") or r["created_at"][:10]
-            label = _date_label(saved, today_date)
-            line += f"   ·   {label}"
-
-        lines.append(line)
-
-    return "\n".join(lines)
 
 
 async def handle_category_command(phone: str, content: str, db: AsyncSession) -> str:
