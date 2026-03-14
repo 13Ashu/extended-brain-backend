@@ -519,7 +519,7 @@ def format_todo_checklist(results: List[Dict]) -> tuple[str, dict]:
     return text, {"inline_keyboard": buttons}
 
 
-async def send_todo_checklist(chat_id: str, results: List[Dict]):
+async def send_todo_checklist(chat_id: str, results: List[Dict], date_from: str = None, date_to: str = None):
     token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
     results = [r for r in results if not r.get("tags", {}).get("done", False)]
     text, reply_markup = format_todo_checklist(results)
