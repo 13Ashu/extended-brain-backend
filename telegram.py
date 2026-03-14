@@ -172,29 +172,20 @@ class TelegramClient(MessagingClient):
             response.raise_for_status()
             return response.content
     
+    
     async def setup_webhook(self, webhook_url: str) -> Dict[str, Any]:
-        """
-        Setup webhook for receiving messages
-        
-        Args:
-            webhook_url: Your server's webhook URL
-        
-        Returns:
-            Response from Telegram API
-        """
-        
         url = f"{self.base_url}/setWebhook"
-        
         payload = {
             "url": webhook_url,
-            "allowed_updates": ["message", "edited_message"]
+            "allowed_updates": ["message", "callback_query"],  # ← fix
+            "drop_pending_updates": False,
         }
-        
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload)
             response.raise_for_status()
             return response.json()
-    
+
+
     async def delete_webhook(self) -> Dict[str, Any]:
         """Delete webhook (useful for development)"""
         

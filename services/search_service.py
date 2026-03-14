@@ -244,48 +244,48 @@ class SearchService:
         self, user_id: int, query: str, db: AsyncSession
     ) -> Optional[Dict]:
         """
-        If query is asking for a named list, fetch it directly.
-        Returns search result dict or None if not a list query.
+        If query is asking for a named list, fetch it directly from DB.
+        Zero LLM — pure DB read.
         """
-        from services.list_service import ListService, LIST_TYPE_MAP
+        from services.list_service import ListService
         ls = ListService(self.cerebras)
 
-        if not ls.is_list_query(query):
+        intent = await ls.detect_list_intent(query)
+        if not intent or intent["intent"] != "show":
             return None
 
-        list_type, list_name = ls.extract_list_type_from_query(query)
-        if not list_type:
-            return None
+        list_name = intent["list_name"]
+        list_type = intent["list_type"]
 
-        msg = await ls.get_active_list(user_id, list_type, db)
+        msg = await ls.find_best_matching_list(user_id, list_name, db)
         if not msg:
             return {
                 "results":          [],
-                "natural_response": f"You don't have a {list_name} yet. Start by sending items.",
+                "natural_response": f"You don\'t have a *{list_name}* yet.\n\nStart by sending:\n`{list_name.lower()}:\n- item1\n- item2`",
                 "is_list":          True,
+                "list_name":        list_name,
                 "list_type":        list_type,
             }
 
         tags     = msg.tags if isinstance(msg.tags, dict) else {}
         subtasks = tags.get("subtasks", [])
 
-        # Build results in standard format for compatibility
         results = [{
-            "id":          msg.id,
-            "content":     msg.content,
-            "essence":     tags.get("list_name", msg.content),
-            "category":    "List",
-            "all_buckets": ["List"],
-            "priority":    "normal",
-            "tags":        tags,
-            "created_at":  msg.created_at.isoformat(),
-            "due_date":    None,
-            "event_time":  None,
-            "events":      [],
-            "relevance":   100.0,
-            "preview":     f"{len(subtasks)} items",
-            "is_list":     True,
-            "list_message": msg,  # pass raw message for checklist rendering
+            "id":           msg.id,
+            "content":      msg.content,
+            "essence":      tags.get("list_name", msg.content),
+            "category":     "List",
+            "all_buckets":  ["List"],
+            "priority":     "normal",
+            "tags":         tags,
+            "created_at":   msg.created_at.isoformat(),
+            "due_date":     None,
+            "event_time":   None,
+            "events":       [],
+            "relevance":    100.0,
+            "preview":      f"{len(subtasks)} items",
+            "is_list":      True,
+            "list_message": msg,
         }]
 
         return {
@@ -297,9 +297,6 @@ class SearchService:
             "list_message_id":  msg.id,
         }
 
-    # ──────────────────────────────────────────────────────────────
-    # Direct todo fetch — ordered, no LLM ranking
-    # ──────────────────────────────────────────────────────────────
 
     async def _fetch_todos_direct(
         self,

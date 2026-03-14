@@ -241,8 +241,8 @@ class MessageProcessor:
         ref = datetime.utcnow()
 
         # ── 1. Check for list intent FIRST ────────────────────────
-        list_intent = self.list_service.detect_list_intent(content)
-        if list_intent and list_intent["intent"] in ("create", "add"):
+        list_intent = await self.list_service.detect_list_intent(content)
+        if list_intent and list_intent["intent"] == "create_or_add":
             return await self._handle_list_save(user, list_intent, content, db)
 
         # ── 2. Fast hints ─────────────────────────────────────────
@@ -356,12 +356,12 @@ class MessageProcessor:
         list_name = intent["list_name"]
         items     = intent["items"]
 
-        msg, added = await self.list_service.add_items(
-            user.id, list_type, list_name, items, db
+        msg, added, was_created = await self.list_service.create_or_add(
+            user.id, list_name, list_type, items, db
         )
 
-        tags     = msg.tags if isinstance(msg.tags, dict) else {}
-        total    = len(tags.get("subtasks", []))
+        tags  = msg.tags if isinstance(msg.tags, dict) else {}
+        total = len(tags.get("subtasks", []))
 
         return {
             "message_id":  msg.id,
