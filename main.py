@@ -342,81 +342,89 @@ async def _handle_callback_query(callback: Dict, db: AsyncSession):
     callback_data = callback.get("data", "")
     tg_message_id = callback["message"]["message_id"]
 
-    # ── done:<id> ─────────────────────────────────────────────────
-    if callback_data.startswith("done:"):
-        msg_db_id = int(callback_data.split(":")[1])
-        async with async_session_maker() as session:
-            from sqlalchemy import select, update
-            msg = await session.scalar(select(Message).where(Message.id == msg_db_id))
-            if msg:
-                tags = dict(msg.tags or {})
-                tags["done"]    = True
-                tags["done_at"] = datetime.utcnow().isoformat()
-                await session.execute(
-                    update(Message).where(Message.id == msg_db_id).values(tags=tags)
+    try:
+        # ── done:<id> ─────────────────────────────────────────────────
+        if callback_data.startswith("done:"):
+            msg_db_id = int(callback_data.split(":")[1])
+            async with async_session_maker() as session:
+                from sqlalchemy import select, update
+                msg = await session.scalar(select(Message).where(Message.id == msg_db_id))
+                if msg:
+                    tags = dict(msg.tags or {})
+                    tags["done"]    = True
+                    tags["done_at"] = datetime.utcnow().isoformat()
+                    await session.execute(
+                        update(Message).where(Message.id == msg_db_id).values(tags=tags)
+                    )
+                    await session.commit()
+            await _answer_callback(callback_id, "✓ Done!")
+            await _refresh_checklist_message(chat_id, tg_message_id)
+
+        # ── snooze:<id>:<minutes> ─────────────────────────────────────
+        elif callback_data.startswith("snooze:"):
+            parts   = callback_data.split(":")
+            msg_id  = int(parts[1])
+            minutes = int(parts[2]) if len(parts) > 2 else 1440
+            await nudge_service.snooze_message(msg_id, minutes)
+            await _answer_callback(callback_id, f"⏰ Snoozed for {minutes // 60}h")
+
+        # ── subtask:<message_id>:<index> ──────────────────────────────
+        elif callback_data.startswith("subtask:"):
+            parts  = callback_data.split(":")
+            msg_id = int(parts[1])
+            idx    = int(parts[2])
+            await subtask_service.complete_subtask(msg_id, idx)
+            await _answer_callback(callback_id, "✓ Subtask done!")
+            await _refresh_subtask_message(chat_id, tg_message_id, msg_id)
+
+        # ── pause_rec:<rec_id> ────────────────────────────────────────
+        elif callback_data.startswith("pause_rec:"):
+            rec_id = int(callback_data.split(":")[1])
+            await recurrence_service.pause(rec_id)
+            await _answer_callback(callback_id, "⏸ Recurring task paused")
+
+        # ── set_briefing_time ─────────────────────────────────────────
+        elif callback_data == "set_briefing_time":
+            await _answer_callback(callback_id, "")
+            token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={
+                        "chat_id":    chat_id,
+                        "text":       (
+                            "⏰ *Set your morning briefing time*\n\n"
+                            "Reply with the time in IST, e.g.:\n"
+                            "`briefing: 07:30`\n`briefing: 08:00`"
+                        ),
+                        "parse_mode": "Markdown",
+                    },
                 )
-                await session.commit()
-        await _answer_callback(callback_id, "✓ Done!")
-        await _refresh_checklist_message(chat_id, tg_message_id)
 
-    # ── snooze:<id>:<minutes> ─────────────────────────────────────
-    elif callback_data.startswith("snooze:"):
-        parts     = callback_data.split(":")
-        msg_id    = int(parts[1])
-        minutes   = int(parts[2]) if len(parts) > 2 else 1440
-        await nudge_service.snooze_message(msg_id, minutes)
-        await _answer_callback(callback_id, f"⏰ Snoozed for {minutes // 60}h")
+        # ── project confirm ───────────────────────────────────────────
+        elif callback_data.startswith("proj_yes:"):
+            parts     = callback_data.split(":", 2)
+            msg_id    = int(parts[1])
+            proj_name = parts[2]
+            await project_service.assign_project(msg_id, proj_name)
+            await _answer_callback(callback_id, f"📁 Added to {proj_name}")
+            await context_service.clear_pending_confirmation(int(chat_id))
 
-    # ── subtask:<message_id>:<index> ──────────────────────────────
-    elif callback_data.startswith("subtask:"):
-        parts   = callback_data.split(":")
-        msg_id  = int(parts[1])
-        idx     = int(parts[2])
-        await subtask_service.complete_subtask(msg_id, idx)
-        await _answer_callback(callback_id, "✓ Subtask done!")
-        # Refresh subtask view
-        await _refresh_subtask_message(chat_id, tg_message_id, msg_id)
+        elif callback_data.startswith("proj_no:"):
+            await _answer_callback(callback_id, "OK, not grouped")
+            await context_service.clear_pending_confirmation(int(chat_id))
 
-    # ── pause_rec:<rec_id> ────────────────────────────────────────
-    elif callback_data.startswith("pause_rec:"):
-        rec_id = int(callback_data.split(":")[1])
-        await recurrence_service.pause(rec_id)
-        await _answer_callback(callback_id, "⏸ Recurring task paused")
+        else:
+            await _answer_callback(callback_id, "Unknown action")
 
-    # ── set_briefing_time ─────────────────────────────────────────
-    elif callback_data == "set_briefing_time":
-        await _answer_callback(callback_id, "")
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id":    chat_id,
-                    "text":       (
-                        "⏰ *Set your morning briefing time*\n\n"
-                        "Reply with the time in IST, e.g.:\n"
-                        "`briefing: 07:30`\n`briefing: 08:00`"
-                    ),
-                    "parse_mode": "Markdown",
-                },
-            )
-
-    # ── project confirm: yes:<msg_id>:<project> ───────────────────
-    elif callback_data.startswith("proj_yes:"):
-        parts      = callback_data.split(":", 2)
-        msg_id     = int(parts[1])
-        proj_name  = parts[2]
-        await project_service.assign_project(msg_id, proj_name)
-        await _answer_callback(callback_id, f"📁 Added to {proj_name}")
-        await context_service.clear_pending_confirmation(int(chat_id))
-
-    elif callback_data.startswith("proj_no:"):
-        await _answer_callback(callback_id, "OK, not grouped")
-        await context_service.clear_pending_confirmation(int(chat_id))
-
-    else:
-        await _answer_callback(callback_id, "Unknown action")
-
+    except Exception as e:
+        print(f"[callback] ERROR for data='{callback_data}': {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            await _answer_callback(callback_id, "⚠ Error")
+        except Exception:
+            pass
 
 async def _answer_callback(callback_id: str, text: str = ""):
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
