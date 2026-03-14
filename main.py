@@ -781,7 +781,7 @@ async def _build_status(user: User, db: AsyncSession) -> str:
     from datetime import date, timedelta
 
     today      = datetime.utcnow().strftime("%Y-%m-%d")
-    week_start = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+    week_start = datetime.utcnow() - timedelta(days=7)
 
     # Pending todos today
     pending_res = await db.execute(
@@ -802,7 +802,7 @@ async def _build_status(user: User, db: AsyncSession) -> str:
         .where(
             Message.user_id == user.id,
             text("(messages.tags->>'done')::boolean IS TRUE"),
-            text("messages.tags->>'done_at' >= :today"),
+            text("(messages.tags->>'done_at')::timestamp >= :today::timestamp"),
         )
         .params(today=f"{today}T00:00:00")
     )

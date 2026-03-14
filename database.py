@@ -84,6 +84,7 @@ class User(Base):
     
     # Settings
     timezone: Mapped[str] = mapped_column(String(50), default="Asia/Kolkata")
+    briefing_time: Mapped[Optional[str]] = mapped_column(String(5), default="08:00", nullable=True)  # ← ADD THIS
     is_active: Mapped[bool] = mapped_column(default=True)
     is_verified: Mapped[bool] = mapped_column(default=False)
     
