@@ -250,6 +250,40 @@ class SearchService:
         from services.list_service import ListService
         ls = ListService(self.cerebras)
 
+        # Handles "dmart?" even without "list" keyword
+        q_clean = query.lower().strip().rstrip("?").strip()
+        if q_clean:
+            async with async_session_maker() as session:  # use fresh session
+                candidate = await ls.find_best_matching_list(user_id, q_clean, db)
+                if candidate:
+                    # Confirmed list match — render it directly
+                    tags     = candidate.tags if isinstance(candidate.tags, dict) else {}
+                    subtasks = tags.get("subtasks", [])
+                    list_name = tags.get("list_name", candidate.content)
+                    return {
+                        "results": [{
+                            "id":           candidate.id,
+                            "content":      candidate.content,
+                            "essence":      list_name,
+                            "category":     "List",
+                            "all_buckets":  ["List"],
+                            "priority":     "normal",
+                            "tags":         tags,
+                            "created_at":   candidate.created_at.isoformat(),
+                            "due_date":     None,
+                            "event_time":   None,
+                            "events":       [],
+                            "relevance":    100.0,
+                            "preview":      f"{len(subtasks)} items",
+                            "is_list":      True,
+                            "list_message": candidate,
+                        }],
+                        "natural_response": "",
+                        "is_list":          True,
+                        "list_name":        list_name,
+                        "list_message_id":  candidate.id,
+                    }
+
         intent = await ls.detect_list_intent(query)
         if not intent or intent["intent"] != "show":
             return None
