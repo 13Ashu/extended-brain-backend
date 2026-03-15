@@ -21,24 +21,44 @@ DATABASE_URL = os.getenv(
 )
 
 # Clean up the URL - remove sslmode and convert to asyncpg
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set")
+
+# Normalize URL for asyncpg
 if DATABASE_URL:
-    # Remove sslmode parameter (asyncpg doesn't support it)
-    if "?sslmode=" in DATABASE_URL:
-        DATABASE_URL = DATABASE_URL.split("?sslmode=")[0]
+    # Strip any query params (ssl handled via connect_args instead)
+    if "?" in DATABASE_URL:
+        DATABASE_URL = DATABASE_URL.split("?")[0]
     
-    # Ensure we're using asyncpg driver
+    # Ensure asyncpg driver prefix
     if DATABASE_URL.startswith("postgresql://"):
         DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif DATABASE_URL.startswith("postgres://"):   # Neon sometimes emits this form
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 
 # Create async engine
+import ssl as _ssl
+
+# Build an SSL context asyncpg actually understands
+_ssl_ctx = _ssl.create_default_context()
+_ssl_ctx.check_hostname = False          # Neon's hostname is fine, but this avoids cert issues
+_ssl_ctx.verify_mode   = _ssl.CERT_NONE # Neon uses self-signed intermediates on some regions
+
 engine = create_async_engine(
     DATABASE_URL,
-    echo=False,  # Set to True for debugging SQL queries
+    echo=False,
     future=True,
-    pool_pre_ping=True,  # Verify connections before using them
+    pool_pre_ping=True,
+    pool_size=5,          # Neon free tier has a connection limit — don't go above 10
+    max_overflow=2,
     connect_args={
-        "ssl": "require"  # Use SSL for Neon
-    }
+        "ssl":     _ssl_ctx,
+        "timeout": 30,    # asyncpg connection timeout in seconds
+        "server_settings": {
+            "application_name": "extended_brain",
+        },
+    },
 )
 
 # Create session maker
