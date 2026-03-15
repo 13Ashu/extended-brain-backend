@@ -529,107 +529,259 @@ async def _refresh_list_message(chat_id: str, tg_message_id: int, message_id: in
 
 # ================== Checklist Helpers ==================
 
+# def format_todo_checklist(
+#     results: List[Dict],
+#     date_from: Optional[str] = None,
+#     date_to: Optional[str] = None,
+# ) -> tuple[str, dict]:
+#     today     = date.today()
+#     yesterday = today - timedelta(days=1)
+
+#     if date_from and date_to:
+#         if date_from == date_to:
+#             d = datetime.fromisoformat(date_from).date()
+#             if d == today:        label = "today"
+#             elif d == yesterday:  label = "yesterday"
+#             else:                 label = d.strftime("%a, %d %b")
+#         else:
+#             label = f"{date_from} → {date_to}"
+#     else:
+#         label = "today"
+
+#     text    = f"📋 *To-Do — {label}*\n\n"
+#     buttons = []
+
+#     if not results:
+#         text += "_Nothing here yet!_"
+#         return text, {"inline_keyboard": buttons}
+
+#     # Separate overdue from current
+#     current = [r for r in results if not r.get("is_overdue")]
+#     overdue = [r for r in results if r.get("is_overdue")]
+
+#     # ── Group current items by split_from ────────────────────────
+#     # Items with same split_from = came from same batch message
+#     # Items with no split_from = standalone tasks
+#     groups: Dict[str, List[Dict]] = {}   # split_from → [items]
+#     standalone: List[Dict] = []
+
+#     for item in current:
+#         split_from = item.get("split_from", "").strip()
+#         if split_from:
+#             if split_from not in groups:
+#                 groups[split_from] = []
+#             groups[split_from].append(item)
+#         else:
+#             standalone.append(item)
+
+#     # Groups with only 1 item — treat as standalone (no point grouping)
+#     for split_from, items in list(groups.items()):
+#         if len(items) == 1:
+#             standalone.append(items[0])
+#             del groups[split_from]
+
+#     # ── Render grouped items ──────────────────────────────────────
+#     for split_from, items in groups.items():
+#         # Derive group title from split_from — first line, cleaned
+#         raw_title  = split_from.split("\n")[0].strip().rstrip(":")
+#         # Strip bullet markers if present
+#         raw_title  = re.sub(r"^[-*•]\s*", "", raw_title)
+#         group_title = raw_title[:40] if raw_title else "Tasks"
+#         done_count  = sum(1 for i in items if i.get("tags", {}).get("done"))
+#         total_count = len(items)
+#         all_done    = done_count == total_count
+
+#         if all_done:
+#             # Strike through the whole group header
+#             text += f"~✓ {group_title} ({total_count})~\n"
+#         else:
+#             # Group header button — shows title + count, marks ALL done on tap
+#             # Use first item's id as representative (or handle noop)
+#             buttons.append([{
+#                 "text": f"📋 {group_title}  {done_count}/{total_count}",
+#                 "callback_data": f"noop",
+#             }])
+#             # Sub-items — indented visually with a leader character
+#             for item in items:
+#                 tags     = item.get("tags", {})
+#                 is_done  = tags.get("done", False)
+#                 due_time = item.get("event_time") or tags.get("event_time", "")
+#                 time_str = f" _{due_time}_" if due_time else ""
+#                 label    = (
+#                     item.get("essence")
+#                     or item.get("content", "").split("\n")[0]
+#                 ).strip()[:38]
+
+#                 if not is_done:
+#                     buttons.append([{
+#                         "text": f"-- {label}{time_str}",
+#                         "callback_data": f"done:{item['id']}",
+#                     }])
+#                 else:
+#                     # Done sub-items shown in text, not as buttons
+#                     text += f"  ~✓ {label}~\n"
+
+#     # ── Render standalone items ───────────────────────────────────
+#     for item in standalone:
+#         tags     = item.get("tags", {})
+#         is_done  = tags.get("done", False)
+#         due_time = item.get("event_time") or tags.get("event_time", "")
+#         time_str = f" _{due_time}_" if due_time else ""
+#         has_subs = bool(tags.get("subtasks"))
+#         sub_icon = " 📎" if has_subs else ""
+#         label    = (
+#             item.get("essence")
+#             or item.get("content", "").split("\n")[0]
+#         ).strip()[:42]
+
+#         if is_done:
+#             text += f"~✓ {label}{time_str}~\n"
+#         else:
+#             buttons.append([{
+#                 "text":          f"☐ {label}{time_str}{sub_icon}",
+#                 "callback_data": f"done:{item['id']}",
+#             }])
+
+#     # ── Render overdue section ────────────────────────────────────
+#     if overdue:
+#         buttons.append([{
+#             "text":          "⚠ Overdue",
+#             "callback_data": "noop",
+#         }])
+#         for item in overdue:
+#             tags  = item.get("tags", {})
+#             due   = item.get("due_date", "")
+#             try:
+#                 due_label = datetime.fromisoformat(due).strftime("%d %b")
+#             except Exception:
+#                 due_label = due
+#             label = (
+#                 item.get("essence")
+#                 or item.get("content", "").split("\n")[0]
+#             ).strip()[:36]
+
+#             if not item.get("tags", {}).get("done"):
+#                 buttons.append([{
+#                     "text":          f"☐ {label} _{due_label}_",
+#                     "callback_data": f"done:{item['id']}",
+#                 }])
+
+#     if results and all(r.get("tags", {}).get("done") for r in results):
+#         text += "_All done! 🎉_"
+
+#     return text, {"inline_keyboard": buttons}
+
+
+from datetime import date, datetime, timedelta
+from typing import List, Dict, Optional
+import re
+
 def format_todo_checklist(
     results: List[Dict],
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
 ) -> tuple[str, dict]:
-    today     = date.today()
+
+    INDENT = "\u00A0\u00A0\u00A0"  # non-breaking spaces for stable indentation
+
+    today = date.today()
     yesterday = today - timedelta(days=1)
 
+    # ── Date label ───────────────────────────────────────────────
     if date_from and date_to:
         if date_from == date_to:
             d = datetime.fromisoformat(date_from).date()
-            if d == today:        label = "today"
-            elif d == yesterday:  label = "yesterday"
-            else:                 label = d.strftime("%a, %d %b")
+            if d == today:
+                label = "today"
+            elif d == yesterday:
+                label = "yesterday"
+            else:
+                label = d.strftime("%a, %d %b")
         else:
             label = f"{date_from} → {date_to}"
     else:
         label = "today"
 
-    text    = f"📋 *To-Do — {label}*\n\n"
+    text = f"📋 *To-Do — {label}*\n\n"
     buttons = []
 
     if not results:
         text += "_Nothing here yet!_"
         return text, {"inline_keyboard": buttons}
 
-    # Separate overdue from current
+    # ── Separate overdue items ───────────────────────────────────
     current = [r for r in results if not r.get("is_overdue")]
     overdue = [r for r in results if r.get("is_overdue")]
 
-    # ── Group current items by split_from ────────────────────────
-    # Items with same split_from = came from same batch message
-    # Items with no split_from = standalone tasks
-    groups: Dict[str, List[Dict]] = {}   # split_from → [items]
+    # ── Group by split_from ──────────────────────────────────────
+    groups: Dict[str, List[Dict]] = {}
     standalone: List[Dict] = []
 
     for item in current:
         split_from = item.get("split_from", "").strip()
         if split_from:
-            if split_from not in groups:
-                groups[split_from] = []
-            groups[split_from].append(item)
+            groups.setdefault(split_from, []).append(item)
         else:
             standalone.append(item)
 
-    # Groups with only 1 item — treat as standalone (no point grouping)
+    # Single-item groups → standalone
     for split_from, items in list(groups.items()):
         if len(items) == 1:
             standalone.append(items[0])
             del groups[split_from]
 
-    # ── Render grouped items ──────────────────────────────────────
+    # ── Render grouped tasks ─────────────────────────────────────
     for split_from, items in groups.items():
-        # Derive group title from split_from — first line, cleaned
-        raw_title  = split_from.split("\n")[0].strip().rstrip(":")
-        # Strip bullet markers if present
-        raw_title  = re.sub(r"^[-*•]\s*", "", raw_title)
-        group_title = raw_title[:40] if raw_title else "Tasks"
-        done_count  = sum(1 for i in items if i.get("tags", {}).get("done"))
-        total_count = len(items)
-        all_done    = done_count == total_count
 
+        raw_title = split_from.split("\n")[0].strip().rstrip(":")
+        raw_title = re.sub(r"^[-*•]\s*", "", raw_title)
+        group_title = raw_title[:40] if raw_title else "Tasks"
+
+        done_count = sum(1 for i in items if i.get("tags", {}).get("done"))
+        total_count = len(items)
+        all_done = done_count == total_count
+
+        # Group header
         if all_done:
-            # Strike through the whole group header
             text += f"~✓ {group_title} ({total_count})~\n"
         else:
-            # Group header button — shows title + count, marks ALL done on tap
-            # Use first item's id as representative (or handle noop)
-            buttons.append([{
-                "text": f"📋 {group_title}  {done_count}/{total_count}",
-                "callback_data": f"noop",
-            }])
-            # Sub-items — indented visually with a leader character
-            for item in items:
-                tags     = item.get("tags", {})
-                is_done  = tags.get("done", False)
-                due_time = item.get("event_time") or tags.get("event_time", "")
-                time_str = f" _{due_time}_" if due_time else ""
-                label    = (
-                    item.get("essence")
-                    or item.get("content", "").split("\n")[0]
-                ).strip()[:38]
+            text += f"🏢 {group_title} ({done_count}/{total_count})\n"
 
-                if not is_done:
-                    buttons.append([{
-                        "text": f"-- {label}{time_str}",
-                        "callback_data": f"done:{item['id']}",
-                    }])
-                else:
-                    # Done sub-items shown in text, not as buttons
-                    text += f"  ~✓ {label}~\n"
+        # Subtasks
+        for item in items:
+            tags = item.get("tags", {})
+            is_done = tags.get("done", False)
 
-    # ── Render standalone items ───────────────────────────────────
+            due_time = item.get("event_time") or tags.get("event_time", "")
+            time_str = f" — {due_time}" if due_time else ""
+
+            label = (
+                item.get("essence")
+                or item.get("content", "").split("\n")[0]
+            ).strip()[:38]
+
+            if is_done:
+                text += f"{INDENT}~✓ {label}{time_str}~\n"
+            else:
+                text += f"{INDENT}• {label}{time_str}\n"
+
+                buttons.append([{
+                    "text": f"✓ {label}",
+                    "callback_data": f"done:{item['id']}",
+                }])
+
+        text += "\n"
+
+    # ── Render standalone tasks ──────────────────────────────────
     for item in standalone:
-        tags     = item.get("tags", {})
-        is_done  = tags.get("done", False)
+
+        tags = item.get("tags", {})
+        is_done = tags.get("done", False)
+
         due_time = item.get("event_time") or tags.get("event_time", "")
-        time_str = f" _{due_time}_" if due_time else ""
-        has_subs = bool(tags.get("subtasks"))
-        sub_icon = " 📎" if has_subs else ""
-        label    = (
+        time_str = f" — {due_time}" if due_time else ""
+
+        label = (
             item.get("essence")
             or item.get("content", "").split("\n")[0]
         ).strip()[:42]
@@ -637,37 +789,41 @@ def format_todo_checklist(
         if is_done:
             text += f"~✓ {label}{time_str}~\n"
         else:
+            text += f"📌 {label}{time_str}\n"
+
             buttons.append([{
-                "text":          f"☐ {label}{time_str}{sub_icon}",
+                "text": f"✓ {label}",
                 "callback_data": f"done:{item['id']}",
             }])
 
-    # ── Render overdue section ────────────────────────────────────
+    # ── Overdue section ──────────────────────────────────────────
     if overdue:
-        buttons.append([{
-            "text":          "⚠ Overdue",
-            "callback_data": "noop",
-        }])
+        text += "\n⚠ *Overdue*\n"
+
         for item in overdue:
-            tags  = item.get("tags", {})
-            due   = item.get("due_date", "")
+
+            due = item.get("due_date", "")
             try:
                 due_label = datetime.fromisoformat(due).strftime("%d %b")
             except Exception:
                 due_label = due
+
             label = (
                 item.get("essence")
                 or item.get("content", "").split("\n")[0]
             ).strip()[:36]
 
             if not item.get("tags", {}).get("done"):
+                text += f"{INDENT}• {label} — {due_label}\n"
+
                 buttons.append([{
-                    "text":          f"☐ {label} _{due_label}_",
+                    "text": f"✓ {label}",
                     "callback_data": f"done:{item['id']}",
                 }])
 
+    # ── All done message ─────────────────────────────────────────
     if results and all(r.get("tags", {}).get("done") for r in results):
-        text += "_All done! 🎉_"
+        text += "\n_All done! 🎉_"
 
     return text, {"inline_keyboard": buttons}
 
