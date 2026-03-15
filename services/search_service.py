@@ -176,13 +176,44 @@ class SearchService:
 
         today = datetime.utcnow().date()
 
-        # ── 1. Named list query — direct DB fetch, zero LLM ──────
+        # ── 1. Use IntentService to classify the query ───────────
+        from services.intent_service import get_intent_service
+        intent_svc     = get_intent_service(self.cerebras)
+        parsed         = await intent_svc.parse(query, user.name, user.timezone or "Asia/Kolkata")
+        query_intent   = parsed.get("intent", "random")
+        query_entities = parsed.get("entities", {})
+
+        print(f"[search] intent={query_intent} for: {query[:60]}")
+
+        # ── 2. Named list query ───────────────────────────────────
+        if query_intent == "query" and query_entities.get("list_name"):
+            list_result = await self._try_list_fetch(
+                user.id, query, db, list_name_hint=query_entities.get("list_name")
+            )
+            if list_result is not None:
+                return list_result
+
+        # Also try list fetch for any query (catches "dmart?")
         list_result = await self._try_list_fetch(user.id, query, db)
         if list_result is not None:
             return list_result
 
-        # ── 2. Todo query — direct ordered fetch, zero LLM ───────
+        # ── 3. Todo query — direct ordered fetch, zero LLM ───────
         date_from, date_to = _resolve_date_range(query, today)
+
+        # Use IntentService date hint if regex didn't find one
+        if not date_from and query_intent == "query":
+            date_hint = query_entities.get("date_hint")
+            if date_hint == "today":
+                date_from = date_to = str(today)
+            elif date_hint == "tomorrow":
+                d = today + timedelta(days=1)
+                date_from = date_to = str(d)
+            elif date_hint == "this_week":
+                monday = today - timedelta(days=today.weekday())
+                date_from = str(monday)
+                date_to   = str(monday + timedelta(days=6))
+
         is_future_q = any(kw in query.lower() for kw in {"upcoming","future","all","everything"})
         is_list_q   = any(kw in query.lower() for kw in TODO_KEYWORDS | {
             "shopping","shop","grocery","buy list","shopping list"
@@ -192,9 +223,12 @@ class SearchService:
             date_from = str(today)
             date_to   = str(today)
 
-        if _is_todo_query(query):
+        if _is_todo_query(query) or query_intent == "query":
+            # Default todo queries to today if no date specified
+            fetch_from = date_from or str(today)
+            fetch_to   = date_to   or str(today)
             todo_result = await self._fetch_todos_direct(
-                user.id, date_from or str(today), date_to or str(today), db, limit
+                user.id, fetch_from, fetch_to, db, limit
             )
             if todo_result["results"]:
                 return todo_result
@@ -241,7 +275,8 @@ class SearchService:
     # ──────────────────────────────────────────────────────────────
 
     async def _try_list_fetch(
-        self, user_id: int, query: str, db: AsyncSession
+        self, user_id: int, query: str, db: AsyncSession,
+        list_name_hint: Optional[str] = None,
     ) -> Optional[Dict]:
         """
         If query is asking for a named list, fetch it directly from DB.
@@ -257,6 +292,27 @@ class SearchService:
         if any(kw in q_lower for kw in TODO_BLOCK):
             return None
 
+
+
+        # Fast path: IntentService already extracted the list name
+        if list_name_hint:
+            msg = await ls.find_best_matching_list(user_id, list_name_hint, db)
+            if msg:
+                tags      = msg.tags if isinstance(msg.tags, dict) else {}
+                subtasks  = tags.get("subtasks", [])
+                list_name = tags.get("list_name", msg.content)
+                return {
+                    "results": [{
+                        "id": msg.id, "content": msg.content, "essence": list_name,
+                        "category": "List", "all_buckets": ["List"], "priority": "normal",
+                        "tags": tags, "created_at": msg.created_at.isoformat(),
+                        "due_date": None, "event_time": None, "events": [],
+                        "relevance": 100.0, "preview": f"{len(subtasks)} items",
+                        "is_list": True, "list_message": msg,
+                    }],
+                    "natural_response": "", "is_list": True,
+                    "list_name": list_name, "list_message_id": msg.id,
+                }
 
         intent = await ls.detect_list_intent(query)
         if not intent or intent["intent"] != "show":

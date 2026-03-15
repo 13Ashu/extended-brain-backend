@@ -519,7 +519,7 @@ def format_todo_checklist(results: List[Dict]) -> tuple[str, dict]:
     return text, {"inline_keyboard": buttons}
 
 
-async def send_todo_checklist(chat_id: str, results: List[Dict], date_from: str = None, date_to: str = None):
+async def send_todo_checklist(chat_id: str, results: List[Dict]):
     token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
     results = [r for r in results if not r.get("tags", {}).get("done", False)]
     text, reply_markup = format_todo_checklist(results)
@@ -753,19 +753,37 @@ async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
                     if subtask_intent:
                         response = await _handle_nl_subtask(user, subtask_intent, content, chat_id, db)
                     else:
-                        result   = await message_processor.process(
+                        result = await message_processor.process(
                             user_phone=user_phone, content=content,
                             message_type=message_type, media_url=media_url, db=db,
                         )
-                        response = _build_save_response(result)
 
-                        # Project detection (async, non-blocking for response)
-                        asyncio.create_task(
-                            _check_project(user, result, content, chat_id, db)
-                        )
-
-                        # Clear search context since user saved something new
-                        await context_service.clear_search_context(user.id)
+                        # IntentService may return a query intent even on save path
+                        if result.get("_is_query"):
+                            qdata  = result.get("query_data", {})
+                            q_text = qdata.get("query_text", content)
+                            search_result = await search_service.search(
+                                user_phone=user_phone, query=q_text, db=db
+                            )
+                            results = search_result.get("results", [])
+                            await context_service.set_search_context(user.id, q_text, "")
+                            if search_result.get("is_list") and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                                await send_list_display(chat_id, search_result)
+                                continue
+                            is_todo_q = any(kw in q_text.lower() for kw in TODO_SEARCH_KEYWORDS)
+                            if is_todo_q and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                                date_from = search_result.get("date_from")
+                                date_to   = search_result.get("date_to")
+                                await send_todo_checklist(chat_id, results, date_from, date_to)
+                                continue
+                            response = format_search_results(search_result)
+                        else:
+                            response = _build_save_response(result)
+                            # Project detection (async, non-blocking)
+                            asyncio.create_task(
+                                _check_project(user, result, content, chat_id, db)
+                            )
+                            await context_service.clear_search_context(user.id)
 
             except Exception as e:
                 print(f"Processing error: {e}")

@@ -179,6 +179,25 @@ class ReminderService:
                 .where(Reminder.id == reminder.id)
                 .values(is_sent=True, sent_at=datetime.utcnow())
             )
+            # Mark the linked todo as done so it disappears from the checklist
+            # Only for non-recurring reminders
+            if reminder.message_id and not (reminder.recurrence):
+                try:
+                    from sqlalchemy import select as sel
+                    msg = await db.scalar(
+                        sel(Message).where(Message.id == reminder.message_id)
+                    )
+                    if msg:
+                        tags = dict(msg.tags or {})
+                        tags["done"]    = True
+                        tags["done_at"] = datetime.utcnow().isoformat()
+                        await db.execute(
+                            update(Message)
+                            .where(Message.id == reminder.message_id)
+                            .values(tags=tags)
+                        )
+                except Exception as e:
+                    print(f"[reminder] Could not mark todo done: {e}")
             await db.commit()
             print(f"[reminder] ✅ Sent #{reminder.id} — {reminder.task}")
         else:

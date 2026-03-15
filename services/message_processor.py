@@ -240,57 +240,408 @@ class MessageProcessor:
 
         ref = datetime.utcnow()
 
-        # ── 1. Check for list intent FIRST ────────────────────────
-        list_intent = await self.list_service.detect_list_intent(content)
-        if list_intent and list_intent["intent"] == "create_or_add":
-            return await self._handle_list_save(user, list_intent, content, db)
+        # ── Single LLM call: multi-action intent parse ────────────
+        from services.intent_service import get_intent_service
+        intent_svc = get_intent_service(self.cerebras)
+        parsed     = await intent_svc.parse(content, user.name, user.timezone or "Asia/Kolkata")
 
-        # ── 2. Fast hints ─────────────────────────────────────────
+        actions = parsed.get("actions", {})
+        print(f"[processor] actions={[k for k,v in actions.items() if v]} for: {content[:60]}")
+
+        # ── Named list — highest priority, self-contained ─────────
+        if actions.get("save_as_list") and parsed.get("list"):
+            lst = parsed["list"]
+            return await self._handle_list_save_direct(
+                user, lst["list_name"], lst["list_type"], lst["items"], db
+            )
+
+        # ── Query — user wants to retrieve something ──────────────
+        if actions.get("is_query"):
+            # Return a special marker — process_webhook_message will route to search
+            return {"_is_query": True, "query_data": parsed.get("query", {})}
+
+        # ── Tasks (todo + optional event + optional reminder) ─────
+        if actions.get("save_as_todo") and parsed.get("tasks"):
+            tasks = parsed["tasks"]
+            if len(tasks) > 1:
+                return await self._process_tasks(
+                    user=user, tasks=tasks, parsed=parsed,
+                    original_content=content, db=db
+                )
+            elif len(tasks) == 1:
+                return await self._process_single_task(
+                    user=user, task=tasks[0], parsed=parsed,
+                    content=content, message_type=message_type,
+                    media_url=media_url, db=db, ref=ref
+                )
+
+        # ── Track ─────────────────────────────────────────────────
+        if actions.get("save_as_track") and parsed.get("track"):
+            return await self._process_track(
+                user=user, track=parsed["track"], content=content,
+                message_type=message_type, media_url=media_url, db=db, ref=ref
+            )
+
+        # ── Note ──────────────────────────────────────────────────
+        if actions.get("save_as_note"):
+            note_data = parsed.get("note") or {"content": content, "keywords": []}
+            return await self._save_single(
+                user=user, content=content, bucket="Remember",
+                keywords=note_data.get("keywords", []),
+                message_type=message_type, media_url=media_url, db=db, ref=ref
+            )
+
+        # ── Idea ──────────────────────────────────────────────────
+        if actions.get("save_as_idea"):
+            idea_data = parsed.get("idea") or {"content": content, "keywords": []}
+            return await self._save_single(
+                user=user, content=content, bucket="Ideas",
+                keywords=idea_data.get("keywords", []),
+                message_type=message_type, media_url=media_url, db=db, ref=ref
+            )
+
+        # ── Fallback ──────────────────────────────────────────────
+        return await self._process_fallback(
+            user=user, content=content, message_type=message_type,
+            media_url=media_url, db=db, ref=ref
+        )
+
+
+    # ──────────────────────────────────────────────────────────────
+    # Handlers — consume multi-action parsed output
+    # ──────────────────────────────────────────────────────────────
+
+    async def _handle_list_save_direct(
+        self, user, list_name: str, list_type: str, items: List[str], db: AsyncSession
+    ) -> Dict:
+        msg, added, was_created = await self.list_service.create_or_add(
+            user.id, list_name, list_type, items, db
+        )
+        tags  = msg.tags if isinstance(msg.tags, dict) else {}
+        total = len(tags.get("subtasks", []))
+        return {
+            "message_id":  msg.id,
+            "category":    "List",
+            "all_buckets": ["List"],
+            "list_type":   list_type,
+            "list_name":   list_name,
+            "items_added": added,
+            "total_items": total,
+            "tags":        [],
+            "essence":     f"{list_name} — {added} item(s) added ({total} total)",
+            "connections": [],
+            "due_date":    None,
+            "events":      [],
+            "priority":    "normal",
+        }
+
+    async def _process_tasks(
+        self, user, tasks: List[Dict], parsed: Dict,
+        original_content: str, db: AsyncSession
+    ) -> Dict:
+        """
+        Save multiple tasks. Each task is its own Message row.
+        Each task with a time gets its own reminder.
+        """
+        category = await self._get_or_create_category(
+            user_id=user.id, name="To-Do",
+            auto_description=INTENT_BUCKETS["To-Do"], db=db,
+        )
+
+        saved_ids   = []
+        saved_items = []
+        ref         = datetime.utcnow()
+        people      = parsed.get("people", [])
+
+        for task_data in tasks:
+            task     = str(task_data.get("task", "")).strip()
+            due_date = task_data.get("due_date") or _today_str()
+            evt_time = task_data.get("time")
+            priority = task_data.get("priority", "normal")
+
+            if not task:
+                continue
+            if not _DATE_RE.match(str(due_date)):
+                due_date = _today_str()
+
+            buckets = ["To-Do"]
+            if evt_time:
+                buckets.append("Events")
+
+            msg = Message(
+                user_id=user.id,
+                category_id=category.id,
+                content=task,
+                message_type=MessageType("text"),
+                summary=task[:100],
+                tags={
+                    "keywords":       [task],
+                    "entities":       {"people": people},
+                    "actionables":    [task],
+                    "sentiment":      "neutral",
+                    "priority":       priority,
+                    "time_reference": "today" if due_date == _today_str() else "future",
+                    "event_time":     evt_time,
+                    "all_buckets":    buckets,
+                    "primary_bucket": "To-Do",
+                    "due_date":       due_date,
+                    "events": (
+                        [{"date": due_date, "time": evt_time, "label": task[:40]}]
+                        if evt_time else []
+                    ),
+                    "split_from": original_content[:200],
+                },
+                created_at=ref,
+            )
+            db.add(msg)
+            await db.flush()
+
+            saved_ids.append(msg.id)
+            saved_items.append({
+                "id": msg.id, "task": task,
+                "evt_time": evt_time, "due_date": due_date,
+                "priority": priority,
+            })
+
+        await db.commit()
+
+        # Embeddings + per-task reminders
+        reminder_count = 0
+        for saved in saved_items:
+            await self._save_embedding(saved["id"], saved["task"], {}, db)
+            # Each task with a time gets its OWN reminder
+            if self.reminder_service and saved["evt_time"]:
+                try:
+                    await self.reminder_service.create(
+                        user=user,
+                        content=saved["task"],
+                        analysis={
+                            "event_time": saved["evt_time"],
+                            "due_date":   saved["due_date"],
+                            "priority":   saved["priority"],
+                            "actionables": [saved["task"]],
+                            "essence":    saved["task"],
+                        },
+                        message_id=saved["id"],
+                        db=db,
+                    )
+                    reminder_count += 1
+                except Exception as e:
+                    print(f"⚠ Reminder failed for '{saved['task']}': {e}")
+
+        reminder_note = f" · {reminder_count} reminder(s) set" if reminder_count else ""
+
+        return {
+            "message_id":  saved_ids[0] if saved_ids else None,
+            "split_count": len(saved_ids),
+            "message_ids": saved_ids,
+            "category":    "To-Do",
+            "all_buckets": ["To-Do"],
+            "tags":        [],
+            "essence":     f"Saved {len(saved_ids)} tasks{reminder_note}: "
+                          + ", ".join(s["task"] for s in saved_items[:3]),
+            "connections": [],
+            "due_date":    saved_items[0]["due_date"] if saved_items else None,
+            "events":      [],
+            "priority":    parsed.get("priority", "normal"),
+        }
+
+    async def _process_single_task(
+        self, user, task: Dict, parsed: Dict, content: str,
+        message_type: str, media_url: Optional[str], db: AsyncSession, ref: datetime
+    ) -> Dict:
+        """Save a single task, optionally with reminder and event."""
+        task_text = str(task.get("task", content)).strip() or content
+        due_date  = task.get("due_date") or _today_str()
+        evt_time  = task.get("time")
+        priority  = task.get("priority", "normal")
+        people    = parsed.get("people", [])
+        actions   = parsed.get("actions", {})
+
+        if not _DATE_RE.match(str(due_date)):
+            due_date = _today_str()
+
+        buckets = ["To-Do"]
+        if actions.get("save_as_event") or evt_time:
+            buckets.append("Events")
+
+        category = await self._get_or_create_category(
+            user_id=user.id, name="To-Do",
+            auto_description=INTENT_BUCKETS["To-Do"], db=db,
+        )
+
+        tags = {
+            "keywords":       [task_text],
+            "entities":       {"people": people},
+            "actionables":    [task_text],
+            "sentiment":      "neutral",
+            "priority":       priority,
+            "time_reference": "today" if due_date == _today_str() else "future",
+            "event_time":     evt_time,
+            "all_buckets":    buckets,
+            "primary_bucket": "To-Do",
+            "due_date":       due_date,
+            "events": (
+                [{"date": due_date, "time": evt_time, "label": task_text[:40]}]
+                if evt_time else []
+            ),
+        }
+
+        msg = Message(
+            user_id=user.id,
+            category_id=category.id,
+            content=task_text,
+            message_type=MessageType(message_type),
+            media_url=media_url,
+            summary=task_text[:100],
+            tags=tags,
+            created_at=ref,
+        )
+        db.add(msg)
+        await db.commit()
+        await db.refresh(msg)
+
+        result = {
+            "message_id":  msg.id,
+            "category":    "To-Do",
+            "all_buckets": buckets,
+            "tags":        [],
+            "essence":     parsed.get("essence") or task_text,
+            "connections": [],
+            "due_date":    due_date,
+            "events":      tags["events"],
+            "priority":    priority,
+        }
+
+        # Reminder — only if set_reminder=true AND time is present
+        if self.reminder_service and actions.get("set_reminder") and evt_time:
+            try:
+                rem_data = parsed.get("reminder") or {}
+                reminder = await self.reminder_service.create(
+                    user=user,
+                    content=task_text,
+                    analysis={
+                        "event_time":  evt_time,
+                        "due_date":    due_date,
+                        "priority":    priority,
+                        "actionables": [task_text],
+                        "essence":     task_text,
+                    },
+                    message_id=msg.id,
+                    db=db,
+                )
+                if reminder:
+                    result["reminder_id"] = reminder.id
+                    result["remind_at"]   = reminder.remind_at.isoformat()
+            except Exception as e:
+                print(f"⚠ Reminder failed: {e}")
+
+        await self._save_embedding(msg.id, task_text, {}, db)
+        return result
+
+    async def _process_track(
+        self, user, track: Dict, content: str, message_type: str,
+        media_url: Optional[str], db: AsyncSession, ref: datetime
+    ) -> Dict:
+        logs    = track.get("logs", [])
+        summary = ", ".join(
+            f"{l.get('metric')} {l.get('value')}{l.get('unit','')}" for l in logs
+        ) or content[:80]
+
+        category = await self._get_or_create_category(
+            user_id=user.id, name="Track",
+            auto_description=INTENT_BUCKETS["Track"], db=db,
+        )
+
+        tags = {
+            "all_buckets":    ["Track"],
+            "primary_bucket": "Track",
+            "logs":           logs,
+            "priority":       "normal",
+            "due_date":       ref.strftime("%Y-%m-%d"),
+        }
+
+        msg = Message(
+            user_id=user.id, category_id=category.id,
+            content=content, message_type=MessageType(message_type),
+            media_url=media_url, summary=summary, tags=tags, created_at=ref,
+        )
+        db.add(msg)
+        await db.commit()
+        await db.refresh(msg)
+        await self._save_embedding(msg.id, content, {}, db)
+
+        return {
+            "message_id": msg.id, "category": "Track",
+            "all_buckets": ["Track"], "tags": [],
+            "essence": summary, "connections": [],
+            "due_date": None, "events": [], "priority": "normal",
+        }
+
+    async def _save_single(
+        self, user, content: str, bucket: str, keywords: List[str],
+        message_type: str, media_url: Optional[str], db: AsyncSession, ref: datetime
+    ) -> Dict:
+        category = await self._get_or_create_category(
+            user_id=user.id, name=bucket,
+            auto_description=INTENT_BUCKETS.get(bucket, ""), db=db,
+        )
+
+        tags = {
+            "keywords":       keywords,
+            "entities":       {},
+            "all_buckets":    [bucket],
+            "primary_bucket": bucket,
+            "priority":       "normal",
+            "due_date":       None,
+        }
+
+        msg = Message(
+            user_id=user.id, category_id=category.id,
+            content=content, message_type=MessageType(message_type),
+            media_url=media_url, summary=content[:100], tags=tags, created_at=ref,
+        )
+        db.add(msg)
+        await db.commit()
+        await db.refresh(msg)
+        await self._save_embedding(msg.id, content, {"keywords": keywords}, db)
+
+        return {
+            "message_id": msg.id, "category": bucket,
+            "all_buckets": [bucket], "tags": keywords,
+            "essence": content[:100], "connections": [],
+            "due_date": None, "events": [], "priority": "normal",
+        }
+
+    async def _process_fallback(
+        self, user, content: str, message_type: str,
+        media_url: Optional[str], db: AsyncSession, ref: datetime
+    ) -> Dict:
+        """Old _full_analysis path as safety net."""
         fast_buckets = _sniff_buckets_fast(content)
         fast_date, fast_time = _extract_time_mention(content, ref)
-        priority = _detect_priority(content)
 
-        # ── 3. Full LLM analysis ──────────────────────────────────
         analysis = await self._full_analysis(
             content=content, user=user, db=db,
             fast_buckets=fast_buckets, fast_date=fast_date,
             fast_time=fast_time, ref=ref,
         )
 
-        # Inject detected priority if LLM didn't catch it
-        if priority != "normal" and analysis.get("priority") == "normal":
-            analysis["priority"] = priority
-
         buckets = [b for b in analysis.get("buckets", fast_buckets) if b in BUCKET_NAMES]
         if not buckets:
             buckets = ["Random"]
 
-        # ── 4. Todo batch splitting ───────────────────────────────
-        if "To-Do" in buckets and message_type == "text":
-            todo_items = analysis.get("todo_items", [])
-            if todo_items and len(todo_items) > 1:
-                return await self._process_todo_batch(
-                    user=user, items=todo_items,
-                    original_content=content, analysis=analysis,
-                    all_buckets=buckets, db=db,
-                )
-
-        # ── 5. Single message persist ─────────────────────────────
         primary_bucket = buckets[0]
         category = await self._get_or_create_category(
             user_id=user.id, name=primary_bucket,
             auto_description=INTENT_BUCKETS.get(primary_bucket, ""), db=db,
         )
 
-        due_date: Optional[str] = analysis.get("due_date")
+        due_date = analysis.get("due_date")
         if not due_date and "To-Do" in buckets:
             due_date = _today_str()
-        # Also set today if we have a time reference but no date
-        # "pay sabziwala at 10pm" implies today
         if not due_date and analysis.get("event_time"):
             due_date = _today_str()
-
-        events = analysis.get("events", [])
 
         tags = {
             "keywords":       analysis.get("keywords", []),
@@ -304,52 +655,47 @@ class MessageProcessor:
             "all_buckets":    buckets,
             "primary_bucket": primary_bucket,
             "due_date":       due_date,
-            "events":         events,
+            "events":         analysis.get("events", []),
         }
 
-        message = Message(
-            user_id=user.id,
-            category_id=category.id,
-            content=content,
-            message_type=MessageType(message_type),
+        msg = Message(
+            user_id=user.id, category_id=category.id,
+            content=content, message_type=MessageType(message_type),
             media_url=media_url,
             summary=analysis.get("essence", content[:100]),
-            tags=tags,
-            created_at=ref,
+            tags=tags, created_at=ref,
         )
-
-        db.add(message)
+        db.add(msg)
         await db.commit()
-        await db.refresh(message)
+        await db.refresh(msg)
 
         result = {
-            "message_id":  message.id,
-            "category":    primary_bucket,
-            "all_buckets": buckets,
-            "tags":        analysis.get("keywords", []),
+            "message_id":  msg.id, "category": primary_bucket,
+            "all_buckets": buckets, "tags": analysis.get("keywords", []),
             "essence":     analysis.get("essence", ""),
             "connections": analysis.get("related_concepts", []),
-            "due_date":    due_date,
-            "events":      events,
+            "due_date":    due_date, "events": analysis.get("events", []),
             "priority":    analysis.get("priority", "normal"),
         }
 
-        # ── 6. Reminder ───────────────────────────────────────────
         if ("To-Do" in buckets or "Events" in buckets) and self.reminder_service:
-            has_time = analysis.get("event_time") and analysis.get("due_date")
-            if has_time:
-                reminder = await self.reminder_service.create(
-                    user=user, content=content, analysis=analysis,
-                    message_id=message.id, db=db,
-                )
-                if reminder:
-                    result["reminder_id"] = reminder.id
-                    result["remind_at"]   = reminder.remind_at.isoformat()
+            if analysis.get("event_time") and due_date:
+                try:
+                    reminder = await self.reminder_service.create(
+                        user=user, content=content, analysis=analysis,
+                        message_id=msg.id, db=db,
+                    )
+                    if reminder:
+                        result["reminder_id"] = reminder.id
+                        result["remind_at"]   = reminder.remind_at.isoformat()
+                except Exception as e:
+                    print(f"⚠ Reminder failed: {e}")
 
-        await self._save_embedding(message.id, content, analysis, db)
+        await self._save_embedding(msg.id, content, analysis, db)
         return result
 
-    # ──────────────────────────────────────────────────────────────
+
+        # ──────────────────────────────────────────────────────────────
     # List save handler
     # ──────────────────────────────────────────────────────────────
 

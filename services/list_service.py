@@ -113,7 +113,13 @@ def _extract_items_from_content(content: str) -> List[str]:
         # Match bullet markers
         m = re.match(r"^[-*•]\s*(.+)$", line)
         if m:
-            items.append(m.group(1).strip())
+            item = m.group(1).strip()
+            # Split "item1, - item2" patterns (multiple items on one bullet line)
+            sub_items = re.split(r",\s*[-*•]\s*", item)
+            if len(sub_items) > 1:
+                items.extend([s.strip() for s in sub_items if s.strip()])
+            else:
+                items.append(item)
             continue
 
         # Numbered: "1. item" or "1) item"
