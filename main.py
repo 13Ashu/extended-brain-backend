@@ -438,6 +438,10 @@ async def _handle_callback_query(callback: Dict):
             if user:
                 await context_service.clear_pending_confirmation(user.id)
 
+    elif callback_data == "noop":
+        # Section divider button — acknowledge silently
+        await _answer_callback(callback_id, "")
+
     else:
         await _answer_callback(callback_id, "Unknown action")
 
@@ -530,18 +534,15 @@ def format_todo_checklist(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
 ) -> tuple[str, dict]:
-    today = date.today()
+    today     = date.today()
     yesterday = today - timedelta(days=1)
 
     if date_from and date_to:
         if date_from == date_to:
             d = datetime.fromisoformat(date_from).date()
-            if d == today:
-                label = "today"
-            elif d == yesterday:
-                label = "yesterday"
-            else:
-                label = d.strftime("%a, %d %b")
+            if d == today:        label = "today"
+            elif d == yesterday:  label = "yesterday"
+            else:                 label = d.strftime("%a, %d %b")
         else:
             label = f"{date_from} → {date_to}"
     else:
@@ -554,27 +555,77 @@ def format_todo_checklist(
         text += "_Nothing here yet!_"
         return text, {"inline_keyboard": buttons}
 
-    for item in results:
-        tags     = item.get("tags", {})
-        is_done  = tags.get("done", False)
-        due_time = item.get("event_time") or tags.get("event_time", "")
-        time_str = f" _{due_time}_" if due_time else ""
-        has_subs = bool(tags.get("subtasks"))
-        sub_icon = " 📎" if has_subs else ""
+    # Separate overdue from current for section headers
+    current = [r for r in results if not r.get("is_overdue")]
+    overdue = [r for r in results if r.get("is_overdue")]
+
+    def _make_button(item: Dict) -> Dict:
+        tags       = item.get("tags", {})
+        due_time   = item.get("event_time") or tags.get("event_time", "")
+        time_str   = f" _{due_time}_" if due_time else ""
+        has_subs   = bool(tags.get("subtasks"))
+        sub_icon   = " 📎" if has_subs else ""
+
+        # Use summary (clean task) over raw multiline content
+        label_text = (
+            item.get("essence")
+            or item.get("summary")
+            or item.get("content", "").split("\n")[0]
+        ).strip()[:42]
+
+        return {
+            "text":          f"☐ {label_text}{time_str}{sub_icon}",
+            "callback_data": f"done:{item['id']}",
+        }
+
+    # Current items
+    for item in current:
+        tags    = item.get("tags", {})
+        is_done = tags.get("done", False)
+        due_time  = item.get("event_time") or tags.get("event_time", "")
+        time_str  = f" _{due_time}_" if due_time else ""
+        label_text = (
+            item.get("essence")
+            or item.get("summary")
+            or item.get("content", "").split("\n")[0]
+        ).strip()[:42]
 
         if is_done:
-            text += f"~✓ {item['content'][:40]}{time_str}~\n"
+            text += f"~✓ {label_text}{time_str}~\n"
         else:
-            buttons.append([{
-                "text":          f"☐ {item['content'][:38]}{time_str}{sub_icon}",
-                "callback_data": f"done:{item['id']}",
-            }])
+            buttons.append([_make_button(item)])
 
-    if results and all(item.get("tags", {}).get("done") for item in results):
+    # Overdue section — only if any exist
+    if overdue:
+        # Inline section divider as a disabled-looking button
+        buttons.append([{
+            "text":          "⚠ Overdue",
+            "callback_data": "noop",   # handled gracefully in _handle_callback_query
+        }])
+        for item in overdue:
+            tags    = item.get("tags", {})
+            is_done = tags.get("done", False)
+            due     = item.get("due_date", "")
+            try:
+                due_label = datetime.fromisoformat(due).strftime("%d %b")
+            except Exception:
+                due_label = due
+            label_text = (
+                item.get("essence")
+                or item.get("summary")
+                or item.get("content", "").split("\n")[0]
+            ).strip()[:36]
+
+            if not is_done:
+                buttons.append([{
+                    "text":          f"☐ {label_text} _{due_label}_",
+                    "callback_data": f"done:{item['id']}",
+                }])
+
+    if results and all(r.get("tags", {}).get("done") for r in results):
         text += "_All done! 🎉_"
 
     return text, {"inline_keyboard": buttons}
-
 
 async def send_todo_checklist(
     chat_id: str,

@@ -244,6 +244,14 @@ class SearchService:
             fetch_from  = date_from or str(today)
             fetch_to    = date_to   or str(today)
             todo_result = await self._fetch_todos_direct(user.id, fetch_from, fetch_to, db, limit)
+            
+            # FIX: always return for todo queries — even if empty.
+            # Never fall through to semantic search for explicit todo requests,
+            # or List/Random messages will appear via keyword similarity.
+            if _is_todo_query(query):
+                return todo_result   # returns empty results with correct structure
+            
+            # For general is_query (non-todo), still allow fallthrough if empty
             if todo_result["results"]:
                 return todo_result
 
@@ -391,17 +399,52 @@ class SearchService:
         date_to: str,
         db: AsyncSession,
         limit: int = 20,
+        include_overdue: bool = True,
     ) -> Dict:
+        from datetime import date as date_type
+        today_str = str(date_type.today())
+        is_today_query = (date_from == date_to == today_str)
+
+        # Build the date condition
+        # For today queries with include_overdue: also pull past-due undone items
+        if include_overdue and is_today_query:
+            date_filter = or_(
+                # Today's items
+                and_(
+                    text("messages.tags->>'due_date' >= :df"),
+                    text("messages.tags->>'due_date' <= :dt"),
+                ),
+                # Overdue: has a due_date, it's in the past, not done
+                and_(
+                    text("messages.tags ? 'due_date'"),
+                    text("messages.tags->>'due_date' != ''"),
+                    text("messages.tags->>'due_date' < :df"),
+                ),
+            )
+        else:
+            date_filter = and_(
+                text("messages.tags->>'due_date' >= :df"),
+                text("messages.tags->>'due_date' <= :dt"),
+            )
+
         result = await db.execute(
             select(Message, Category)
             .join(Category, Message.category_id == Category.id, isouter=True)
             .where(
                 and_(
                     Message.user_id == user_id,
-                    text("messages.tags->>'due_date' >= :df"),
-                    text("messages.tags->>'due_date' <= :dt"),
+                    date_filter,
                     text("(messages.tags->>'done')::boolean IS NOT TRUE"),
                     text("messages.tags->'all_buckets' @> '\"To-Do\"'::jsonb"),
+                    # Exclude pure List messages — primary_bucket = 'List'
+                    # Handles both old rows (intent_bucket) and new rows (primary_bucket)
+                    text("""
+                        COALESCE(
+                            messages.tags->>'primary_bucket',
+                            messages.tags->>'intent_bucket',
+                            'To-Do'
+                        ) != 'List'
+                    """),
                 )
             )
             .params(df=date_from, dt=date_to)
@@ -413,28 +456,37 @@ class SearchService:
         if not rows:
             return {"results": [], "natural_response": "", "is_direct_todo": True}
 
-        timed   = []
-        untimed = []
+        timed    = []
+        untimed  = []
+        overdue  = []
 
         for message, category in rows:
-            tags     = message.tags if isinstance(message.tags, dict) else {}
-            evt_time = tags.get("event_time")
+            tags       = message.tags if isinstance(message.tags, dict) else {}
+            evt_time   = tags.get("event_time")
+            due        = tags.get("due_date", "")
+            is_overdue = bool(due and due < today_str and is_today_query)
+
             item = {
                 "id":          message.id,
                 "content":     message.content,
-                "essence":     message.summary or message.content[:80],
+                # Use summary (clean task text) over raw content
+                "essence":     message.summary or message.content.split("\n")[0][:80],
                 "category":    category.name if category else "To-Do",
                 "all_buckets": tags.get("all_buckets", ["To-Do"]),
                 "priority":    tags.get("priority", "normal"),
                 "tags":        tags,
                 "created_at":  message.created_at.isoformat(),
-                "due_date":    tags.get("due_date"),
+                "due_date":    due,
                 "event_time":  evt_time,
                 "events":      tags.get("events", []),
                 "relevance":   50.0,
                 "preview":     message.content[:120],
+                "is_overdue":  is_overdue,
             }
-            if evt_time:
+
+            if is_overdue:
+                overdue.append(item)
+            elif evt_time:
                 timed.append(item)
             else:
                 untimed.append(item)
@@ -451,16 +503,24 @@ class SearchService:
 
         timed   = _dedup(timed)
         untimed = _dedup(untimed)
+        overdue = _dedup(overdue)
+
+        # Sort timed by event_time, overdue by due_date (oldest first)
         timed.sort(key=lambda x: x["event_time"] or "00:00")
+        overdue.sort(key=lambda x: x["due_date"] or "")
+
+        # Order: timed today → untimed today → overdue (at bottom, less urgent visually)
+        results = (timed + untimed + overdue)[:limit]
 
         return {
-            "results":       (timed + untimed)[:limit],
+            "results":         results,
             "natural_response": "",
             "is_direct_todo":   True,
             "date_from":        date_from,
             "date_to":          date_to,
             "timed_count":      len(timed),
             "untimed_count":    len(untimed),
+            "overdue_count":    len(overdue),
         }
 
     # ──────────────────────────────────────────────────────────────
