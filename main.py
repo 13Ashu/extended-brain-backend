@@ -839,45 +839,79 @@ async def process_webhook_message(webhook_data: Dict):
 
                     # ── SAVE ───────────────────────────────────────────
                     else:
-                        subtask_intent = await subtask_service.detect_subtask_intent(
-                            content, user.id, db
-                        )
-                        if subtask_intent:
-                            response = await _handle_nl_subtask(user, subtask_intent, content, chat_id, db)
-                        else:
-                            result = await message_processor.process(
-                                user_phone=user_phone, content=content,
-                                message_type=message_type, media_url=media_url, db=db,
-                            )
 
-                            if result.get("_is_query"):
-                                qdata  = result.get("query_data", {})
-                                q_text = qdata.get("query_text", content)
-                                search_result = await search_service.search(
-                                    user_phone=user_phone, query=q_text, db=db
-                                )
-                                results = search_result.get("results", [])
-                                await context_service.set_search_context(user.id, q_text, "")
-                                if search_result.get("is_list") and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
-                                    await send_list_display(chat_id, search_result)
-                                    continue
-                                is_todo_q = any(kw in q_text.lower() for kw in TODO_SEARCH_KEYWORDS)
-                                if is_todo_q and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
-                                    date_from = search_result.get("date_from")
-                                    date_to   = search_result.get("date_to")
-                                    await send_todo_checklist(chat_id, results, date_from, date_to)
-                                    continue
-                                response = format_search_results(search_result)
+                        # ── Check list intent FIRST (before subtask) ──────────────
+                        # "add to the galleria list: x, y" must route to list_service,
+                        # not subtask_service — subtask detection would greedily match
+                        # the list message as a parent task.
+                        from services.list_service import ListService
+                        ls = ListService(cerebras_client)
+                        list_intent = await ls.detect_list_intent(content)
+
+                        if list_intent and list_intent["intent"] == "create_or_add":
+                            # Route directly to list service
+                            msg, added, was_created = await ls.create_or_add(
+                                user.id,
+                                list_intent["list_name"],
+                                list_intent["list_type"],
+                                list_intent["items"],
+                                db,
+                            )
+                            tags  = msg.tags if isinstance(msg.tags, dict) else {}
+                            total = len(tags.get("subtasks", []))
+                            action = "Created" if was_created else "Updated"
+                            response = (
+                                f"✓ {action} *{list_intent['list_name']}*!\n\n"
+                                f"📝 {added} item(s) added · {total} total"
+                            )
+                            # Send the interactive checklist immediately
+                            if Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                                from services.list_service import ListService as LS
+                                text_, reply_markup = LS(cerebras_client).format_for_telegram(msg)
+                                await _tg_send(chat_id, text_, reply_markup)
+                                continue
+
+                        else:
+
+                            subtask_intent = await subtask_service.detect_subtask_intent(
+                                content, user.id, db
+                            )
+                            if subtask_intent:
+                                response = await _handle_nl_subtask(user, subtask_intent, content, chat_id, db)
                             else:
-                                response = _build_save_response(result)
-                                # Only spawn project check for content-bearing buckets
-                                all_buckets = result.get("all_buckets", [])
-                                skip_buckets = {"Track", "List", "Random"}
-                                if not set(all_buckets) <= skip_buckets:
-                                    asyncio.create_task(
-                                        _check_project(user, result, content, chat_id)
+                                result = await message_processor.process(
+                                    user_phone=user_phone, content=content,
+                                    message_type=message_type, media_url=media_url, db=db,
+                                )
+
+                                if result.get("_is_query"):
+                                    qdata  = result.get("query_data", {})
+                                    q_text = qdata.get("query_text", content)
+                                    search_result = await search_service.search(
+                                        user_phone=user_phone, query=q_text, db=db
                                     )
-                                await context_service.clear_search_context(user.id)
+                                    results = search_result.get("results", [])
+                                    await context_service.set_search_context(user.id, q_text, "")
+                                    if search_result.get("is_list") and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                                        await send_list_display(chat_id, search_result)
+                                        continue
+                                    is_todo_q = any(kw in q_text.lower() for kw in TODO_SEARCH_KEYWORDS)
+                                    if is_todo_q and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                                        date_from = search_result.get("date_from")
+                                        date_to   = search_result.get("date_to")
+                                        await send_todo_checklist(chat_id, results, date_from, date_to)
+                                        continue
+                                    response = format_search_results(search_result)
+                                else:
+                                    response = _build_save_response(result)
+                                    # Only spawn project check for content-bearing buckets
+                                    all_buckets = result.get("all_buckets", [])
+                                    skip_buckets = {"Track", "List", "Random"}
+                                    if not set(all_buckets) <= skip_buckets:
+                                        asyncio.create_task(
+                                            _check_project(user, result, content, chat_id)
+                                        )
+                                    await context_service.clear_search_context(user.id)
 
                 except Exception as e:
                     print(f"Processing error: {e}")
@@ -1046,6 +1080,32 @@ async def _handle_nl_subtask(
     hint      = intent.get("parent_hint", "")
 
     if parent_id:
+        # Check if the matched parent is actually a List message
+        # If so, use list_add_confirm instead of subtask_confirm
+        async with async_session_maker() as session:
+            from sqlalchemy import select as sel
+            parent_msg = await session.scalar(sel(Message).where(Message.id == parent_id))
+
+        if parent_msg:
+            parent_tags    = parent_msg.tags if isinstance(parent_msg.tags, dict) else {}
+            parent_buckets = parent_tags.get("all_buckets", [])
+
+            if "List" in parent_buckets:
+                # This is a shopping/named list — use list_add_confirm
+                list_name = parent_tags.get("list_name", parent_msg.content)
+                list_type = parent_tags.get("list_type", "custom")
+                await context_service.set_pending_confirmation(user.id, "list_add_confirm", {
+                    "list_name": list_name,
+                    "list_type": list_type,
+                    "items":     subs,
+                })
+                return (
+                    f"🛒 Add these items to *{list_name}*?\n\n"
+                    + "\n".join(f"• {s}" for s in subs)
+                    + "\n\nReply *yes* to confirm or *no* to skip."
+                )
+
+        # Original subtask flow for non-list parents
         await context_service.set_pending_confirmation(user.id, "subtask_confirm", {
             "message_id": parent_id,
             "subtasks":   subs,
@@ -1056,6 +1116,7 @@ async def _handle_nl_subtask(
             + "\n".join(f"• {s}" for s in subs)
             + "\n\nReply *yes* to confirm or *no* to skip."
         )
+
     else:
         candidates = await subtask_service.find_parent_message(user.id, hint, db)
         if not candidates:
@@ -1136,7 +1197,22 @@ async def _handle_confirmation_yes(
     conf_type = pending.get("type")
     data      = pending.get("data", {})
 
-    if conf_type == "subtask_confirm":
+        # NEW: list add confirmation
+    if conf_type == "list_add_confirm":
+        from services.list_service import ListService
+        ls = ListService(cerebras_client)
+        msg, added, _ = await ls.create_or_add(
+            user.id,
+            data["list_name"],
+            data["list_type"],
+            data["items"],
+            db,
+        )
+        text_, reply_markup = ls.format_for_telegram(msg)
+        await _tg_send(chat_id, text_, reply_markup)
+        return
+
+    elif conf_type == "subtask_confirm":
         ok = await subtask_service.add_subtasks(data["message_id"], data["subtasks"])
         if ok:
             async with async_session_maker() as session:

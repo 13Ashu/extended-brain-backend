@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import async_session_maker, Message, User, Category
 from cerebras_client import CerebrasClient
+from models import MessageType as MT
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -456,7 +457,7 @@ class ListService:
             user_id=user_id,
             category_id=cat.id,
             content=list_name,
-            message_type=__import__("models").MessageType("text"),
+            message_type=MT("text"),
             summary=f"{list_name} — {len(items)} items",
             tags={
                 "list_type":      list_type,
