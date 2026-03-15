@@ -390,6 +390,8 @@ class SearchService:
         today_str = str(date_type.today())
         is_today_query = (date_from == date_to == today_str)
 
+        print(f"[todos_direct] user={user_id} df={date_from} dt={date_to} is_today={is_today_query}")
+
         # Build the date condition
         # For today queries with include_overdue: also pull past-due undone items
         if include_overdue and is_today_query:
