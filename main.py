@@ -598,7 +598,7 @@ def format_todo_checklist(
             # Group header button — shows title + count, marks ALL done on tap
             # Use first item's id as representative (or handle noop)
             buttons.append([{
-                "text":          f"☐ {group_title}  ({done_count}/{total_count})",
+                "text": f"📂 {group_title}  {done_count}/{total_count}",
                 "callback_data": f"noop",
             }])
             # Sub-items — indented visually with a leader character
@@ -614,7 +614,7 @@ def format_todo_checklist(
 
                 if not is_done:
                     buttons.append([{
-                        "text":          f"  ∟ {label}{time_str}",
+                        "text": f"↳ {label}{time_str}",
                         "callback_data": f"done:{item['id']}",
                     }])
                 else:
