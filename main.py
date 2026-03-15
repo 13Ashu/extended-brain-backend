@@ -673,21 +673,24 @@ async def _refresh_list_message(chat_id: str, tg_message_id: int, message_id: in
 
 
 from datetime import date, datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 import re
+
 
 def format_todo_checklist(
     results: List[Dict],
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    expanded_groups: Optional[Set[str]] = None,
 ) -> tuple[str, dict]:
 
-    INDENT = "\u00A0\u00A0\u00A0"  # non-breaking spaces for stable indentation
+    if expanded_groups is None:
+        expanded_groups = set()
 
     today = date.today()
     yesterday = today - timedelta(days=1)
 
-    # ── Date label ───────────────────────────────────────────────
+    # ── Date label ─────────────────────────────────────────
     if date_from and date_to:
         if date_from == date_to:
             d = datetime.fromisoformat(date_from).date()
@@ -700,20 +703,20 @@ def format_todo_checklist(
         else:
             label = f"{date_from} → {date_to}"
     else:
-        label = "today"
+        label = today.strftime("%a, %d %b")
 
     text = f"📋 *To-Do — {label}*\n\n"
-    buttons = []
+    buttons: list[list[Dict]] = []
 
     if not results:
         text += "_Nothing here yet!_"
         return text, {"inline_keyboard": buttons}
 
-    # ── Separate overdue items ───────────────────────────────────
+    # ── Split overdue ──────────────────────────────────────
     current = [r for r in results if not r.get("is_overdue")]
     overdue = [r for r in results if r.get("is_overdue")]
 
-    # ── Group by split_from ──────────────────────────────────────
+    # ── Group tasks by split_from ──────────────────────────
     groups: Dict[str, List[Dict]] = {}
     standalone: List[Dict] = []
 
@@ -724,109 +727,115 @@ def format_todo_checklist(
         else:
             standalone.append(item)
 
-    # Single-item groups → standalone
+    # Convert single-item groups to standalone
     for split_from, items in list(groups.items()):
         if len(items) == 1:
             standalone.append(items[0])
             del groups[split_from]
 
-    # ── Render grouped tasks ─────────────────────────────────────
+    # ── Render grouped tasks ───────────────────────────────
     for split_from, items in groups.items():
 
         raw_title = split_from.split("\n")[0].strip().rstrip(":")
         raw_title = re.sub(r"^[-*•]\s*", "", raw_title)
         group_title = raw_title[:40] if raw_title else "Tasks"
 
+        group_id = f"group:{hash(split_from)}"
+
         done_count = sum(1 for i in items if i.get("tags", {}).get("done"))
         total_count = len(items)
-        all_done = done_count == total_count
 
-        # Group header
-        if all_done:
-            text += f"~✓ {group_title} ({total_count})~\n"
-        else:
-            text += f"🏢 {group_title} ({done_count}/{total_count})\n"
+        # Show group progress in text
+        text += f"🏢 *{group_title}* — {done_count}/{total_count}\n"
 
-        # Subtasks
-        for item in items:
-            tags = item.get("tags", {})
-            is_done = tags.get("done", False)
+        expanded = group_id in expanded_groups
+        arrow = "▾" if expanded else "▸"
 
-            due_time = item.get("event_time") or tags.get("event_time", "")
-            time_str = f" — {due_time}" if due_time else ""
+        # Group toggle button
+        buttons.append([{
+            "text": f"{arrow} {group_title}  {done_count}/{total_count}",
+            "callback_data": f"toggle:{group_id}"
+        }])
 
-            label = (
-                item.get("essence")
-                or item.get("content", "").split("\n")[0]
-            ).strip()[:38]
+        # Show tasks only if expanded
+        if expanded:
 
-            if is_done:
-                text += f"{INDENT}~✓ {label}{time_str}~\n"
-            else:
-                text += f"{INDENT}• {label}{time_str}\n"
+            for item in items:
 
-                buttons.append([{
-                    "text": f"✓ {label}",
-                    "callback_data": f"done:{item['id']}",
-                }])
+                tags = item.get("tags", {})
+                is_done = tags.get("done", False)
+
+                label = (
+                    item.get("essence")
+                    or item.get("content", "").split("\n")[0]
+                ).strip()[:40]
+
+                due_time = item.get("event_time") or tags.get("event_time", "")
+                time_str = f" — {due_time}" if due_time else ""
+
+                if is_done:
+                    text += f"✓ ~{label}{time_str}~\n"
+                else:
+                    buttons.append([{
+                        "text": f"   ☐ {label}{time_str}",
+                        "callback_data": f"done:{item['id']}"
+                    }])
 
         text += "\n"
 
-    # ── Render standalone tasks ──────────────────────────────────
+    # ── Standalone tasks ───────────────────────────────────
     for item in standalone:
 
         tags = item.get("tags", {})
         is_done = tags.get("done", False)
-
-        due_time = item.get("event_time") or tags.get("event_time", "")
-        time_str = f" — {due_time}" if due_time else ""
 
         label = (
             item.get("essence")
             or item.get("content", "").split("\n")[0]
         ).strip()[:42]
 
-        if is_done:
-            text += f"~✓ {label}{time_str}~\n"
-        else:
-            text += f"📌 {label}{time_str}\n"
+        due_time = item.get("event_time") or tags.get("event_time", "")
+        time_str = f" — {due_time}" if due_time else ""
 
+        if is_done:
+            text += f"✓ ~{label}{time_str}~\n"
+        else:
             buttons.append([{
-                "text": f"✓ {label}",
-                "callback_data": f"done:{item['id']}",
+                "text": f"📌 ☐ {label}{time_str}",
+                "callback_data": f"done:{item['id']}"
             }])
 
-    # ── Overdue section ──────────────────────────────────────────
+    # ── Overdue section ────────────────────────────────────
     if overdue:
+
         text += "\n⚠ *Overdue*\n"
 
         for item in overdue:
 
+            label = (
+                item.get("essence")
+                or item.get("content", "").split("\n")[0]
+            ).strip()[:38]
+
             due = item.get("due_date", "")
+
             try:
                 due_label = datetime.fromisoformat(due).strftime("%d %b")
             except Exception:
                 due_label = due
 
-            label = (
-                item.get("essence")
-                or item.get("content", "").split("\n")[0]
-            ).strip()[:36]
-
             if not item.get("tags", {}).get("done"):
-                text += f"{INDENT}• {label} — {due_label}\n"
 
                 buttons.append([{
-                    "text": f"✓ {label}",
-                    "callback_data": f"done:{item['id']}",
+                    "text": f"⚠ ☐ {label} — {due_label}",
+                    "callback_data": f"done:{item['id']}"
                 }])
 
-    # ── All done message ─────────────────────────────────────────
+    # ── All done indicator ─────────────────────────────────
     if results and all(r.get("tags", {}).get("done") for r in results):
         text += "\n_All done! 🎉_"
 
     return text, {"inline_keyboard": buttons}
-
 
 async def send_todo_checklist(
     chat_id: str,
