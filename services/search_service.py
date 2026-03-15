@@ -187,21 +187,26 @@ class SearchService:
 
         today = datetime.utcnow().date()
 
-        # ── 1. Parse intent via IntentService ────────────────────
+        # ── 1. List fetch FIRST — before any LLM call ────────────────
+        # All ? queries are searches. List queries are the most common
+        # and can be resolved purely from DB — no LLM needed.
+        list_result = await self._try_list_fetch(user.id, query, db)
+        if list_result is not None:
+            return list_result
+
+        # ── 2. IntentService — only if list fetch didn't resolve it ──
         from services.intent_service import get_intent_service
         intent_svc = get_intent_service(self.cerebras)
         parsed     = await intent_svc.parse(query, user.name, user.timezone or "Asia/Kolkata")
 
-        # FIX: read from correct keys in the IntentService output schema
-        actions      = parsed.get("actions", {})
-        is_query     = actions.get("is_query", False)
-        query_sub    = parsed.get("query") or {}   # the "query" sub-object, not top-level intent
+        actions        = parsed.get("actions", {})
+        is_query       = actions.get("is_query", False)
+        query_sub      = parsed.get("query") or {}
         list_name_hint = query_sub.get("list_name")
         date_hint      = query_sub.get("date_hint")
 
-        print(f"[search] is_query={is_query} list_hint={list_name_hint!r} for: {query[:60]}")
-
-        # ── 2. Named list query ───────────────────────────────────
+        # ── 3. Second list fetch attempt with IntentService hint ──────
+        # IntentService may have extracted a list_name we missed in step 1
         if is_query and list_name_hint:
             list_result = await self._try_list_fetch(
                 user.id, query, db, list_name_hint=list_name_hint
@@ -209,15 +214,9 @@ class SearchService:
             if list_result is not None:
                 return list_result
 
-        # Also try list fetch for any query (catches bare "dmart?")
-        list_result = await self._try_list_fetch(user.id, query, db)
-        if list_result is not None:
-            return list_result
-
-        # ── 3. Resolve date range ─────────────────────────────────
+        # ── 4. Resolve date range ─────────────────────────────────────
         date_from, date_to = _resolve_date_range(query, today)
 
-        # Fall back to IntentService date hint if regex found nothing
         if not date_from and is_query:
             if date_hint == "today":
                 date_from = date_to = str(today)
@@ -229,33 +228,19 @@ class SearchService:
                 date_from = str(monday)
                 date_to   = str(monday + timedelta(days=6))
 
-        is_future_q = any(kw in query.lower() for kw in {"upcoming", "future", "all", "everything"})
-        is_list_q   = any(kw in query.lower() for kw in TODO_KEYWORDS | {
-            "shopping", "shop", "grocery", "buy list", "shopping list"
-        })
-
-        # Default undated list/todo queries to today only (not for "all" / "upcoming")
-        if not date_from and is_list_q and not is_future_q:
-            date_from = str(today)
-            date_to   = str(today)
-
-        # ── 4. Direct todo fetch — zero LLM ──────────────────────
+        # ── 5. Direct todo fetch ──────────────────────────────────────
         if _is_todo_query(query) or is_query:
             fetch_from  = date_from or str(today)
             fetch_to    = date_to   or str(today)
-            todo_result = await self._fetch_todos_direct(user.id, fetch_from, fetch_to, db, limit)
-            
-            # FIX: always return for todo queries — even if empty.
-            # Never fall through to semantic search for explicit todo requests,
-            # or List/Random messages will appear via keyword similarity.
+            todo_result = await self._fetch_todos_direct(
+                user.id, fetch_from, fetch_to, db, limit
+            )
             if _is_todo_query(query):
-                return todo_result   # returns empty results with correct structure
-            
-            # For general is_query (non-todo), still allow fallthrough if empty
+                return todo_result        # always return for explicit todo queries
             if todo_result["results"]:
-                return todo_result
-
-        # ── 5. Standard semantic + keyword search ─────────────────
+                return todo_result        # return if found, else fall through
+            
+        # ── 6. Standard semantic + keyword search ─────────────────────
         bucket_hint    = _detect_bucket(query)
         use_due_filter = _is_due_date_query(query) and date_from is not None
         person_hint    = _extract_person_name(query)
