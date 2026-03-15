@@ -216,6 +216,7 @@ class SearchService:
 
         # ── 4. Resolve date range ─────────────────────────────────────
         date_from, date_to = _resolve_date_range(query, today)
+        print(f"[search] _resolve_date_range({query!r}) → {date_from}, {date_to}")
 
         if not date_from and is_query:
             if date_hint == "today":
@@ -228,6 +229,8 @@ class SearchService:
                 date_from = str(monday)
                 date_to   = str(monday + timedelta(days=6))
 
+
+        print(f"[search] query={query!r} date_from={date_from} date_to={date_to} is_query={is_query} is_todo={_is_todo_query(query)}")
         # ── 5. Direct todo fetch ──────────────────────────────────────
         if _is_todo_query(query) or is_query:
             fetch_from  = date_from or str(today)

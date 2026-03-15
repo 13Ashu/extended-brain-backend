@@ -71,9 +71,9 @@ class NudgeService:
             except Exception as e:
                 print(f"[nudge] Failed for user {user.id}: {e}")
 
+
     async def _nudge_user(self, user: User, today: str, now_utc: datetime):
         async with async_session_maker() as session:
-            # Todos that are overdue or due today, not done, not snoozed past now
             result = await session.execute(
                 select(Message)
                 .where(
@@ -82,26 +82,23 @@ class NudgeService:
                         text("messages.tags->>'due_date' <= :today"),
                         text("(messages.tags->>'done')::boolean IS NOT TRUE"),
                         text("messages.tags->'all_buckets' @> '\"To-Do\"'::jsonb"),
-                        # Not snoozed — either no snooze_until or it's past
                         text(
                             "(messages.tags->>'snooze_until' IS NULL OR "
                             " messages.tags->>'snooze_until' <= :now)"
                         ),
-                        # Only nudge if created more than 1 day ago
-                        text("messages.created_at <= :cutoff"),
+                        # FIX: use SQLAlchemy column comparison for DateTime column
+                        # not text() — asyncpg requires actual datetime object, not string
+                        Message.created_at <= now_utc - timedelta(days=1),
                     )
                 )
                 .params(
                     today=today,
+                    # FIX: snooze_until is stored as a JSONB string so string compare is fine
                     now=now_utc.strftime("%Y-%m-%dT%H:%M:%S"),
-                    cutoff=(now_utc - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S"),
                 )
-                .limit(5)  # max 5 nudges per user per run to avoid spam
+                .limit(5)
             )
             todos = result.scalars().all()
-
-        for todo in todos:
-            await self._send_nudge(user.telegram_chat_id, todo)
 
     async def _send_nudge(self, chat_id: str, message: Message):
         tags     = message.tags if isinstance(message.tags, dict) else {}
