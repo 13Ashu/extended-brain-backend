@@ -852,8 +852,8 @@ async def process_webhook_message(webhook_data: Dict):
                         query    = _extract_query(content)
                         prev_ctx = await context_service.get_search_context(user.id)
 
-                        if prev_ctx and not content.lower().startswith(("search:", "find:", "get:")):
-                            query = f"{prev_ctx['query']} {query}"
+                        # if prev_ctx and not content.lower().startswith(("search:", "find:", "get:")):
+                        #     query = f"{prev_ctx['query']} {query}"
 
                         search_result = await search_service.search(
                             user_phone=user_phone, query=query, db=db
