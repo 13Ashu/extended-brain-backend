@@ -43,6 +43,26 @@ from services.recurrence_service import RecurrenceService, Recurrence
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Starting Extended Brain API...")
+
+    # ── Connectivity diagnostic ──────────────────────────────────
+    import socket, os
+    db_url = os.getenv("DATABASE_URL", "NOT SET")
+    print(f"[db] DATABASE_URL set: {'yes' if db_url != 'NOT SET' else '❌ NO'}")
+    
+    # Extract hostname from URL for DNS check
+    import re
+    m = re.search(r"@([^:/]+)", db_url)
+    if m:
+        host = m.group(1)
+        print(f"[db] Resolving host: {host}")
+        try:
+            ip = socket.gethostbyname(host)
+            print(f"[db] ✓ DNS resolved → {ip}")
+        except Exception as e:
+            print(f"[db] ❌ DNS failed: {e}")
+    else:
+        print("[db] ❌ Could not parse hostname from DATABASE_URL")
+
     await init_db()
     print("✓ Database initialized")
 
