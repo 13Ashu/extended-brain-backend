@@ -459,18 +459,38 @@ async def _answer_callback(callback_id: str, text: str = ""):
 
 async def _refresh_checklist_message(chat_id: str, tg_message_id: int):
     async with async_session_maker() as session:
-        user = await session.scalar(select(User).where(User.telegram_chat_id == chat_id))
+        user = await session.scalar(
+            select(User).where(User.telegram_chat_id == chat_id)
+        )
         if not user:
             return
-        search_result = await search_service.search(
-            user_phone=user.phone_number, query="todo tasks pending", db=session
+
+        # Retrieve the date this checklist was originally showing
+        ctx       = await context_service.get_checklist_context(user.id, tg_message_id)
+        date_from = ctx.get("date_from") if ctx else None
+        date_to   = ctx.get("date_to")   if ctx else None
+
+        # If no context (old message), default to today
+        from datetime import date as date_type
+        today_str = str(date_type.today())
+        date_from = date_from or today_str
+        date_to   = date_to   or today_str
+
+        # Fetch directly from DB — don't go through LLM search
+        from services.search_service import SearchService
+        todo_result = await search_service._fetch_todos_direct(
+            user_id=user.id,
+            date_from=date_from,
+            date_to=date_to,
+            db=session,
         )
 
     results = [
-        r for r in search_result.get("results", [])
+        r for r in todo_result.get("results", [])
         if not r.get("tags", {}).get("done", False)
     ]
-    text, reply_markup = format_todo_checklist(results)
+
+    text, reply_markup = format_todo_checklist(results, date_from, date_to)
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     async with httpx.AsyncClient(timeout=10.0) as client:
         await client.post(
@@ -483,7 +503,6 @@ async def _refresh_checklist_message(chat_id: str, tg_message_id: int):
                 "reply_markup": reply_markup,
             },
         )
-
 
 async def _refresh_subtask_message(chat_id: str, tg_message_id: int, message_id: int):
     async with async_session_maker() as session:
@@ -683,7 +702,7 @@ async def send_todo_checklist(
     results = [r for r in results if not r.get("tags", {}).get("done", False)]
     text, reply_markup = format_todo_checklist(results, date_from, date_to)
     async with httpx.AsyncClient(timeout=10.0) as client:
-        await client.post(
+        resp = await client.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={
                 "chat_id":      chat_id,
@@ -692,6 +711,20 @@ async def send_todo_checklist(
                 "reply_markup": reply_markup,
             },
         )
+
+        # Store the date context for this checklist so refresh knows the date
+        data = resp.json()
+        if data.get("ok") and date_from:
+            msg_id = data["result"]["message_id"]
+            async with async_session_maker() as session:
+                user = await session.scalar(
+                    select(User).where(User.telegram_chat_id == chat_id)
+                )
+                if user:
+                    await context_service.set_checklist_context(
+                        user.id, msg_id, date_from, date_to or date_from
+                    )
+
 
 
 async def send_list_display(chat_id: str, search_result: Dict):

@@ -103,6 +103,19 @@ class ContextService:
         except Exception as e:
             print(f"[context] Failed to clear confirmation: {e}")
 
+    async def set_checklist_context(
+        self, user_id: int, message_id: int, date_from: str, date_to: str
+    ):
+        """Store which date a checklist message was showing."""
+        await self._store(f"checklist_ctx:{user_id}:{message_id}", {
+            "date_from": date_from,
+            "date_to":   date_to,
+        })
+
+    async def get_checklist_context(
+        self, user_id: int, message_id: int
+    ) -> Optional[Dict]:
+        return await self._get(f"checklist_ctx:{user_id}:{message_id}")
 
 # Singleton
 context_service = ContextService()
