@@ -10,12 +10,15 @@ from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta, date
 from enum import Enum
 from contextlib import asynccontextmanager
+from zoneinfo import ZoneInfo
 import os
+import re
 import asyncio
 import httpx
+from sqlalchemy import select, update, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import Config, MessagingPlatform
@@ -43,35 +46,13 @@ from services.recurrence_service import RecurrenceService, Recurrence
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 Starting Extended Brain API...")
-
-    # ── Connectivity diagnostic ──────────────────────────────────
-    import socket, os
-    db_url = os.getenv("DATABASE_URL", "NOT SET")
-    print(f"[db] DATABASE_URL set: {'yes' if db_url != 'NOT SET' else '❌ NO'}")
-    
-    # Extract hostname from URL for DNS check
-    import re
-    m = re.search(r"@([^:/]+)", db_url)
-    if m:
-        host = m.group(1)
-        print(f"[db] Resolving host: {host}")
-        try:
-            ip = socket.gethostbyname(host)
-            print(f"[db] ✓ DNS resolved → {ip}")
-        except Exception as e:
-            print(f"[db] ❌ DNS failed: {e}")
-    else:
-        print("[db] ❌ Could not parse hostname from DATABASE_URL")
-
     await init_db()
     print("✓ Database initialized")
 
-    # Create all new tables
     from services.reminder_service import Reminder
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # Start scheduler
     scheduler_task = asyncio.create_task(_master_scheduler())
     print("✅ Master scheduler running")
 
@@ -89,24 +70,17 @@ async def lifespan(app: FastAPI):
 
 
 async def _master_scheduler():
-    """
-    Single scheduler loop — runs every 60 seconds.
-    Delegates to each sub-scheduler.
-    """
-    from services.reminder_service import ReminderService as RS
+    """Single scheduler loop — runs every 60 seconds."""
     print("[scheduler] Master scheduler started")
     tick = 0
     while True:
         try:
-            await asyncio.sleep(60)
+            # Do work first so reminders fire immediately on startup, then sleep
             tick += 1
-
-            # Every minute: reminders + recurrences + briefing check
             await reminder_service.run_scheduler_tick()
             await recurrence_service.run()
             await briefing_service.run()
 
-            # Every 30 minutes: nudges + follow-ups
             if tick % 30 == 0:
                 await nudge_service.run_idle_nudges()
                 await nudge_service.run_followup_checks()
@@ -115,6 +89,8 @@ async def _master_scheduler():
             break
         except Exception as e:
             print(f"[scheduler] Error: {e}")
+        finally:
+            await asyncio.sleep(60)
 
 
 # ================== FastAPI App ==================
@@ -190,7 +166,7 @@ class ForgotPasswordRequest(BaseModel):
 
 
 class TelegramLinkRequest(BaseModel):
-    phone_number:    str
+    phone_number:     str
     telegram_chat_id: str
 
 
@@ -208,10 +184,10 @@ class SearchQuery(BaseModel):
 
 
 class CategoryOperation(BaseModel):
-    operation:    str
+    operation:     str
     category_name: Optional[str] = None
-    new_name:     Optional[str]  = None
-    description:  Optional[str]  = None
+    new_name:      Optional[str] = None
+    description:   Optional[str] = None
 
 
 # ================== Core Endpoints ==================
@@ -280,7 +256,6 @@ async def delete_account(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    phone = current_user.phone_number
     await db.delete(current_user)
     await db.commit()
     return {"success": True, "message": "Account deleted."}
@@ -288,7 +263,6 @@ async def delete_account(
 
 @app.post("/api/auth/link-telegram")
 async def link_telegram(request: TelegramLinkRequest, db: AsyncSession = Depends(get_db)):
-    from sqlalchemy import select
     user = await db.scalar(select(User).where(User.phone_number == request.phone_number))
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -326,12 +300,13 @@ async def verify_whatsapp_webhook(
 
 @app.post("/webhook/whatsapp")
 async def handle_whatsapp_webhook(
-    request: Request, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)
+    request: Request, background_tasks: BackgroundTasks
 ):
     if Config.get_messaging_platform() != MessagingPlatform.WHATSAPP:
         raise HTTPException(status_code=400, detail="WhatsApp not configured")
     webhook_data = await request.json()
-    background_tasks.add_task(process_webhook_message, webhook_data, db)
+    # FIX: do NOT pass db — background task opens its own session
+    background_tasks.add_task(process_webhook_message, webhook_data)
     return {"status": "received"}
 
 
@@ -339,7 +314,7 @@ async def handle_whatsapp_webhook(
 
 @app.post("/webhook/telegram")
 async def handle_telegram_webhook(
-    request: Request, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)
+    request: Request, background_tasks: BackgroundTasks
 ):
     if Config.get_messaging_platform() != MessagingPlatform.TELEGRAM:
         raise HTTPException(status_code=400, detail="Telegram not configured")
@@ -347,16 +322,20 @@ async def handle_telegram_webhook(
     webhook_data = await request.json()
 
     if "callback_query" in webhook_data:
-        await _handle_callback_query(webhook_data["callback_query"], db)
+        # Callbacks are handled inline with their own session — not in a background task
+        # because Telegram expects answerCallbackQuery within a few seconds
+        asyncio.create_task(_handle_callback_query(webhook_data["callback_query"]))
         return {"ok": True}
 
-    background_tasks.add_task(process_webhook_message, webhook_data, db)
+    # FIX: do NOT pass db — background task opens its own session
+    background_tasks.add_task(process_webhook_message, webhook_data)
     return {"ok": True}
 
 
 # ================== Callback Handler ==================
 
-async def _handle_callback_query(callback: Dict, db: AsyncSession):
+async def _handle_callback_query(callback: Dict):
+    """Handles inline keyboard callbacks. Opens its own DB session."""
     callback_id   = callback["id"]
     chat_id       = str(callback["from"]["id"])
     callback_data = callback.get("data", "")
@@ -366,7 +345,6 @@ async def _handle_callback_query(callback: Dict, db: AsyncSession):
     if callback_data.startswith("done:"):
         msg_db_id = int(callback_data.split(":")[1])
         async with async_session_maker() as session:
-            from sqlalchemy import select, update
             msg = await session.scalar(select(Message).where(Message.id == msg_db_id))
             if msg:
                 tags = dict(msg.tags or {})
@@ -381,21 +359,40 @@ async def _handle_callback_query(callback: Dict, db: AsyncSession):
 
     # ── snooze:<id>:<minutes> ─────────────────────────────────────
     elif callback_data.startswith("snooze:"):
-        parts     = callback_data.split(":")
-        msg_id    = int(parts[1])
-        minutes   = int(parts[2]) if len(parts) > 2 else 1440
+        parts   = callback_data.split(":")
+        msg_id  = int(parts[1])
+        minutes = int(parts[2]) if len(parts) > 2 else 1440
         await nudge_service.snooze_message(msg_id, minutes)
         await _answer_callback(callback_id, f"⏰ Snoozed for {minutes // 60}h")
 
     # ── subtask:<message_id>:<index> ──────────────────────────────
     elif callback_data.startswith("subtask:"):
-        parts   = callback_data.split(":")
-        msg_id  = int(parts[1])
-        idx     = int(parts[2])
+        parts  = callback_data.split(":")
+        msg_id = int(parts[1])
+        idx    = int(parts[2])
         await subtask_service.complete_subtask(msg_id, idx)
         await _answer_callback(callback_id, "✓ Subtask done!")
-        # Refresh subtask view
         await _refresh_subtask_message(chat_id, tg_message_id, msg_id)
+
+    # ── list_done:<message_id>:<index> ────────────────────────────
+    elif callback_data.startswith("list_done:"):
+        parts  = callback_data.split(":")
+        msg_id = int(parts[1])
+        idx    = int(parts[2])
+        from services.list_service import ListService
+        ls = ListService(cerebras_client)
+        await ls.complete_item(msg_id, idx)
+        await _answer_callback(callback_id, "✓ Done!")
+        await _refresh_list_message(chat_id, tg_message_id, msg_id)
+
+    # ── list_clear:<message_id> ───────────────────────────────────
+    elif callback_data.startswith("list_clear:"):
+        msg_id = int(callback_data.split(":")[1])
+        from services.list_service import ListService
+        ls = ListService(cerebras_client)
+        removed = await ls.clear_done_items(msg_id)
+        await _answer_callback(callback_id, f"🗑 Cleared {removed} done items")
+        await _refresh_list_message(chat_id, tg_message_id, msg_id)
 
     # ── pause_rec:<rec_id> ────────────────────────────────────────
     elif callback_data.startswith("pause_rec:"):
@@ -421,18 +418,25 @@ async def _handle_callback_query(callback: Dict, db: AsyncSession):
                 },
             )
 
-    # ── project confirm: yes:<msg_id>:<project> ───────────────────
+    # ── proj_yes:<msg_id>:<project> ───────────────────────────────
     elif callback_data.startswith("proj_yes:"):
-        parts      = callback_data.split(":", 2)
-        msg_id     = int(parts[1])
-        proj_name  = parts[2]
+        parts     = callback_data.split(":", 2)
+        msg_id    = int(parts[1])
+        proj_name = parts[2]
         await project_service.assign_project(msg_id, proj_name)
         await _answer_callback(callback_id, f"📁 Added to {proj_name}")
-        await context_service.clear_pending_confirmation(int(chat_id))
+        # Resolve user_id from chat_id to clear confirmation
+        async with async_session_maker() as session:
+            user = await session.scalar(select(User).where(User.telegram_chat_id == chat_id))
+            if user:
+                await context_service.clear_pending_confirmation(user.id)
 
     elif callback_data.startswith("proj_no:"):
         await _answer_callback(callback_id, "OK, not grouped")
-        await context_service.clear_pending_confirmation(int(chat_id))
+        async with async_session_maker() as session:
+            user = await session.scalar(select(User).where(User.telegram_chat_id == chat_id))
+            if user:
+                await context_service.clear_pending_confirmation(user.id)
 
     else:
         await _answer_callback(callback_id, "Unknown action")
@@ -447,11 +451,10 @@ async def _answer_callback(callback_id: str, text: str = ""):
         )
 
 
-# ================== Checklist & Subtask Refresh ==================
+# ================== Message refresh helpers ==================
 
 async def _refresh_checklist_message(chat_id: str, tg_message_id: int):
     async with async_session_maker() as session:
-        from sqlalchemy import select
         user = await session.scalar(select(User).where(User.telegram_chat_id == chat_id))
         if not user:
             return
@@ -459,18 +462,11 @@ async def _refresh_checklist_message(chat_id: str, tg_message_id: int):
             user_phone=user.phone_number, query="todo tasks pending", db=session
         )
 
-    items = [
-        {
-            "id":         r["id"],
-            "content":    r["content"],
-            "event_time": r.get("event_time") or r.get("tags", {}).get("event_time"),
-            "tags":       r.get("tags", {}),
-        }
-        for r in search_result.get("results", [])
+    results = [
+        r for r in search_result.get("results", [])
         if not r.get("tags", {}).get("done", False)
     ]
-
-    text, reply_markup = format_todo_checklist(items)
+    text, reply_markup = format_todo_checklist(results)
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     async with httpx.AsyncClient(timeout=10.0) as client:
         await client.post(
@@ -487,12 +483,32 @@ async def _refresh_checklist_message(chat_id: str, tg_message_id: int):
 
 async def _refresh_subtask_message(chat_id: str, tg_message_id: int, message_id: int):
     async with async_session_maker() as session:
-        from sqlalchemy import select
         msg = await session.scalar(select(Message).where(Message.id == message_id))
         if not msg:
             return
-
     text, reply_markup = subtask_service.format_subtasks(msg)
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.post(
+            f"https://api.telegram.org/bot{token}/editMessageText",
+            json={
+                "chat_id":      chat_id,
+                "message_id":   tg_message_id,
+                "text":         text,
+                "parse_mode":   "Markdown",
+                "reply_markup": reply_markup,
+            },
+        )
+
+
+async def _refresh_list_message(chat_id: str, tg_message_id: int, message_id: int):
+    async with async_session_maker() as session:
+        msg = await session.scalar(select(Message).where(Message.id == message_id))
+        if not msg:
+            return
+    from services.list_service import ListService
+    ls = ListService(cerebras_client)
+    text, reply_markup = ls.format_for_telegram(msg)
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     async with httpx.AsyncClient(timeout=10.0) as client:
         await client.post(
@@ -509,8 +525,29 @@ async def _refresh_subtask_message(chat_id: str, tg_message_id: int, message_id:
 
 # ================== Checklist Helpers ==================
 
-def format_todo_checklist(results: List[Dict]) -> tuple[str, dict]:
-    text    = "📋 *Your To-Do List*\n\n"
+def format_todo_checklist(
+    results: List[Dict],
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> tuple[str, dict]:
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+
+    if date_from and date_to:
+        if date_from == date_to:
+            d = datetime.fromisoformat(date_from).date()
+            if d == today:
+                label = "today"
+            elif d == yesterday:
+                label = "yesterday"
+            else:
+                label = d.strftime("%a, %d %b")
+        else:
+            label = f"{date_from} → {date_to}"
+    else:
+        label = "today"
+
+    text    = f"📋 *To-Do — {label}*\n\n"
     buttons = []
 
     if not results:
@@ -521,7 +558,7 @@ def format_todo_checklist(results: List[Dict]) -> tuple[str, dict]:
         tags     = item.get("tags", {})
         is_done  = tags.get("done", False)
         due_time = item.get("event_time") or tags.get("event_time", "")
-        time_str = f" {due_time}" if due_time else ""
+        time_str = f" _{due_time}_" if due_time else ""
         has_subs = bool(tags.get("subtasks"))
         sub_icon = " 📎" if has_subs else ""
 
@@ -539,10 +576,15 @@ def format_todo_checklist(results: List[Dict]) -> tuple[str, dict]:
     return text, {"inline_keyboard": buttons}
 
 
-async def send_todo_checklist(chat_id: str, results: List[Dict]):
+async def send_todo_checklist(
+    chat_id: str,
+    results: List[Dict],
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
     token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
     results = [r for r in results if not r.get("tags", {}).get("done", False)]
-    text, reply_markup = format_todo_checklist(results)
+    text, reply_markup = format_todo_checklist(results, date_from, date_to)
     async with httpx.AsyncClient(timeout=10.0) as client:
         await client.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -555,6 +597,42 @@ async def send_todo_checklist(chat_id: str, results: List[Dict]):
         )
 
 
+async def send_list_display(chat_id: str, search_result: Dict):
+    """Send a named list as an interactive Telegram checklist."""
+    from services.list_service import ListService
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+    list_msg = search_result.get("results", [{}])[0].get("list_message")
+    if not list_msg:
+        # Fallback: plain text
+        list_name = search_result.get("list_name", "List")
+        await _tg_send(chat_id, f"📋 *{list_name}*\n\n_Nothing here yet._")
+        return
+
+    ls = ListService(cerebras_client)
+    text, reply_markup = ls.format_for_telegram(list_msg)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id":      chat_id,
+                "text":         text,
+                "parse_mode":   "Markdown",
+                "reply_markup": reply_markup,
+            },
+        )
+
+
+async def _tg_send(chat_id: str, text: str, reply_markup: Optional[Dict] = None):
+    """Thin helper for sending a plain Telegram message."""
+    token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload)
+
+
 # ================== Message Processing ==================
 
 TODO_SEARCH_KEYWORDS = {
@@ -564,7 +642,6 @@ TODO_SEARCH_KEYWORDS = {
 
 
 def _is_search_query(content: str) -> bool:
-    """True if content starts with search:/find:/get: OR ends with ?"""
     lc = content.lower().strip()
     return (
         lc.startswith(("search:", "find:", "get:"))
@@ -573,262 +650,256 @@ def _is_search_query(content: str) -> bool:
 
 
 def _extract_query(content: str) -> str:
-    """Extract the actual query string."""
     lc = content.lower().strip()
     if lc.startswith(("search:", "find:", "get:")):
         return content.split(":", 1)[1].strip()
-    # Ends with ?
     return content.strip()
 
 
-async def process_webhook_message(webhook_data: Dict, db: AsyncSession):
-    try:
-        from sqlalchemy import select, update
+async def process_webhook_message(webhook_data: Dict):
+    # FIX: owns its own session — the request's db session is closed by the time
+    # this background task runs.
+    async with async_session_maker() as db:
+        try:
+            messages = messaging_client.extract_message_data(webhook_data)
 
-        messages = messaging_client.extract_message_data(webhook_data)
+            for msg_data in messages:
+                chat_id      = msg_data["user_id"]
+                content      = msg_data["content"]
+                message_type = msg_data["message_type"]
+                metadata     = msg_data.get("metadata", {})
 
-        for msg_data in messages:
-            chat_id      = msg_data["user_id"]
-            content      = msg_data["content"]
-            message_type = msg_data["message_type"]
-            metadata     = msg_data.get("metadata", {})
-
-            # Look up user
-            if Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
-                result = await db.execute(select(User).where(User.telegram_chat_id == chat_id))
-            else:
-                result = await db.execute(select(User).where(User.phone_number == chat_id))
-            user = result.scalar_one_or_none()
-
-            # ── /start ────────────────────────────────────────────
-            if content.lower().strip() == "/start":
-                if user:
-                    response = (
-                        f"👋 Welcome back, {user.name}!\n\n"
-                        f"📝 Send anything to save it\n"
-                        f"🔍 *Search:* `search: query` or end with ?\n"
-                        f"✅ *Todo:* `search: my todos`\n"
-                        f"📊 *Status:* `/status`\n"
-                        f"📁 *Projects:* `project: Japan trip`\n"
-                        f"🔁 *Recurring:* `every monday: weekly review`\n"
-                        f"📎 *Subtasks:* `subtask: parent > task1, task2`\n"
-                        f"⏰ *Briefing:* `briefing: 08:00`"
-                    )
+                # Look up user
+                if Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                    user = await db.scalar(select(User).where(User.telegram_chat_id == chat_id))
                 else:
-                    response = (
-                        f"👋 Welcome to Extended Brain!\n\n"
-                        f"1. Register at: https://your-digital-mind.vercel.app\n"
-                        f"2. Link Telegram: `/link +919876543210`"
-                    )
-                await messaging_client.send_message(chat_id, response)
-                continue
+                    user = await db.scalar(select(User).where(User.phone_number == chat_id))
 
-            # ── /link ─────────────────────────────────────────────
-            if content.lower().startswith("/link"):
-                parts = content.split()
-                if len(parts) != 2:
-                    await messaging_client.send_message(chat_id, "Usage: /link +919876543210")
-                    continue
-                phone        = parts[1].strip()
-                user_to_link = await db.scalar(select(User).where(User.phone_number == phone))
-                if not user_to_link:
-                    response = f"❌ No account found with {phone}"
-                else:
-                    user_to_link.telegram_chat_id = chat_id
-                    await db.commit()
-                    response = f"✅ Linked! Hi {user_to_link.name}, you're all set."
-                await messaging_client.send_message(chat_id, response)
-                continue
-
-            if not user:
-                await messaging_client.send_message(
-                    chat_id,
-                    "🚫 Please link your account first.\n\nSend: /link +919876543210"
-                )
-                continue
-
-            user_phone = user.phone_number
-
-            # ── /status ───────────────────────────────────────────
-            if content.lower().strip() in {"/status", "status"}:
-                response = await _build_status(user, db)
-                await messaging_client.send_message(chat_id, response)
-                continue
-
-            # ── briefing time setter ───────────────────────────────
-            if content.lower().startswith("briefing:"):
-                time_str = content.split(":", 1)[1].strip()
-                import re
-                if re.match(r"^\d{1,2}:\d{2}$", time_str):
-                    # Normalise to HH:MM
-                    h, m     = time_str.split(":")
-                    hhmm     = f"{int(h):02d}:{int(m):02d}"
-                    ok       = await briefing_service.set_briefing_time(user.id, hhmm)
-                    response = (
-                        f"✅ Morning briefing set to *{hhmm} IST* daily!"
-                        if ok else "❌ Failed to update briefing time."
-                    )
-                else:
-                    response = "❌ Use format `briefing: 08:00`"
-                await messaging_client.send_message(chat_id, response)
-                continue
-
-            # ── project view command ───────────────────────────────
-            if content.lower().startswith("project:"):
-                project_name = content.split(":", 1)[1].strip()
-                msgs         = await project_service.get_project_messages(user.id, project_name, db)
-                response     = project_service.format_project_summary(project_name, msgs)
-                await messaging_client.send_message(chat_id, response)
-                continue
-
-            # ── pending confirmation (project/subtask) ────────────
-            pending = await context_service.get_pending_confirmation(user.id)
-            if pending:
-                lc = content.lower().strip()
-                if lc in {"yes", "y", "yeah", "yep", "sure", "ok", "okay"}:
-                    await _handle_confirmation_yes(user, pending, chat_id, db)
-                    await context_service.clear_pending_confirmation(user.id)
-                    continue
-                elif lc in {"no", "n", "nope", "nah", "skip"}:
-                    await context_service.clear_pending_confirmation(user.id)
-                    await messaging_client.send_message(chat_id, "👍 Skipped.")
-                    continue
-
-            # ── Media handling ─────────────────────────────────────
-            media_url = None
-            if metadata.get("media_id") or metadata.get("file_id"):
-                media_id = metadata.get("media_id") or metadata.get("file_id")
-                try:
-                    media_url = await messaging_client.get_media_url(media_id)
-                except Exception as e:
-                    print(f"Error getting media URL: {e}")
-
-            if message_type == "audio" and media_url:
-                try:
-                    content = await cerebras_client.transcribe_audio(media_url)
-                except Exception:
-                    content = "[Audio - transcription failed]"
-
-            if message_type == "document" and media_url:
-                try:
-                    from services.document_processor import extract_document_text
-                    extracted = await extract_document_text(media_url)
-                    content   = f"{metadata.get('file_name', 'document')}: {extracted}"
-                except Exception as e:
-                    print(f"Error extracting document: {e}")
-
-            try:
-                # ── SEARCH (search: prefix OR ends with ?) ─────────
-                if _is_search_query(content):
-                    query         = _extract_query(content)
-                    prev_ctx      = await context_service.get_search_context(user.id)
-
-                    # If this is a follow-up, prepend previous context
-                    if prev_ctx and not content.lower().startswith(("search:", "find:", "get:")):
-                        # Ends with ? and there's a previous search — it's a follow-up
-                        query = f"{prev_ctx['query']} {query}"
-
-                    search_result = await search_service.search(
-                        user_phone=user_phone, query=query, db=db
-                    )
-                    results       = search_result.get("results", [])
-
-                    # Store context for follow-up
-                    natural = search_result.get("natural_response", "")
-                    await context_service.set_search_context(user.id, query, natural[:300])
-
-                    # Named list query → list checklist display (zero LLM render)
-                    if search_result.get("is_list") and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
-                        await send_list_display(chat_id, search_result)
-                        continue
-
-                    # Todo query → todo checklist display
-                    is_todo_query = any(kw in query.lower() for kw in TODO_SEARCH_KEYWORDS)
-                    if is_todo_query and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
-                        date_from = search_result.get("date_from")
-                        date_to   = search_result.get("date_to")
-                        await send_todo_checklist(chat_id, results, date_from, date_to)
-                        continue
-
-                    response = format_search_results(search_result)
-
-                # ── CATEGORIES ─────────────────────────────────────
-                elif content.lower().startswith(("category:", "categories")):
-                    response = await handle_category_command(user_phone, content, db)
-
-                # ── SUBTASK COMMAND ────────────────────────────────
-                elif content.lower().startswith("subtask:"):
-                    response = await _handle_subtask_command(user, content, chat_id, db)
-
-                # ── RECURRING TASK ─────────────────────────────────
-                elif recurrence_service.is_recurring(content):
-                    response = await _handle_recurring(user, content, db)
-
-                # ── SAVE ───────────────────────────────────────────
-                else:
-                    # Check for NL subtask intent first
-                    subtask_intent = await subtask_service.detect_subtask_intent(
-                        content, user.id, db
-                    )
-                    if subtask_intent:
-                        response = await _handle_nl_subtask(user, subtask_intent, content, chat_id, db)
-                    else:
-                        result = await message_processor.process(
-                            user_phone=user_phone, content=content,
-                            message_type=message_type, media_url=media_url, db=db,
+                # ── /start ────────────────────────────────────────────
+                if content.lower().strip() == "/start":
+                    if user:
+                        response = (
+                            f"👋 Welcome back, {user.name}!\n\n"
+                            f"📝 Send anything to save it\n"
+                            f"🔍 *Search:* `search: query` or end with ?\n"
+                            f"✅ *Todo:* `search: my todos`\n"
+                            f"📊 *Status:* `/status`\n"
+                            f"📁 *Projects:* `project: Japan trip`\n"
+                            f"🔁 *Recurring:* `every monday: weekly review`\n"
+                            f"📎 *Subtasks:* `subtask: parent > task1, task2`\n"
+                            f"⏰ *Briefing:* `briefing: 08:00`"
                         )
+                    else:
+                        response = (
+                            "👋 Welcome to Extended Brain!\n\n"
+                            "1. Register at: https://your-digital-mind.vercel.app\n"
+                            "2. Link Telegram: `/link +919876543210`"
+                        )
+                    await messaging_client.send_message(chat_id, response)
+                    continue
 
-                        # IntentService may return a query intent even on save path
-                        if result.get("_is_query"):
-                            qdata  = result.get("query_data", {})
-                            q_text = qdata.get("query_text", content)
-                            search_result = await search_service.search(
-                                user_phone=user_phone, query=q_text, db=db
-                            )
-                            results = search_result.get("results", [])
-                            await context_service.set_search_context(user.id, q_text, "")
-                            if search_result.get("is_list") and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
-                                await send_list_display(chat_id, search_result)
-                                continue
-                            is_todo_q = any(kw in q_text.lower() for kw in TODO_SEARCH_KEYWORDS)
-                            if is_todo_q and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
-                                date_from = search_result.get("date_from")
-                                date_to   = search_result.get("date_to")
-                                await send_todo_checklist(chat_id, results, date_from, date_to)
-                                continue
-                            response = format_search_results(search_result)
+                # ── /link ─────────────────────────────────────────────
+                if content.lower().startswith("/link"):
+                    parts = content.split()
+                    if len(parts) != 2:
+                        await messaging_client.send_message(chat_id, "Usage: /link +919876543210")
+                        continue
+                    phone        = parts[1].strip()
+                    user_to_link = await db.scalar(select(User).where(User.phone_number == phone))
+                    if not user_to_link:
+                        response = f"❌ No account found with {phone}"
+                    else:
+                        user_to_link.telegram_chat_id = chat_id
+                        await db.commit()
+                        response = f"✅ Linked! Hi {user_to_link.name}, you're all set."
+                    await messaging_client.send_message(chat_id, response)
+                    continue
+
+                if not user:
+                    await messaging_client.send_message(
+                        chat_id,
+                        "🚫 Please link your account first.\n\nSend: /link +919876543210"
+                    )
+                    continue
+
+                user_phone = user.phone_number
+
+                # ── /status ───────────────────────────────────────────
+                if content.lower().strip() in {"/status", "status"}:
+                    response = await _build_status(user, db)
+                    await messaging_client.send_message(chat_id, response)
+                    continue
+
+                # ── briefing time setter ───────────────────────────────
+                if content.lower().startswith("briefing:"):
+                    time_str = content.split(":", 1)[1].strip()
+                    if re.match(r"^\d{1,2}:\d{2}$", time_str):
+                        h, m  = time_str.split(":")
+                        hhmm  = f"{int(h):02d}:{int(m):02d}"
+                        ok    = await briefing_service.set_briefing_time(user.id, hhmm)
+                        response = (
+                            f"✅ Morning briefing set to *{hhmm} IST* daily!"
+                            if ok else "❌ Failed to update briefing time."
+                        )
+                    else:
+                        response = "❌ Use format `briefing: 08:00`"
+                    await messaging_client.send_message(chat_id, response)
+                    continue
+
+                # ── project view command ───────────────────────────────
+                if content.lower().startswith("project:"):
+                    project_name = content.split(":", 1)[1].strip()
+                    msgs         = await project_service.get_project_messages(user.id, project_name, db)
+                    response     = project_service.format_project_summary(project_name, msgs)
+                    await messaging_client.send_message(chat_id, response)
+                    continue
+
+                # ── pending confirmation (project/subtask) ────────────
+                pending = await context_service.get_pending_confirmation(user.id)
+                if pending:
+                    lc = content.lower().strip()
+                    if lc in {"yes", "y", "yeah", "yep", "sure", "ok", "okay"}:
+                        await _handle_confirmation_yes(user, pending, chat_id, db)
+                        await context_service.clear_pending_confirmation(user.id)
+                        continue
+                    elif lc in {"no", "n", "nope", "nah", "skip"}:
+                        await context_service.clear_pending_confirmation(user.id)
+                        await messaging_client.send_message(chat_id, "👍 Skipped.")
+                        continue
+                    # FIX: handle subtask_pick_number — user is replying with a digit
+                    elif pending.get("type") == "subtask_pick_number" and lc.isdigit():
+                        await _handle_subtask_pick_number(user, pending, int(lc), chat_id)
+                        await context_service.clear_pending_confirmation(user.id)
+                        continue
+
+                # ── Media handling ─────────────────────────────────────
+                media_url = None
+                if metadata.get("media_id") or metadata.get("file_id"):
+                    media_id = metadata.get("media_id") or metadata.get("file_id")
+                    try:
+                        media_url = await messaging_client.get_media_url(media_id)
+                    except Exception as e:
+                        print(f"Error getting media URL: {e}")
+
+                if message_type == "audio" and media_url:
+                    try:
+                        content = await cerebras_client.transcribe_audio(media_url)
+                    except Exception:
+                        content = "[Audio - transcription failed]"
+
+                if message_type == "document" and media_url:
+                    try:
+                        from services.document_processor import extract_document_text
+                        extracted = await extract_document_text(media_url)
+                        content   = f"{metadata.get('file_name', 'document')}: {extracted}"
+                    except Exception as e:
+                        print(f"Error extracting document: {e}")
+
+                try:
+                    # ── SEARCH ────────────────────────────────────────
+                    if _is_search_query(content):
+                        query    = _extract_query(content)
+                        prev_ctx = await context_service.get_search_context(user.id)
+
+                        if prev_ctx and not content.lower().startswith(("search:", "find:", "get:")):
+                            query = f"{prev_ctx['query']} {query}"
+
+                        search_result = await search_service.search(
+                            user_phone=user_phone, query=query, db=db
+                        )
+                        results = search_result.get("results", [])
+
+                        natural = search_result.get("natural_response", "")
+                        await context_service.set_search_context(user.id, query, natural[:300])
+
+                        if search_result.get("is_list") and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                            await send_list_display(chat_id, search_result)
+                            continue
+
+                        is_todo_query = any(kw in query.lower() for kw in TODO_SEARCH_KEYWORDS)
+                        if is_todo_query and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                            date_from = search_result.get("date_from")
+                            date_to   = search_result.get("date_to")
+                            await send_todo_checklist(chat_id, results, date_from, date_to)
+                            continue
+
+                        response = format_search_results(search_result)
+
+                    # ── CATEGORIES ─────────────────────────────────────
+                    elif content.lower().startswith(("category:", "categories")):
+                        response = await handle_category_command(user_phone, content, db)
+
+                    # ── SUBTASK COMMAND ────────────────────────────────
+                    elif content.lower().startswith("subtask:"):
+                        response = await _handle_subtask_command(user, content, chat_id, db)
+
+                    # ── RECURRING TASK ─────────────────────────────────
+                    elif recurrence_service.is_recurring(content):
+                        response = await _handle_recurring(user, content, db)
+
+                    # ── SAVE ───────────────────────────────────────────
+                    else:
+                        subtask_intent = await subtask_service.detect_subtask_intent(
+                            content, user.id, db
+                        )
+                        if subtask_intent:
+                            response = await _handle_nl_subtask(user, subtask_intent, content, chat_id, db)
                         else:
-                            response = _build_save_response(result)
-                            # Project detection (async, non-blocking)
-                            asyncio.create_task(
-                                _check_project(user, result, content, chat_id, db)
+                            result = await message_processor.process(
+                                user_phone=user_phone, content=content,
+                                message_type=message_type, media_url=media_url, db=db,
                             )
-                            await context_service.clear_search_context(user.id)
 
-            except Exception as e:
-                print(f"Processing error: {e}")
-                import traceback
-                traceback.print_exc()
-                response = "⚠ Something went wrong. Please try again."
+                            if result.get("_is_query"):
+                                qdata  = result.get("query_data", {})
+                                q_text = qdata.get("query_text", content)
+                                search_result = await search_service.search(
+                                    user_phone=user_phone, query=q_text, db=db
+                                )
+                                results = search_result.get("results", [])
+                                await context_service.set_search_context(user.id, q_text, "")
+                                if search_result.get("is_list") and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                                    await send_list_display(chat_id, search_result)
+                                    continue
+                                is_todo_q = any(kw in q_text.lower() for kw in TODO_SEARCH_KEYWORDS)
+                                if is_todo_q and Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
+                                    date_from = search_result.get("date_from")
+                                    date_to   = search_result.get("date_to")
+                                    await send_todo_checklist(chat_id, results, date_from, date_to)
+                                    continue
+                                response = format_search_results(search_result)
+                            else:
+                                response = _build_save_response(result)
+                                # Only spawn project check for content-bearing buckets
+                                all_buckets = result.get("all_buckets", [])
+                                skip_buckets = {"Track", "List", "Random"}
+                                if not set(all_buckets) <= skip_buckets:
+                                    asyncio.create_task(
+                                        _check_project(user, result, content, chat_id)
+                                    )
+                                await context_service.clear_search_context(user.id)
 
-            await messaging_client.send_message(chat_id, response)
+                except Exception as e:
+                    print(f"Processing error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    response = "⚠ Something went wrong. Please try again."
 
-    except Exception as e:
-        print(f"Error processing webhook: {e}")
-        import traceback
-        traceback.print_exc()
+                await messaging_client.send_message(chat_id, response)
+
+        except Exception as e:
+            print(f"Error processing webhook: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 # ================== Feature Handlers ==================
 
 async def _build_status(user: User, db: AsyncSession) -> str:
-    from sqlalchemy import select, func, text
-    from datetime import date, timedelta
-
     today      = datetime.utcnow().strftime("%Y-%m-%d")
     week_start = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+    week_end   = (datetime.utcnow() + timedelta(days=7)).strftime("%Y-%m-%d")
 
-    # Pending todos today
     pending_res = await db.execute(
         select(func.count(Message.id))
         .where(
@@ -841,7 +912,6 @@ async def _build_status(user: User, db: AsyncSession) -> str:
     )
     pending = pending_res.scalar() or 0
 
-    # Done today
     done_res = await db.execute(
         select(func.count(Message.id))
         .where(
@@ -853,17 +923,12 @@ async def _build_status(user: User, db: AsyncSession) -> str:
     )
     done_today = done_res.scalar() or 0
 
-    # Saves this week
     saves_res = await db.execute(
         select(func.count(Message.id))
-        .where(
-            Message.user_id == user.id,
-            Message.created_at >= week_start,
-        )
+        .where(Message.user_id == user.id, Message.created_at >= week_start)
     )
     saves_week = saves_res.scalar() or 0
 
-    # Ideas count
     ideas_res = await db.execute(
         select(func.count(Message.id))
         .where(
@@ -873,8 +938,6 @@ async def _build_status(user: User, db: AsyncSession) -> str:
     )
     ideas = ideas_res.scalar() or 0
 
-    # Events this week
-    week_end = (datetime.utcnow() + timedelta(days=7)).strftime("%Y-%m-%d")
     events_res = await db.execute(
         select(func.count(Message.id))
         .where(
@@ -886,13 +949,10 @@ async def _build_status(user: User, db: AsyncSession) -> str:
     )
     events = events_res.scalar() or 0
 
-    # Active recurrences
     rec_res = await db.execute(
         select(func.count())
         .select_from(text("recurrences"))
-        .where(
-            text("user_id = :uid AND is_active = TRUE")
-        )
+        .where(text("user_id = :uid AND is_active = TRUE"))
         .params(uid=user.id)
     )
     recurrences = rec_res.scalar() or 0
@@ -932,39 +992,50 @@ async def _handle_subtask_command(
     if len(candidates) == 1:
         ok = await subtask_service.add_subtasks(candidates[0].id, subs)
         if ok:
-            text_, reply_markup = subtask_service.format_subtasks(candidates[0])
-            # Re-fetch to get updated tags
             async with async_session_maker() as session:
-                from sqlalchemy import select as sel
-                msg = await session.scalar(sel(Message).where(Message.id == candidates[0].id))
-            text_, reply_markup = subtask_service.format_subtasks(msg)
-            token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={
-                        "chat_id":      chat_id,
-                        "text":         text_,
-                        "parse_mode":   "Markdown",
-                        "reply_markup": reply_markup,
-                    },
-                )
-            return ""  # Already sent above
+                msg = await session.scalar(select(Message).where(Message.id == candidates[0].id))
+            if msg:
+                text_, reply_markup = subtask_service.format_subtasks(msg)
+                await _tg_send(chat_id, text_, reply_markup)
+            return ""
         return "❌ Failed to add subtasks."
 
-    # Multiple candidates — ask user to pick
-    options = "\n".join(
-        f"{i+1}. {c.content[:60]}" for i, c in enumerate(candidates[:5])
-    )
-    # Store pending confirmation with candidates
+    options = "\n".join(f"{i+1}. {c.content[:60]}" for i, c in enumerate(candidates[:5]))
     await context_service.set_pending_confirmation(user.id, "subtask_pick", {
         "candidates": [{"id": c.id, "content": c.content} for c in candidates[:5]],
         "subtasks":   subs,
     })
     return (
         f"🤔 Found {len(candidates)} matching tasks:\n\n{options}\n\n"
-        f"Which one? Reply with the number (1-{min(len(candidates),5)})"
+        f"Which one? Reply with the number (1-{min(len(candidates), 5)})"
     )
+
+
+async def _handle_subtask_pick_number(
+    user: User, pending: Dict, number: int, chat_id: str
+):
+    """FIX: was missing entirely — handles user replying with a digit after subtask_pick."""
+    data       = pending.get("data", {})
+    candidates = data.get("candidates", [])
+    subs       = data.get("subtasks", [])
+    idx        = number - 1
+
+    if idx < 0 or idx >= len(candidates):
+        await messaging_client.send_message(
+            chat_id, f"❌ Please reply with a number between 1 and {len(candidates)}."
+        )
+        return
+
+    chosen_id = candidates[idx]["id"]
+    ok = await subtask_service.add_subtasks(chosen_id, subs)
+    if ok:
+        async with async_session_maker() as session:
+            msg = await session.scalar(select(Message).where(Message.id == chosen_id))
+        if msg:
+            text_, reply_markup = subtask_service.format_subtasks(msg)
+            await _tg_send(chat_id, text_, reply_markup)
+            return
+    await messaging_client.send_message(chat_id, "❌ Failed to add subtasks.")
 
 
 async def _handle_nl_subtask(
@@ -975,7 +1046,6 @@ async def _handle_nl_subtask(
     hint      = intent.get("parent_hint", "")
 
     if parent_id:
-        # High confidence match
         await context_service.set_pending_confirmation(user.id, "subtask_confirm", {
             "message_id": parent_id,
             "subtasks":   subs,
@@ -987,7 +1057,6 @@ async def _handle_nl_subtask(
             + "\n\nReply *yes* to confirm or *no* to skip."
         )
     else:
-        # Ambiguous — search for parent
         candidates = await subtask_service.find_parent_message(user.id, hint, db)
         if not candidates:
             return f"❌ Couldn't find a task matching *{hint}*."
@@ -995,9 +1064,7 @@ async def _handle_nl_subtask(
             "candidates": [{"id": c.id, "content": c.content} for c in candidates[:5]],
             "subtasks":   subs,
         })
-        options = "\n".join(
-            f"{i+1}. {c.content[:60]}" for i, c in enumerate(candidates[:5])
-        )
+        options = "\n".join(f"{i+1}. {c.content[:60]}" for i, c in enumerate(candidates[:5]))
         return (
             f"🤔 Which task should these subtasks go under?\n\n{options}\n\n"
             f"Reply with the number."
@@ -1025,21 +1092,16 @@ async def _handle_recurring(user: User, content: str, db: AsyncSession) -> str:
     )
 
 
-async def _check_project(
-    user: User, result: Dict, content: str, chat_id: str, db: AsyncSession
-):
-    """Background task — detect project and ask user if found."""
+async def _check_project(user: User, result: Dict, content: str, chat_id: str):
+    """Background task — detect project. Opens its own session."""
     try:
         async with async_session_maker() as session:
             msg = await session.scalar(
-                __import__("sqlalchemy").select(Message).where(
-                    Message.id == result.get("message_id")
-                )
+                select(Message).where(Message.id == result.get("message_id"))
             )
             if not msg:
                 return
 
-            # Build a minimal analysis dict for project detection
             analysis = {
                 "concepts": result.get("connections", []),
                 "keywords": result.get("tags", []),
@@ -1049,29 +1111,21 @@ async def _check_project(
             if not project:
                 return
 
-        # Store pending confirmation
         await context_service.set_pending_confirmation(user.id, "project_confirm", {
             "message_id": msg.id,
             "project":    project,
         })
 
-        # Send inline confirmation
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id":    chat_id,
-                    "text":       f"📁 Add this to project *{project}*?",
-                    "parse_mode": "Markdown",
-                    "reply_markup": {
-                        "inline_keyboard": [[
-                            {"text": "✅ Yes",  "callback_data": f"proj_yes:{msg.id}:{project}"},
-                            {"text": "❌ No",   "callback_data": f"proj_no:{msg.id}"},
-                        ]]
-                    },
-                },
-            )
+        await _tg_send(
+            chat_id,
+            f"📁 Add this to project *{project}*?",
+            reply_markup={
+                "inline_keyboard": [[
+                    {"text": "✅ Yes", "callback_data": f"proj_yes:{msg.id}:{project}"},
+                    {"text": "❌ No",  "callback_data": f"proj_no:{msg.id}"},
+                ]]
+            },
+        )
     except Exception as e:
         print(f"[project] Background check failed: {e}")
 
@@ -1084,30 +1138,28 @@ async def _handle_confirmation_yes(
 
     if conf_type == "subtask_confirm":
         ok = await subtask_service.add_subtasks(data["message_id"], data["subtasks"])
-        msg_text = "✅ Subtasks added!" if ok else "❌ Failed to add subtasks."
-        await messaging_client.send_message(chat_id, msg_text)
+        if ok:
+            async with async_session_maker() as session:
+                msg = await session.scalar(select(Message).where(Message.id == data["message_id"]))
+            if msg:
+                text_, reply_markup = subtask_service.format_subtasks(msg)
+                await _tg_send(chat_id, text_, reply_markup)
+                return
+        await messaging_client.send_message(chat_id, "❌ Failed to add subtasks.")
 
     elif conf_type == "subtask_pick":
-        # User replied with a number
-        await messaging_client.send_message(
-            chat_id,
-            "Reply with the number of the task (e.g. `1`)"
-        )
-        # Re-store so next message picks up the number
+        # User said "yes" to an ambiguous pick — prompt for the number
+        await messaging_client.send_message(chat_id, "Reply with the number of the task (e.g. `1`)")
         await context_service.set_pending_confirmation(user.id, "subtask_pick_number", data)
 
     elif conf_type == "project_confirm":
         await project_service.assign_project(data["message_id"], data["project"])
-        await messaging_client.send_message(
-            chat_id, f"📁 Added to project *{data['project']}*!"
-        )
+        await messaging_client.send_message(chat_id, f"📁 Added to project *{data['project']}*!")
 
 
 # ================== Helpers ==================
 
 def _build_save_response(result: Dict) -> str:
-    from zoneinfo import ZoneInfo
-
     category    = result.get("category", "Notes")
     all_buckets = result.get("all_buckets", [category])
     remind_at   = result.get("remind_at")
@@ -1155,7 +1207,7 @@ async def handle_category_command(phone: str, content: str, db: AsyncSession) ->
     return "Send 'categories' to list all your categories."
 
 
-# ================== API Endpoints ==================
+# ================== REST API Endpoints ==================
 
 @app.post("/api/messages/capture")
 async def capture_message(
@@ -1212,12 +1264,11 @@ async def get_user_analytics(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    from sqlalchemy import select, func
     phone = current_user.phone_number
     total = await db.scalar(
         select(func.count(Message.id)).join(User).where(User.phone_number == phone)
     )
-    cat_stats  = await db.execute(
+    cat_stats = await db.execute(
         select(Category.name, func.count(Message.id))
         .join(Message.category).join(User).where(User.phone_number == phone)
         .group_by(Category.name)
@@ -1242,10 +1293,10 @@ async def get_webhook_info():
     try:
         info = await messaging_client.get_webhook_info()
         return {
-            "platform":        "telegram",
+            "platform":         "telegram",
             "webhook_endpoint": "/webhook/telegram",
-            "current_webhook": info.get("result", {}),
-            "configured_url":  Config.TELEGRAM_WEBHOOK_URL,
+            "current_webhook":  info.get("result", {}),
+            "configured_url":   Config.TELEGRAM_WEBHOOK_URL,
         }
     except Exception:
         return {

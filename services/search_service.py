@@ -7,6 +7,11 @@ KEY CHANGES over v2:
     (timed todos first by event_time, untimed after)
   • Timestamp delta computed in Python — shown only when results span >1 date
   • Multi-source date detection — groups results by date with subtle labels
+
+FIX (v3.1):
+  • IntentService key mapping corrected:
+      parsed.get("actions", {}).get("is_query")  instead of parsed.get("intent")
+      parsed.get("query") or {}                  instead of parsed.get("entities")
 ────────────────────────────────────────────────────────────────────────────
 """
 
@@ -39,11 +44,6 @@ BUCKET_ALIASES: Dict[str, str] = {
 TODO_KEYWORDS = {
     "todo", "to-do", "to do", "task", "tasks", "pending",
     "checklist", "check list",
-}
-
-LIST_KEYWORDS = {
-    "shopping list", "grocery list", "bag list", "packing list",
-    "travel list", "reading list", "watch list", "to buy",
 }
 
 DUE_DATE_SIGNALS = {
@@ -80,14 +80,18 @@ def _resolve_date_range(query: str, ref: date) -> Tuple[Optional[str], Optional[
         return str(monday), str(monday + timedelta(days=6))
     if re.search(r"this\s+month", q):
         first = ref.replace(day=1)
-        last  = ref.replace(month=ref.month+1, day=1) - timedelta(days=1) if ref.month < 12 else ref.replace(day=31)
+        last  = (
+            ref.replace(month=ref.month + 1, day=1) - timedelta(days=1)
+            if ref.month < 12
+            else ref.replace(day=31)
+        )
         return str(first), str(last)
 
     m = re.search(r"(?:past|last)\s+(\d+)\s+days?", q)
     if m:
         return str(ref - timedelta(days=int(m.group(1)))), str(ref)
 
-    day_names = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+    day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
     for i, d in enumerate(day_names):
         if re.search(rf"\b{d}\b", q):
             delta  = (i - ref.weekday()) % 7 or 7
@@ -95,14 +99,19 @@ def _resolve_date_range(query: str, ref: date) -> Tuple[Optional[str], Optional[
             return str(target), str(target)
 
     MONTHS = {
-        "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
-        "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
     }
     for name, num in MONTHS.items():
         if re.search(rf"\b{name}\b", q):
             year  = ref.year if num >= ref.month else ref.year + 1
             first = date(year, num, 1)
-            last  = date(year, num+1, 1) - timedelta(days=1) if num < 12 else date(year, 12, 31)
+            last  = (
+                date(year, num + 1, 1) - timedelta(days=1)
+                if num < 12
+                else date(year, 12, 31)
+            )
             return str(first), str(last)
 
     return None, None
@@ -135,19 +144,21 @@ def _extract_person_name(query: str) -> Optional[str]:
         m = re.search(p, query)
         if m:
             name = m.group(1)
-            if name.lower() not in {"show","find","get","search","my","me","the","a","an","today","tomorrow"}:
+            if name.lower() not in {
+                "show", "find", "get", "search", "my", "me",
+                "the", "a", "an", "today", "tomorrow",
+            }:
                 return name
     return None
 
 
 def _date_label(saved_date: str, today: date) -> str:
-    """Human-readable date label for multi-source display."""
     try:
         d     = date.fromisoformat(saved_date)
         delta = (today - d).days
-        if delta == 0:   return "today"
-        if delta == 1:   return "yesterday"
-        if delta <= 6:   return f"{delta}d ago"
+        if delta == 0:  return "today"
+        if delta == 1:  return "yesterday"
+        if delta <= 6:  return f"{delta}d ago"
         return d.strftime("%d %b")
     except Exception:
         return saved_date
@@ -176,34 +187,38 @@ class SearchService:
 
         today = datetime.utcnow().date()
 
-        # ── 1. Use IntentService to classify the query ───────────
+        # ── 1. Parse intent via IntentService ────────────────────
         from services.intent_service import get_intent_service
-        intent_svc     = get_intent_service(self.cerebras)
-        parsed         = await intent_svc.parse(query, user.name, user.timezone or "Asia/Kolkata")
-        query_intent   = parsed.get("intent", "random")
-        query_entities = parsed.get("entities", {})
+        intent_svc = get_intent_service(self.cerebras)
+        parsed     = await intent_svc.parse(query, user.name, user.timezone or "Asia/Kolkata")
 
-        print(f"[search] intent={query_intent} for: {query[:60]}")
+        # FIX: read from correct keys in the IntentService output schema
+        actions      = parsed.get("actions", {})
+        is_query     = actions.get("is_query", False)
+        query_sub    = parsed.get("query") or {}   # the "query" sub-object, not top-level intent
+        list_name_hint = query_sub.get("list_name")
+        date_hint      = query_sub.get("date_hint")
+
+        print(f"[search] is_query={is_query} list_hint={list_name_hint!r} for: {query[:60]}")
 
         # ── 2. Named list query ───────────────────────────────────
-        if query_intent == "query" and query_entities.get("list_name"):
+        if is_query and list_name_hint:
             list_result = await self._try_list_fetch(
-                user.id, query, db, list_name_hint=query_entities.get("list_name")
+                user.id, query, db, list_name_hint=list_name_hint
             )
             if list_result is not None:
                 return list_result
 
-        # Also try list fetch for any query (catches "dmart?")
+        # Also try list fetch for any query (catches bare "dmart?")
         list_result = await self._try_list_fetch(user.id, query, db)
         if list_result is not None:
             return list_result
 
-        # ── 3. Todo query — direct ordered fetch, zero LLM ───────
+        # ── 3. Resolve date range ─────────────────────────────────
         date_from, date_to = _resolve_date_range(query, today)
 
-        # Use IntentService date hint if regex didn't find one
-        if not date_from and query_intent == "query":
-            date_hint = query_entities.get("date_hint")
+        # Fall back to IntentService date hint if regex found nothing
+        if not date_from and is_query:
             if date_hint == "today":
                 date_from = date_to = str(today)
             elif date_hint == "tomorrow":
@@ -214,26 +229,25 @@ class SearchService:
                 date_from = str(monday)
                 date_to   = str(monday + timedelta(days=6))
 
-        is_future_q = any(kw in query.lower() for kw in {"upcoming","future","all","everything"})
+        is_future_q = any(kw in query.lower() for kw in {"upcoming", "future", "all", "everything"})
         is_list_q   = any(kw in query.lower() for kw in TODO_KEYWORDS | {
-            "shopping","shop","grocery","buy list","shopping list"
+            "shopping", "shop", "grocery", "buy list", "shopping list"
         })
 
+        # Default undated list/todo queries to today only (not for "all" / "upcoming")
         if not date_from and is_list_q and not is_future_q:
             date_from = str(today)
             date_to   = str(today)
 
-        if _is_todo_query(query) or query_intent == "query":
-            # Default todo queries to today if no date specified
-            fetch_from = date_from or str(today)
-            fetch_to   = date_to   or str(today)
-            todo_result = await self._fetch_todos_direct(
-                user.id, fetch_from, fetch_to, db, limit
-            )
+        # ── 4. Direct todo fetch — zero LLM ──────────────────────
+        if _is_todo_query(query) or is_query:
+            fetch_from  = date_from or str(today)
+            fetch_to    = date_to   or str(today)
+            todo_result = await self._fetch_todos_direct(user.id, fetch_from, fetch_to, db, limit)
             if todo_result["results"]:
                 return todo_result
 
-        # ── 3. Standard semantic + keyword search ─────────────────
+        # ── 5. Standard semantic + keyword search ─────────────────
         bucket_hint    = _detect_bucket(query)
         use_due_filter = _is_due_date_query(query) and date_from is not None
         person_hint    = _extract_person_name(query)
@@ -278,21 +292,14 @@ class SearchService:
         self, user_id: int, query: str, db: AsyncSession,
         list_name_hint: Optional[str] = None,
     ) -> Optional[Dict]:
-        """
-        If query is asking for a named list, fetch it directly from DB.
-        Zero LLM — pure DB read.
-        """
         from services.list_service import ListService
         ls = ListService(self.cerebras)
 
-        # CRITICAL: todo/task/pending queries must NEVER be treated as named list queries
-        # "todo list today?", "todo list for tomorrow?" must route to _fetch_todos_direct
+        # Never intercept todo/task queries as list queries
         q_lower = query.lower().strip()
         TODO_BLOCK = {"todo", "to-do", "to do", "task", "tasks", "pending"}
         if any(kw in q_lower for kw in TODO_BLOCK):
             return None
-
-
 
         # Fast path: IntentService already extracted the list name
         if list_name_hint:
@@ -303,15 +310,26 @@ class SearchService:
                 list_name = tags.get("list_name", msg.content)
                 return {
                     "results": [{
-                        "id": msg.id, "content": msg.content, "essence": list_name,
-                        "category": "List", "all_buckets": ["List"], "priority": "normal",
-                        "tags": tags, "created_at": msg.created_at.isoformat(),
-                        "due_date": None, "event_time": None, "events": [],
-                        "relevance": 100.0, "preview": f"{len(subtasks)} items",
-                        "is_list": True, "list_message": msg,
+                        "id":           msg.id,
+                        "content":      msg.content,
+                        "essence":      list_name,
+                        "category":     "List",
+                        "all_buckets":  ["List"],
+                        "priority":     "normal",
+                        "tags":         tags,
+                        "created_at":   msg.created_at.isoformat(),
+                        "due_date":     None,
+                        "event_time":   None,
+                        "events":       [],
+                        "relevance":    100.0,
+                        "preview":      f"{len(subtasks)} items",
+                        "is_list":      True,
+                        "list_message": msg,
                     }],
-                    "natural_response": "", "is_list": True,
-                    "list_name": list_name, "list_message_id": msg.id,
+                    "natural_response": "",
+                    "is_list":          True,
+                    "list_name":        list_name,
+                    "list_message_id":  msg.id,
                 }
 
         intent = await ls.detect_list_intent(query)
@@ -325,35 +343,36 @@ class SearchService:
         if not msg:
             return {
                 "results":          [],
-                "natural_response": f"You don\'t have a *{list_name}* yet.\n\nStart by sending:\n`{list_name.lower()}:\n- item1\n- item2`",
-                "is_list":          True,
-                "list_name":        list_name,
-                "list_type":        list_type,
+                "natural_response": (
+                    f"You don't have a *{list_name}* yet.\n\n"
+                    f"Start by sending:\n`{list_name.lower()}:\n- item1\n- item2`"
+                ),
+                "is_list":   True,
+                "list_name": list_name,
+                "list_type": list_type,
             }
 
         tags     = msg.tags if isinstance(msg.tags, dict) else {}
         subtasks = tags.get("subtasks", [])
 
-        results = [{
-            "id":           msg.id,
-            "content":      msg.content,
-            "essence":      tags.get("list_name", msg.content),
-            "category":     "List",
-            "all_buckets":  ["List"],
-            "priority":     "normal",
-            "tags":         tags,
-            "created_at":   msg.created_at.isoformat(),
-            "due_date":     None,
-            "event_time":   None,
-            "events":       [],
-            "relevance":    100.0,
-            "preview":      f"{len(subtasks)} items",
-            "is_list":      True,
-            "list_message": msg,
-        }]
-
         return {
-            "results":          results,
+            "results": [{
+                "id":           msg.id,
+                "content":      msg.content,
+                "essence":      tags.get("list_name", msg.content),
+                "category":     "List",
+                "all_buckets":  ["List"],
+                "priority":     "normal",
+                "tags":         tags,
+                "created_at":   msg.created_at.isoformat(),
+                "due_date":     None,
+                "event_time":   None,
+                "events":       [],
+                "relevance":    100.0,
+                "preview":      f"{len(subtasks)} items",
+                "is_list":      True,
+                "list_message": msg,
+            }],
             "natural_response": "",
             "is_list":          True,
             "list_type":        list_type,
@@ -361,6 +380,9 @@ class SearchService:
             "list_message_id":  msg.id,
         }
 
+    # ──────────────────────────────────────────────────────────────
+    # Direct todo fetch — ZERO LLM
+    # ──────────────────────────────────────────────────────────────
 
     async def _fetch_todos_direct(
         self,
@@ -370,11 +392,6 @@ class SearchService:
         db: AsyncSession,
         limit: int = 20,
     ) -> Dict:
-        """
-        Fetch todos for a date range directly from DB.
-        Timed todos first (sorted by event_time), untimed after.
-        Zero LLM — pure DB read.
-        """
         result = await db.execute(
             select(Message, Category)
             .join(Category, Message.category_id == Category.id, isouter=True)
@@ -422,10 +439,9 @@ class SearchService:
             else:
                 untimed.append(item)
 
-        # Deduplicate by content (case-insensitive) — prevents duplicates from re-saving
-        def _dedup(items):
-            seen = set()
-            out  = []
+        def _dedup(items: List[Dict]) -> List[Dict]:
+            seen: set = set()
+            out = []
             for item in items:
                 key = item["content"].lower().strip()
                 if key not in seen:
@@ -435,14 +451,10 @@ class SearchService:
 
         timed   = _dedup(timed)
         untimed = _dedup(untimed)
-
-        # Sort timed by event_time
         timed.sort(key=lambda x: x["event_time"] or "00:00")
 
-        results = timed + untimed
-
         return {
-            "results":          results[:limit],
+            "results":       (timed + untimed)[:limit],
             "natural_response": "",
             "is_direct_todo":   True,
             "date_from":        date_from,
@@ -521,8 +533,8 @@ Return ONLY this JSON:
             .where(Message.user_id == user.id)
         )
 
-        bucket_filter     = expansion.get("bucket_filter")
-        extra_buckets     = expansion.get("extra_buckets", [])
+        bucket_filter  = expansion.get("bucket_filter")
+        extra_buckets  = expansion.get("extra_buckets", [])
         if isinstance(extra_buckets, str):
             extra_buckets = [extra_buckets]
         all_target_buckets = list(dict.fromkeys(
@@ -561,7 +573,7 @@ Return ONLY this JSON:
                     )
                 )
 
-        kw_conds = []
+        kw_conds  = []
         all_terms = (
             expansion.get("keywords", [])[:8]
             + expansion.get("core_concepts", [])[:4]
@@ -628,7 +640,6 @@ Return ONLY this JSON:
         expansion: Dict, use_due_filter: bool,
     ) -> List[Dict]:
         scored = []
-        today  = datetime.utcnow().date()
 
         for message, category in messages:
             score = self._score(message, category, query, expansion, use_due_filter)
@@ -665,7 +676,7 @@ Return ONLY this JSON:
         q_lower = query.lower()
 
         score += getattr(message, "_semantic_score", 0.0) * 20.0
-        if q_lower in content:   score += 12.0
+        if q_lower in content:  score += 12.0
 
         for c in expansion.get("core_concepts", []):
             if c.lower() in content: score += 6.0
@@ -709,7 +720,7 @@ Return ONLY this JSON:
         return score
 
     # ──────────────────────────────────────────────────────────────
-    # Natural response — with smart timestamp logic
+    # Natural response
     # ──────────────────────────────────────────────────────────────
 
     async def _natural_response(
@@ -726,31 +737,28 @@ Return ONLY this JSON:
                     time_ctx = f" between {date_from} and {date_to}"
             return f"Nothing found{time_ctx} in your notes."
 
-        # Detect if results span multiple dates
         saved_dates  = {r["_saved_date"] for r in results if r.get("_saved_date")}
         multi_source = len(saved_dates) > 1
         today_str    = str(today)
         yesterday    = str(today - timedelta(days=1))
 
         if date_from and date_to:
-            if date_from == date_to == today_str:   time_ctx = "today"
-            elif date_from == date_to == yesterday:  time_ctx = "yesterday"
-            elif date_from == date_to:               time_ctx = datetime.fromisoformat(date_from).strftime("%A, %d %b")
-            else:                                    time_ctx = f"between {date_from} and {date_to}"
+            if date_from == date_to == today_str:    time_ctx = "today"
+            elif date_from == date_to == yesterday:   time_ctx = "yesterday"
+            elif date_from == date_to:                time_ctx = datetime.fromisoformat(date_from).strftime("%A, %d %b")
+            else:                                     time_ctx = f"between {date_from} and {date_to}"
         else:
             time_ctx = "any time"
 
         context = ""
         for r in results[:8]:
-            due      = f" [due: {r['due_date']}]" if r.get("due_date") else ""
-            ev_time  = f" at {r['event_time']}" if r.get("event_time") else ""
-            buckets  = ", ".join(r.get("all_buckets", [r.get("category", "?")]))
-            # Only add saved date to context if multi-source
-            if multi_source:
-                label = _date_label(r.get("_saved_date", ""), today)
-                date_note = f" [saved {label}]"
-            else:
-                date_note = ""
+            due       = f" [due: {r['due_date']}]" if r.get("due_date") else ""
+            ev_time   = f" at {r['event_time']}" if r.get("event_time") else ""
+            buckets   = ", ".join(r.get("all_buckets", [r.get("category", "?")]))
+            date_note = (
+                f" [saved {_date_label(r.get('_saved_date', ''), today)}]"
+                if multi_source else ""
+            )
             context += f"\n[{buckets}]{due}{ev_time}{date_note}: {r['content']}\n"
 
         prompt = f"""Personal assistant answering a search in the user's notes.
@@ -788,8 +796,8 @@ Reply:"""
                 start = max(0, idx - 50)
                 end   = min(len(content), idx + 100)
                 pre   = content[start:end]
-                if start > 0:          pre = "…" + pre
-                if end < len(content): pre = pre + "…"
+                if start > 0:           pre = "…" + pre
+                if end < len(content):  pre = pre + "…"
                 return pre
         return content[:150] + "…"
 
