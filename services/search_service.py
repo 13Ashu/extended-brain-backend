@@ -472,6 +472,7 @@ class SearchService:
                 "relevance":   50.0,
                 "preview":     message.content[:120],
                 "is_overdue":  is_overdue,
+                "split_from":  tags.get("split_from", ""),
             }
 
             if is_overdue:
