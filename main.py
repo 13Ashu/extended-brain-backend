@@ -797,6 +797,34 @@ def _extract_query(content: str) -> str:
     return content.strip()
 
 
+async def _send_image_results(chat_id: str, results: List[Dict]):
+    """Re-send saved images via Telegram sendPhoto."""
+    for r in results[:3]:
+        file_id = r.get("file_id")
+        if not file_id:
+            continue
+
+        caption = f"🖼 *{r.get('essence', 'Image')}*"
+        if r.get("caption") and r["caption"] != "[Image]":
+            caption += f"\n_{r['caption']}_"
+        if r.get("description"):
+            caption += f"\n{r['description']}"
+        caption += f"\n\n_Saved {r.get('created_at', '')[:10]}_"
+
+        try:
+            await messaging_client.send_image(
+                to=chat_id,
+                image_url=file_id,   # Telegram accepts file_id as photo param
+                caption=caption,
+            )
+        except Exception as e:
+            print(f"[image] Re-send failed for {file_id}: {e}")
+            await messaging_client.send_message(
+                chat_id, f"⚠ Couldn't retrieve image: {r.get('essence', '')}"
+            )
+
+
+
 async def process_webhook_message(webhook_data: Dict):
     # FIX: owns its own session — the request's db session is closed by the time
     # this background task runs.
@@ -915,6 +943,8 @@ async def process_webhook_message(webhook_data: Dict):
 
                 # ── Media handling ─────────────────────────────────────
                 media_url = None
+                file_id   = metadata.get("file_id") or metadata.get("media_id")
+
                 if metadata.get("media_id") or metadata.get("file_id"):
                     media_id = metadata.get("media_id") or metadata.get("file_id")
                     try:
@@ -936,7 +966,80 @@ async def process_webhook_message(webhook_data: Dict):
                     except Exception as e:
                         print(f"Error extracting document: {e}")
 
+                # ── Image message — vision processing ─────────────────────────
+                if message_type == "image" and file_id:
+                    try:
+                        from services.vision_service import vision_service
+
+                        # Use existing client — get URL then download bytes
+                        media_url  = await messaging_client.get_media_url(file_id)
+                        image_data = await messaging_client.download_media(media_url)
+
+                        # Infer mime type from URL extension
+                        ext      = media_url.rsplit(".", 1)[-1].lower()
+                        mime_map = {
+                            "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                            "png": "image/png",  "webp": "image/webp",
+                            "gif": "image/gif",
+                        }
+                        mime_type = mime_map.get(ext, "image/jpeg")
+
+                        ref    = datetime.utcnow()
+                        result = await message_processor._process_image(
+                            user=user,
+                            file_id=file_id,
+                            caption=content,
+                            image_data=image_data,
+                            mime_type=mime_type,
+                            db=db,
+                            ref=ref,
+                        )
+
+                        title             = result.get("essence", "Image")
+                        extracted_preview = result.get("extracted_text", "")[:60]
+                        extracted_line    = f"\n📄 _{extracted_preview}..._" if extracted_preview else ""
+
+                        response = (
+                            f"✓ Image saved!\n\n"
+                            f"🖼 *{title}*{extracted_line}\n\n"
+                            f"_Retrieve anytime:_ `image: {content or title}`"
+                        )
+                    except Exception as e:
+                        print(f"[image] Processing failed: {e}")
+                        import traceback; traceback.print_exc()
+                        response = "⚠ Couldn't process the image. Please try again."
+
+                    await messaging_client.send_message(chat_id, response)
+                    continue
+
+                # ── Audio transcription (existing) ────────────────────────────
+                if message_type == "audio" and file_id:
+                    try:
+                        media_url = await messaging_client.get_media_url(file_id)
+                        content   = await cerebras_client.transcribe_audio(media_url)
+                    except Exception:
+                        content = "[Audio - transcription failed]"
+
+
                 try:
+
+                    # ── IMAGE RETRIEVAL ────────────────────────────────────────────
+                    if content.lower().strip().startswith("image:"):
+                        search_result = await search_service.search(
+                            user_phone=user_phone, query=content, db=db
+                        )
+                        results = search_result.get("results", [])
+                        if not results:
+                            response = search_result.get(
+                                "natural_response",
+                                "No images found. Try different keywords."
+                            )
+                            await messaging_client.send_message(chat_id, response)
+                        else:
+                            await _send_image_results(chat_id, results)
+                        continue
+
+
                     # ── SEARCH ────────────────────────────────────────
                     if _is_search_query(content):
                         query    = _extract_query(content)

@@ -187,6 +187,10 @@ class SearchService:
 
         today = datetime.utcnow().date()
 
+        # ── 0. Image search — highest priority ───────────────────────
+        if query.lower().strip().startswith("image:"):
+            return await self._fetch_images_direct(user.id, query, db, limit)
+
         # ── 1. List fetch FIRST — before any LLM call ────────────────
         # All ? queries are searches. List queries are the most common
         # and can be resolved purely from DB — no LLM needed.
@@ -859,3 +863,79 @@ Reply:"""
     async def _get_user_categories(self, user_id: int, db: AsyncSession) -> List[str]:
         result = await db.execute(select(Category.name).where(Category.user_id == user_id))
         return [row[0] for row in result.all()]
+
+    async def _fetch_images_direct(
+        self,
+        user_id: int,
+        query: str,
+        db: AsyncSession,
+        limit: int = 5,
+    ) -> Dict:
+        """
+        Search saved images by keyword match on content, summary, and tags.
+        Returns file_id in results for Telegram re-send.
+        Zero LLM — pure DB search.
+        """
+        # Extract search terms — strip "image:" prefix
+        search_term = re.sub(r"^image:\s*", "", query, flags=re.IGNORECASE).strip().lower()
+
+        if not search_term:
+            return {"results": [], "natural_response": "", "is_image_search": True}
+
+        # Split into individual words for broader matching
+        terms = [t for t in search_term.split() if len(t) > 2]
+        if not terms:
+            terms = [search_term]
+
+        # Build keyword conditions across content, summary, and extracted_text tag
+        kw_conditions = []
+        for term in terms[:6]:
+            kw_conditions.extend([
+                func.lower(Message.content).contains(term),
+                func.lower(Message.summary).contains(term),
+                text(f"lower(messages.tags->>'extracted_text') LIKE '%{term}%'"),
+                text(f"lower(messages.tags->>'caption') LIKE '%{term}%'"),
+                text(f"lower(messages.tags->>'image_title') LIKE '%{term}%'"),
+            ])
+
+        result = await db.execute(
+            select(Message)
+            .where(
+                and_(
+                    Message.user_id == user_id,
+                    text("(messages.tags->>'is_image')::boolean IS TRUE"),
+                    or_(*kw_conditions),
+                )
+            )
+            .order_by(Message.created_at.desc())
+            .limit(limit)
+        )
+        rows = result.scalars().all()
+
+        if not rows:
+            return {
+                "results":          [],
+                "natural_response": f"No images found matching *{search_term}*.",
+                "is_image_search":  True,
+            }
+
+        results = []
+        for msg in rows:
+            tags = msg.tags if isinstance(msg.tags, dict) else {}
+            results.append({
+                "id":            msg.id,
+                "content":       msg.content,
+                "essence":       msg.summary or tags.get("image_title", "Image"),
+                "file_id":       tags.get("file_id"),
+                "caption":       tags.get("caption", ""),
+                "document_type": tags.get("document_type", "other"),
+                "description":   tags.get("description", ""),
+                "created_at":    msg.created_at.isoformat(),
+                "tags":          tags,
+            })
+
+        return {
+            "results":         results,
+            "natural_response": "",
+            "is_image_search": True,
+        }

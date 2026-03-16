@@ -1010,3 +1010,90 @@ Return ONLY this JSON:
             await db.commit()
         except Exception as e:
             print(f"⚠ Embedding failed (non-critical): {e}")
+
+    async def _process_image(
+        self,
+        user: User,
+        file_id: str,
+        caption: str,
+        image_data: bytes,      # ADD
+        mime_type: str,         # ADD
+        db: AsyncSession,
+        ref: datetime,
+    ) -> Dict:
+        from services.vision_service import vision_service
+
+        try:
+            analysis = await vision_service.analyze_image(image_data, mime_type)
+        except Exception as e:
+            print(f"[processor] Image analysis failed: {e}")
+            analysis = {
+                "document_type":  "other",
+                "title":          caption or "Image",
+                "extracted_text": "",
+                "key_fields":     {},
+                "description":    "",
+                "keywords":       [],
+            }
+
+        extracted = analysis.get("extracted_text", "")
+        title     = analysis.get("title") or caption or "Image"
+
+        content_parts = [caption] if caption and caption != "[Image]" else []
+        if extracted:
+            content_parts.append(extracted[:500])
+        content = " | ".join(content_parts) if content_parts else title
+
+        category = await self._get_or_create_category(
+            user_id=user.id, name="Remember",
+            auto_description=INTENT_BUCKETS["Remember"], db=db,
+        )
+
+        tags = {
+            "all_buckets":    ["Remember"],
+            "primary_bucket": "Remember",
+            "priority":       "normal",
+            "due_date":       None,
+            "is_image":       True,
+            "file_id":        file_id,
+            "mime_type":      mime_type,
+            "caption":        caption,
+            "document_type":  analysis.get("document_type", "other"),
+            "image_title":    title,
+            "extracted_text": extracted,
+            "key_fields":     analysis.get("key_fields", {}),
+            "description":    analysis.get("description", ""),
+            "keywords":       analysis.get("keywords", []),
+            "language":       analysis.get("language", "english"),
+        }
+
+        msg = Message(
+            user_id=user.id,
+            category_id=category.id,
+            content=content,
+            message_type=MessageType("image"),
+            summary=title,
+            tags=tags,
+            created_at=ref,
+        )
+        db.add(msg)
+        await db.commit()
+        await db.refresh(msg)
+
+        await self._save_embedding(
+            msg.id, content, {"keywords": analysis.get("keywords", [])}, db
+        )
+
+        return {
+            "message_id":     msg.id,
+            "category":       "Remember",
+            "all_buckets":    ["Remember"],
+            "tags":           analysis.get("keywords", []),
+            "essence":        title,
+            "document_type":  analysis.get("document_type", "other"),
+            "extracted_text": extracted[:100] if extracted else "",
+            "connections":    [],
+            "due_date":       None,
+            "events":         [],
+            "priority":       "normal",
+        }

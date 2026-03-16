@@ -59,30 +59,27 @@ class TelegramClient(MessagingClient):
             response.raise_for_status()
             return response.json()
     
+
     async def send_image(
         self,
         to: str,
         image_url: str,
         caption: Optional[str] = None,
+        parse_mode: str = "Markdown",
         **kwargs
     ) -> Dict[str, Any]:
-        """Send photo message"""
-        
-        url = f"{self.base_url}/sendPhoto"
-        
-        payload = {
-            "chat_id": to,
-            "photo": image_url
-        }
-        
+        url     = f"{self.base_url}/sendPhoto"
+        payload = {"chat_id": to, "photo": image_url}
         if caption:
-            payload["caption"] = caption
-        
+            payload["caption"]    = caption
+            payload["parse_mode"] = parse_mode
+
         async with httpx.AsyncClient() as client:
             response = await client.post(url, json=payload)
             response.raise_for_status()
             return response.json()
-    
+
+
     async def send_document(
         self,
         to: str,
