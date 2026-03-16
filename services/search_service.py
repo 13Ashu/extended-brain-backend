@@ -232,7 +232,7 @@ class SearchService:
 
         print(f"[search] query={query!r} date_from={date_from} date_to={date_to} is_query={is_query} is_todo={_is_todo_query(query)}")
         # ── 5. Direct todo fetch ──────────────────────────────────────
-        if _is_todo_query(query) or is_query:
+        if _is_todo_query(query):
             fetch_from  = date_from or str(today)
             fetch_to    = date_to   or str(today)
             todo_result = await self._fetch_todos_direct(

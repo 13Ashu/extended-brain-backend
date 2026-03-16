@@ -730,12 +730,24 @@ async def send_todo_checklist(
 async def send_list_display(chat_id: str, search_result: Dict):
     """Send a named list as an interactive Telegram checklist."""
     from services.list_service import ListService
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    token     = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    results   = search_result.get("results", [])
+    list_name = search_result.get("list_name", "List")
 
-    list_msg = search_result.get("results", [{}])[0].get("list_message")
+    # FIX: handle empty results — list doesn't exist yet
+    if not results:
+        await _tg_send(
+            chat_id,
+            search_result.get(
+                "natural_response",
+                f"You don't have a *{list_name}* yet.\n\n"
+                f"Start by sending:\n`{list_name.lower()}:\n- item1\n- item2`"
+            )
+        )
+        return
+
+    list_msg = results[0].get("list_message")
     if not list_msg:
-        # Fallback: plain text
-        list_name = search_result.get("list_name", "List")
         await _tg_send(chat_id, f"📋 *{list_name}*\n\n_Nothing here yet._")
         return
 
@@ -761,7 +773,6 @@ async def _tg_send(chat_id: str, text: str, reply_markup: Optional[Dict] = None)
         payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient(timeout=10.0) as client:
         await client.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload)
-
 
 # ================== Message Processing ==================
 
