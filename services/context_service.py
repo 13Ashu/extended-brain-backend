@@ -105,17 +105,31 @@ class ContextService:
 
     async def set_checklist_context(
         self, user_id: int, message_id: int, date_from: str, date_to: str
-    ):
-        """Store which date a checklist message was showing."""
-        await self._store(f"checklist_ctx:{user_id}:{message_id}", {
-            "date_from": date_from,
-            "date_to":   date_to,
-        })
+    ) -> None:
+        """Store which date a checklist message was showing — used by refresh."""
+        try:
+            redis   = _get_redis()
+            payload = json.dumps({"date_from": date_from, "date_to": date_to})
+            await redis.set(
+                f"ctx:checklist:{user_id}:{message_id}",
+                payload,
+                ex=self.CONTEXT_TTL,
+            )
+        except Exception as e:
+            print(f"[context] Failed to set checklist context: {e}")
 
     async def get_checklist_context(
         self, user_id: int, message_id: int
     ) -> Optional[Dict]:
-        return await self._get(f"checklist_ctx:{user_id}:{message_id}")
+        """Retrieve the date context for a checklist message."""
+        try:
+            redis = _get_redis()
+            raw   = await redis.get(f"ctx:checklist:{user_id}:{message_id}")
+            if raw:
+                return json.loads(raw)
+        except Exception as e:
+            print(f"[context] Failed to get checklist context: {e}")
+        return None
 
 # Singleton
 context_service = ContextService()
