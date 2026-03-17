@@ -363,7 +363,27 @@ async def _handle_callback_query(callback: Dict):
         msg_id  = int(parts[1])
         minutes = int(parts[2]) if len(parts) > 2 else 1440
         await nudge_service.snooze_message(msg_id, minutes)
-        await _answer_callback(callback_id, f"⏰ Snoozed for {minutes // 60}h")
+
+        if minutes < 60:
+            snooze_label = f"{minutes} min"
+        elif minutes == 60:
+            snooze_label = "1 hr"
+        else:
+            snooze_label = f"{minutes // 60} hrs"
+
+        await _answer_callback(callback_id, f"⏰ Snoozed {snooze_label}")
+
+        # Remove buttons after snooze so message stays clean
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/editMessageReplyMarkup",
+                json={
+                    "chat_id":      chat_id,
+                    "message_id":   tg_message_id,
+                    "reply_markup": {"inline_keyboard": []},
+                },
+            )
 
     # ── subtask:<message_id>:<index> ──────────────────────────────
     elif callback_data.startswith("subtask:"):
@@ -425,18 +445,48 @@ async def _handle_callback_query(callback: Dict):
         proj_name = parts[2]
         await project_service.assign_project(msg_id, proj_name)
         await _answer_callback(callback_id, f"📁 Added to {proj_name}")
-        # Resolve user_id from chat_id to clear confirmation
+
+        # FIX: remove the Yes/No buttons and update message text
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json={
+                    "chat_id":      chat_id,
+                    "message_id":   tg_message_id,
+                    "text":         f"📁 Added to project *{proj_name}*",
+                    "parse_mode":   "Markdown",
+                    "reply_markup": {"inline_keyboard": []},  # clears buttons
+                },
+            )
+
         async with async_session_maker() as session:
             user = await session.scalar(select(User).where(User.telegram_chat_id == chat_id))
             if user:
                 await context_service.clear_pending_confirmation(user.id)
 
     elif callback_data.startswith("proj_no:"):
-        await _answer_callback(callback_id, "OK, not grouped")
+        await _answer_callback(callback_id, "OK, skipped")
+
+        # FIX: remove the Yes/No buttons
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json={
+                    "chat_id":      chat_id,
+                    "message_id":   tg_message_id,
+                    "text":         "📁 _Not added to any project_",
+                    "parse_mode":   "Markdown",
+                    "reply_markup": {"inline_keyboard": []},  # clears buttons
+                },
+            )
+
         async with async_session_maker() as session:
             user = await session.scalar(select(User).where(User.telegram_chat_id == chat_id))
             if user:
                 await context_service.clear_pending_confirmation(user.id)
+
 
     elif callback_data == "noop":
         # Section divider button — acknowledge silently
@@ -1516,7 +1566,6 @@ async def _handle_confirmation_yes(
 
 
 # ================== Helpers ==================
-
 def _build_save_response(result: Dict) -> str:
     category    = result.get("category", "Notes")
     all_buckets = result.get("all_buckets", [category])
@@ -1525,20 +1574,27 @@ def _build_save_response(result: Dict) -> str:
     essence     = result.get("essence") or result.get("summary", "")
     split_count = result.get("split_count", 0)
 
+    # Build search hint from essence
+    search_hint = essence[:30].strip() if essence else category
+    search_tip  = (
+        f"\n\n_Search anytime:_ `search: {search_hint}` _or_ `{search_hint}?`"
+    )
+
     if remind_at:
         remind_dt = datetime.fromisoformat(remind_at).replace(
             tzinfo=ZoneInfo("UTC")
         ).astimezone(ZoneInfo("Asia/Kolkata"))
         time_str = remind_dt.strftime("%I:%M %p, %d %b")
-        return f"✓ Saved & reminder set!\n\n⏰ {time_str} IST\n📝 {essence}"
+        return f"✓ Saved & reminder set!\n\n⏰ {time_str} IST\n📝 {essence}{search_tip}"
 
     if split_count > 1:
-        return f"✓ Saved {split_count} tasks!\n\n📝 {essence}"
+        return f"✓ Saved {split_count} tasks!\n\n📝 {essence}{search_tip}"
 
     if "To-Do" in all_buckets and due_date:
-        return f"✓ Added to To-Do!\n\n📝 {essence}\n📅 {due_date}"
+        return f"✓ Added to To-Do!\n\n📝 {essence}\n📅 {due_date}{search_tip}"
 
-    return f"✓ Saved to '{category}'!\n\n📝 {essence}"
+    return f"✓ Saved to '{category}'!\n\n📝 {essence}{search_tip}"
+
 
 
 def format_search_results(search_data) -> str:

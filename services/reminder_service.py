@@ -161,48 +161,86 @@ class ReminderService:
             return
 
         local_time = self._to_local_time(reminder.remind_at, reminder.timezone)
+        priority   = getattr(reminder, "priority", "normal") or "normal"
+        alarm_icon = "🚨" if priority in ("high", "urgent") else "⏰"
+
         text = (
-            f"⏰ *Reminder*\n\n"
+            f"{alarm_icon} *Reminder*\n\n"
             f"{reminder.task}\n\n"
             f"_Scheduled for {local_time}_"
         )
 
-        success = await send_telegram(
-            chat_id=reminder.telegram_chat_id,
-            text=text,
-            token=self.telegram_token,
-        )
+        reply_markup = {
+            "inline_keyboard": [[
+                {
+                    "text":          "✅ Done",
+                    "callback_data": f"done:{reminder.message_id}",
+                },
+                {
+                    "text":          "⏰ 30 min",
+                    "callback_data": f"snooze:{reminder.message_id}:30",
+                },
+                {
+                    "text":          "⏰ 1 hr",
+                    "callback_data": f"snooze:{reminder.message_id}:60",
+                },
+            ]]
+        }
 
-        if success:
-            await db.execute(
-                update(Reminder)
-                .where(Reminder.id == reminder.id)
-                .values(is_sent=True, sent_at=datetime.utcnow())
+        token = self.telegram_token
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id":              reminder.telegram_chat_id,
+                    "text":                 text,
+                    "parse_mode":           "Markdown",
+                    "disable_notification": False,
+                    "reply_markup":         reply_markup,
+                },
             )
-            # Mark the linked todo as done so it disappears from the checklist
-            # Only for non-recurring reminders
-            if reminder.message_id and not (reminder.recurrence):
-                try:
-                    from sqlalchemy import select as sel
-                    msg = await db.scalar(
-                        sel(Message).where(Message.id == reminder.message_id)
-                    )
-                    if msg:
-                        tags = dict(msg.tags or {})
-                        tags["done"]    = True
-                        tags["done_at"] = datetime.utcnow().isoformat()
-                        await db.execute(
-                            update(Message)
-                            .where(Message.id == reminder.message_id)
-                            .values(tags=tags)
+            data      = resp.json()
+            tg_msg_id = data.get("result", {}).get("message_id")
+
+            # Pin high priority reminders for extra visibility
+            if priority in ("high", "urgent") and tg_msg_id:
+                await client.post(
+                    f"https://api.telegram.org/bot{token}/pinChatMessage",
+                    json={
+                        "chat_id":              reminder.telegram_chat_id,
+                        "message_id":           tg_msg_id,
+                        "disable_notification": False,
+                    },
+                )
+
+        if data.get("ok"):
+            async with async_session_maker() as session:
+                await session.execute(
+                    update(Reminder)
+                    .where(Reminder.id == reminder.id)
+                    .values(is_sent=True, sent_at=datetime.utcnow())
+                )
+                # Mark linked todo done only for non-recurring reminders
+                if reminder.message_id and not reminder.recurrence:
+                    try:
+                        msg = await session.scalar(
+                            select(Message).where(Message.id == reminder.message_id)
                         )
-                except Exception as e:
-                    print(f"[reminder] Could not mark todo done: {e}")
-            await db.commit()
+                        if msg:
+                            tags = dict(msg.tags or {})
+                            tags["reminded_at"] = datetime.utcnow().isoformat()
+                            # Don't auto-mark done — let user tap the Done button
+                            await session.execute(
+                                update(Message)
+                                .where(Message.id == reminder.message_id)
+                                .values(tags=tags)
+                            )
+                    except Exception as e:
+                        print(f"[reminder] Could not update todo tags: {e}")
+                await session.commit()
             print(f"[reminder] ✅ Sent #{reminder.id} — {reminder.task}")
         else:
-            print(f"[reminder] ❌ Failed to send #{reminder.id}")
-
+            print(f"[reminder] ❌ Failed to send #{reminder.id}: {data}")
     # ──────────────────────────────────────────────────────────────
     # Snooze / Cancel / List
     # ──────────────────────────────────────────────────────────────
