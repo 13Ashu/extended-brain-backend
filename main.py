@@ -1093,7 +1093,6 @@ async def process_webhook_message(webhook_data: Dict):
                         list_intent = await ls.detect_list_intent(content)
 
                         if list_intent and list_intent["intent"] == "create_or_add":
-                            # Route directly to list service
                             msg, added, was_created = await ls.create_or_add(
                                 user.id,
                                 list_intent["list_name"],
@@ -1101,19 +1100,24 @@ async def process_webhook_message(webhook_data: Dict):
                                 list_intent["items"],
                                 db,
                             )
-                            tags  = msg.tags if isinstance(msg.tags, dict) else {}
-                            total = len(tags.get("subtasks", []))
-                            action = "Created" if was_created else "Updated"
-                            response = (
-                                f"✓ {action} *{list_intent['list_name']}*!\n\n"
-                                f"📝 {added} item(s) added · {total} total"
+                            action    = "Created" if was_created else "Updated"
+                            list_name = list_intent["list_name"]
+                            total     = len((msg.tags or {}).get("subtasks", []))
+
+                            await messaging_client.send_message(
+                                chat_id,
+                                f"✓ {action} *{list_name}*  ·  {added} added · {total} total"
                             )
-                            # Send the interactive checklist immediately
-                            if Config.get_messaging_platform() == MessagingPlatform.TELEGRAM:
-                                from services.list_service import ListService as LS
-                                text_, reply_markup = LS(cerebras_client).format_for_telegram(msg)
-                                await _tg_send(chat_id, text_, reply_markup)
-                                continue
+                            await send_list_display(chat_id, {
+                                "results": [{
+                                    "list_message": msg,
+                                    "essence":      list_name,
+                                }],
+                                "is_list":   True,
+                                "list_name": list_name,
+                            })
+                            await context_service.clear_search_context(user.id)
+                            continue
 
                         else:
 
@@ -1147,9 +1151,43 @@ async def process_webhook_message(webhook_data: Dict):
                                         continue
                                     response = format_search_results(search_result)
                                 else:
-                                    response = _build_save_response(result)
-                                    # Only spawn project check for content-bearing buckets
                                     all_buckets = result.get("all_buckets", [])
+
+                                    # ── List save → show full updated checklist immediately ───
+                                    if "List" in all_buckets and result.get("message_id"):
+                                        async with async_session_maker() as session:
+                                            from sqlalchemy import select as sel
+                                            list_msg = await session.scalar(
+                                                sel(Message).where(Message.id == result["message_id"])
+                                            )
+                                        if list_msg:
+                                            from services.list_service import ListService
+                                            ls        = ListService(cerebras_client)
+                                            was_created = result.get("items_added") == result.get("total_items")
+                                            action      = "Created" if was_created else "Updated"
+                                            list_name   = result.get("list_name", "List")
+                                            added       = result.get("items_added", 0)
+                                            total       = result.get("total_items", 0)
+
+                                            # Send header confirmation first
+                                            await messaging_client.send_message(
+                                                chat_id,
+                                                f"✓ {action} *{list_name}*  ·  {added} added · {total} total"
+                                            )
+                                            # Then send full interactive checklist
+                                            await send_list_display(chat_id, {
+                                                "results": [{
+                                                    "list_message": list_msg,
+                                                    "essence":      list_name,
+                                                }],
+                                                "is_list":   True,
+                                                "list_name": list_name,
+                                            })
+                                            await context_service.clear_search_context(user.id)
+                                            continue
+
+                                    # ── All other saves ───────────────────────────────────────
+                                    response = _build_save_response(result)
                                     skip_buckets = {"Track", "List", "Random"}
                                     if not set(all_buckets) <= skip_buckets:
                                         asyncio.create_task(

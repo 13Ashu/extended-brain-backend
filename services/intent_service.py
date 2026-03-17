@@ -216,12 +216,24 @@ class IntentService:
             "  - A reminder IS ALWAYS also a todo → both save_as_todo AND set_reminder = true\n"
             "  - An event with time IS ALWAYS also a todo → both save_as_event AND save_as_todo = true\n"
             "  - set_reminder = true ONLY when a specific time is mentioned\n"
-            "  - save_as_list = true ONLY for named lists with actual items (shopping/bag/packing)\n"
-            "  - 'todo list for tomorrow' is is_query=true (they want to SEE their todos)\n"
-            "  - 'new todo list for tomorrow: task1, task2' is save_as_todo=true (saving tasks)\n"
             "  - Time without explicit date → assume TODAY\n"
             "  - Extract ALL tasks even from unstructured prose\n"
             "  - Priority: urgent/asap/critical/important → high, else normal\n\n"
+            "  NAMED HEADER RULE (most important for Header:\\n- items structure):\n"
+            "  A header has its OWN IDENTITY if it refers to a specific named thing:\n"
+            "  a project, place, brand, person, product, or feature set.\n"
+            "  A header is NEUTRAL if it's just a time/category label with no specific identity.\n\n"
+            "  Named header + bullet items = save_as_list=true\n"
+            "    (items belong to that named thing as a collection)\n"
+            "  Named header + bullet items WITH time/date = save_as_list=true AND save_as_todo=true\n"
+            "    (items are both a collection AND actionable tasks)\n"
+            "  Neutral header + bullet items = save_as_todo=true (NOT save_as_list)\n\n"
+            "  NAMED headers (have own identity) → save_as_list:\n"
+            "    'Extended minds changes', 'Japan trip', 'Grocery', 'Dmart',\n"
+            "    'House renovation', 'Birthday party', 'Project X', 'Client ABC'\n"
+            "  NEUTRAL headers (time/category labels) → save_as_todo:\n"
+            "    'Todo', 'Tasks', 'Today', 'Tomorrow', 'This week',\n"
+            "    'Office tasks', 'Urgent', 'Things to do', 'New todo list'\n\n"
             "Return ONLY this JSON (no markdown):\n"
             "{\n"
             '  "actions": {\n'
@@ -247,38 +259,82 @@ class IntentService:
             '  "essence": "one sentence summary"\n'
             "}\n\n"
             "EXAMPLES:\n\n"
+
+            # ── Reminder ──────────────────────────────────────────────────
             f'Message: "remind me to call mom at 10pm"\n'
             f'→ actions: save_as_todo=true, set_reminder=true\n'
             f'  tasks: [{{"task":"call mom","due_date":"{today}","time":"22:00","priority":"normal"}}]\n'
             f'  reminder: {{"due_date":"{today}","time":"22:00","priority":"normal"}}\n\n'
+
+            # ── Event ─────────────────────────────────────────────────────
             f'Message: "dentist appointment Friday 3pm"\n'
             f'→ actions: save_as_todo=true, save_as_event=true, set_reminder=true\n'
             f'  tasks: [{{"task":"dentist appointment","due_date":"{day_map.get("friday", tomorrow)}","time":"15:00","priority":"normal"}}]\n'
             f'  event: {{"title":"dentist appointment","due_date":"{day_map.get("friday", tomorrow)}","time":"15:00","people":[]}}\n'
             f'  reminder: {{"due_date":"{day_map.get("friday", tomorrow)}","time":"15:00","priority":"normal"}}\n\n'
-            f'Message: "New todo list for tomorrow:\\nWork on meraki 4hrs\\nFollow up with Aditi\\nOrder clothes"\n'
+
+            # ── Neutral header → Todo (NOT list) ──────────────────────────
+            f'Message: "New todo list for tomorrow:\\n- Work on meraki 4hrs\\n- Follow up with Aditi\\n- Order clothes"\n'
             f'→ actions: save_as_todo=true (NOT save_as_list)\n'
+            f'  reasoning: "New todo list for tomorrow" is a NEUTRAL label — time reference, no specific identity\n'
             f'  tasks: [{{"task":"Work on meraki matter for 4 hours","due_date":"{tomorrow}","time":null,"priority":"normal"}},{{"task":"Follow up with Aditi","due_date":"{tomorrow}","time":null,"priority":"normal"}},{{"task":"Order clothes","due_date":"{tomorrow}","time":null,"priority":"normal"}}]\n\n'
+
+            # ── Neutral header with times → Todo ──────────────────────────
             f'Message: "My todo for today: - do x task at 3 pm, -do y task at 7 pm"\n'
             f'→ actions: save_as_todo=true, set_reminder=true\n'
+            f'  reasoning: "My todo for today" is a NEUTRAL time label\n'
             f'  tasks: [{{"task":"do x task","due_date":"{today}","time":"15:00","priority":"normal"}},{{"task":"do y task","due_date":"{today}","time":"19:00","priority":"normal"}}]\n'
-            f'  reminder: null (multiple tasks with different times — each task has its own time)\n\n'
+            f'  reminder: null (multiple tasks each have own time)\n\n'
+
+            # ── Named header → List (shopping) ────────────────────────────
             f'Message: "dmart shopping:\\n- Pen\\n- coffee mug\\n- glue"\n'
             f'→ actions: save_as_list=true\n'
+            f'  reasoning: "dmart shopping" is a NAMED thing — specific store identity\n'
             f'  list: {{"list_name":"Dmart Shopping List","list_type":"shopping","items":["Pen","coffee mug","glue"]}}\n\n'
+
+            # ── Named header → List (custom/project) ──────────────────────
+            f'Message: "Extended minds changes:\\n- Image with space\\n- improve search message"\n'
+            f'→ actions: save_as_list=true\n'
+            f'  reasoning: "Extended minds changes" is a NAMED project — has its own identity\n'
+            f'  list: {{"list_name":"Extended Minds Changes List","list_type":"custom","items":["Image with space","improve search message"]}}\n\n'
+
+            # ── Named header + actionable items with dates → List AND Todo ─
+            f'Message: "Japan trip:\\n- book flights\\n- get visa\\n- pack bags"\n'
+            f'→ actions: save_as_list=true, save_as_todo=true\n'
+            f'  reasoning: "Japan trip" is a NAMED thing AND items are also actionable tasks\n'
+            f'  list: {{"list_name":"Japan Trip List","list_type":"packing","items":["book flights","get visa","pack bags"]}}\n'
+            f'  tasks: [{{"task":"book flights","due_date":null,"time":null,"priority":"normal"}},{{"task":"get visa","due_date":null,"time":null,"priority":"normal"}},{{"task":"pack bags","due_date":null,"time":null,"priority":"normal"}}]\n\n'
+
+            # ── Named header + items with explicit time → List AND Todo ───
+            f'Message: "Client ABC meeting prep:\\n- send agenda by 9am\\n- book conference room"\n'
+            f'→ actions: save_as_list=true, save_as_todo=true, set_reminder=true\n'
+            f'  reasoning: "Client ABC meeting prep" is a NAMED thing AND items have time ref\n'
+            f'  list: {{"list_name":"Client ABC Meeting Prep List","list_type":"custom","items":["send agenda by 9am","book conference room"]}}\n'
+            f'  tasks: [{{"task":"send agenda","due_date":"{today}","time":"09:00","priority":"normal"}},{{"task":"book conference room","due_date":"{today}","time":null,"priority":"normal"}}]\n'
+            f'  reminder: {{"due_date":"{today}","time":"09:00","priority":"normal"}}\n\n'
+
+            # ── Single task with time ──────────────────────────────────────
             f'Message: "pay sabziwala at 10pm"\n'
             f'→ actions: save_as_todo=true, set_reminder=true\n'
             f'  tasks: [{{"task":"pay sabziwala","due_date":"{today}","time":"22:00","priority":"normal"}}]\n'
             f'  reminder: {{"due_date":"{today}","time":"22:00","priority":"normal"}}\n\n'
+
+            # ── Query: todo ───────────────────────────────────────────────
             f'Message: "Todo list for tomorrow?"\n'
             f'→ actions: is_query=true\n'
             f'  query: {{"query_text":"todos for tomorrow","date_hint":"tomorrow","list_name":null}}\n\n'
+
+            # ── Query: named list ─────────────────────────────────────────
             f'Message: "Show dmart list?"\n'
             f'→ actions: is_query=true\n'
             f'  query: {{"query_text":"dmart shopping list","date_hint":null,"list_name":"Dmart Shopping List"}}\n\n'
+
+            # ── Track ─────────────────────────────────────────────────────
             f'Message: "weight 74kg, slept 7 hours, ran 3km"\n'
             f'→ actions: save_as_track=true\n'
             f'  track: {{"logs":[{{"metric":"weight","value":"74","unit":"kg"}},{{"metric":"sleep","value":"7","unit":"hours"}},{{"metric":"run","value":"3","unit":"km"}}]}}\n\n'
+
+            # ── Note ──────────────────────────────────────────────────────
             f'Message: "wifi password is airtel123"\n'
             f'→ actions: save_as_note=true\n'
             f'  note: {{"content":"wifi password is airtel123","keywords":["wifi","password"]}}\n\n'

@@ -1,0 +1,79 @@
+User sends a message
+        │
+        ▼
+main.py: process_webhook_message
+        │
+        ├── ends with "?" → _is_search_query = True → search path (skip save entirely)
+        ├── starts with "image:" → image search path
+        ├── starts with "briefing:", "project:", "subtask:", etc → command path
+        │
+        ▼
+SAVE PATH
+        │
+        ▼
+① List intent check (main.py)
+   ListService.detect_list_intent(content)
+        │
+        ├── LLM returns save_as_list=true + items exist
+        │       → create/add to named list → DONE
+        │
+        └── not a list → continue
+        │
+        ▼
+② Subtask intent check (main.py)
+   subtask_service.detect_subtask_intent(content)
+        │
+        ├── found parent task match
+        │       → ask user "add these as subtasks to X?" → DONE
+        │
+        └── not a subtask → continue
+        │
+        ▼
+③ Recurring task check (main.py)
+   recurrence_service.is_recurring(content)
+        │
+        ├── "every monday", "daily at 8am" etc
+        │       → create recurrence → DONE
+        │
+        └── not recurring → continue
+        │
+        ▼
+④ MessageProcessor.process() — main classification
+        │
+        ▼
+   IntentService.parse(content)  ← SINGLE LLM CALL
+        │
+        │   Returns:
+        │   actions = {
+        │     save_as_todo:  bool
+        │     save_as_event: bool
+        │     save_as_note:  bool
+        │     save_as_idea:  bool
+        │     save_as_track: bool
+        │     save_as_list:  bool  ← second chance to catch lists
+        │     set_reminder:  bool
+        │     is_query:      bool
+        │   }
+        │   + structured data for each action
+        │
+        ├── is_query=true → return _is_query marker → search path
+        │
+        ├── save_as_list=true + items exist
+        │       → _handle_list_save_direct → DONE
+        │
+        ├── save_as_todo=true + tasks exist
+        │   │
+        │   ├── multiple tasks → _process_tasks (saves each as separate row)
+        │   └── single task   → _process_single_task
+        │           │
+        │           └── set_reminder=true + time → ReminderService.create()
+        │
+        ├── save_as_track=true → _process_track → DONE
+        │
+        ├── save_as_note=true → _save_single("Remember") → DONE
+        │
+        ├── save_as_idea=true → _save_single("Ideas") → DONE
+        │
+        └── none matched → _process_fallback
+                │
+                └── old _full_analysis LLM call → save with best-guess bucket
