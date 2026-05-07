@@ -1814,6 +1814,50 @@ async def handle_category_command(phone: str, content: str, db: AsyncSession) ->
 
 # ================== REST API Endpoints ==================
 
+@app.get("/api/messages/recent")
+async def get_recent_messages(
+    limit: int = 100,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the user's most recent messages, newest first."""
+    result = await db.execute(
+        select(Message, Category)
+        .outerjoin(Category, Message.category_id == Category.id)
+        .where(Message.user_id == current_user.id)
+        .order_by(Message.created_at.desc())
+        .limit(min(limit, 200))
+    )
+    rows = result.all()
+
+    messages = []
+    for msg, cat in rows:
+        tags = msg.tags if isinstance(msg.tags, dict) else {}
+        bucket = (
+            tags.get("primary_bucket")
+            or tags.get("intent_bucket")
+            or (cat.name if cat else "Random")
+        )
+        messages.append({
+            "id":           msg.id,
+            "content":      msg.content,
+            "essence":      msg.summary or msg.content[:80],
+            "message_type": msg.message_type.value if msg.message_type else "text",
+            "media_url":    msg.media_url,
+            "category":     bucket,
+            "all_buckets":  tags.get("all_buckets", [bucket]),
+            "priority":     tags.get("priority", "normal"),
+            "tags":         tags,
+            "created_at":   msg.created_at.isoformat(),
+            "due_date":     tags.get("due_date"),
+            "event_time":   tags.get("event_time"),
+            "events":       tags.get("events", []),
+            "starred":      tags.get("starred", False),
+        })
+
+    return {"success": True, "results": messages, "total": len(messages)}
+
+
 @app.post("/api/messages/capture")
 async def capture_message(
     message: MessageCreate,
