@@ -301,6 +301,29 @@ class MessageProcessor:
             )
 
         # ── Fallback ──────────────────────────────────────────────
+        # When intent LLM 429'd (all actions False), try pure-regex list
+        # detection before saving as a generic note/random entry.
+        if not any(actions.values()):
+            list_result = self.list_service._regex_detect(content)
+            if list_result:
+                if list_result["intent"] == "create_or_add" and list_result.get("items"):
+                    return await self._handle_list_save_direct(
+                        user,
+                        list_result["list_name"],
+                        list_result["list_type"],
+                        list_result["items"],
+                        db,
+                    )
+                elif list_result["intent"] == "show":
+                    return {
+                        "_is_query": True,
+                        "query_data": {
+                            "query_text": list_result["list_name"],
+                            "date_hint":  None,
+                            "list_name":  list_result["list_name"],
+                        },
+                    }
+
         return await self._process_fallback(
             user=user, content=content, message_type=message_type,
             media_url=media_url, db=db, ref=ref
@@ -794,7 +817,11 @@ Return ONLY this JSON:
   "related_concepts": []
 }}"""
 
-        response = await self.cerebras.chat(prompt, max_tokens=1500)
+        try:
+            response = await self.cerebras.chat(prompt, max_tokens=1500)
+        except Exception as e:
+            print(f"[processor] _full_analysis LLM failed: {e}")
+            response = {}
 
         response.setdefault("buckets", fast_buckets)
         response.setdefault("essence", content[:100])

@@ -43,26 +43,55 @@ SKIP_WORDS = {
     "for", "of", "in", "on", "at", "to", "from",
 }
 
-# Patterns that clearly indicate list CREATE/ADD intent
-# Must have a name AND bullet items
-LIST_HEADER_PATTERNS = [
-    # "Shopping list for mall:\n- item"  or  "dmart shopping:\n- item"
-    r"^([\w][\w\s\-]+?):\s*\n\s*[-*•]",
-    # "add to/in X list: ..."
-    r"add (?:to|in|into) ([\w\s]+(?:list|bag))[\s:,]",
-]
+# Words/phrases that flag a name as a neutral time/category label (NOT a named list)
+_BLOCKED_NAME_WORDS = {
+    "todo", "to-do", "to do", "task", "tasks", "remind", "reminder",
+    "update", "notes", "note", "things", "items",
+    "today", "tomorrow", "morning", "evening", "night",
+    "urgent", "important", "priority", "agenda",
+}
+
+# Signals that confirm a name refers to a list-like thing
+LIST_SIGNALS = {
+    # Generic
+    "list", "lists", "bag", "checklist",
+    # Shopping
+    "shopping", "grocery", "groceries", "supermarket", "store",
+    # Stores / delivery apps
+    "dmart", "mall", "zepto", "blinkit", "swiggy", "amazon",
+    "flipkart", "bigbasket", "instamart", "dunzo",
+    # Packing / travel
+    "packing", "pack", "travel", "trip", "luggage", "vacation",
+    # Media
+    "movies", "movie", "watch", "watching", "shows", "series",
+    # Reading
+    "reading", "books", "book",
+}
 
 # Patterns that indicate SHOW intent
 LIST_SHOW_PATTERNS = [
     # "show my dmart list today" / "get shopping list" / "give mall list"
-    r"(?:show|get|give|display)\s+(?:my\s+|the\s+)?(\w[\w\s\-]+?(?:list|bag))(?:\s+today|\s+now)?\s*\??$",
+    r"(?:show|get|give|display|open)\s+(?:my\s+|the\s+)?(\w[\w\s\-]+?(?:list|bag))(?:\s+today|\s+now)?\s*\??$",
     # "my dmart shopping list?" / "my bag list today?"
     r"^(?:my\s+)?(\w[\w\s\-]+?(?:list|bag))(?:\s+today|\s+now)?\s*\?+\s*$",
     # "whats in my shopping list" / "what is in my bag list"
     r"what(?:\'s| is) (?:in|on) (?:my\s+|the\s+)?([\w][\w\s\-]+?(?:list|bag))",
-    # bare "dmart list?" or "shopping?"
+    # bare "dmart list?" or "movie list?"
     r"^(\w[\w\s\-]+?(?:list|bag))(?:\s+today|\s+now)?\s*\?+\s*$",
+    # "show me my X list"
+    r"show\s+me\s+(?:my\s+|the\s+)?(\w[\w\s\-]+?(?:list|bag))",
 ]
+
+
+def _name_blocked(name: str) -> bool:
+    """Return True if name looks like a neutral time/category label, not a named list."""
+    words = set(name.lower().split())
+    return bool(words & _BLOCKED_NAME_WORDS) or "to-do" in name or "to do" in name
+
+
+def _has_list_signal(text: str) -> bool:
+    """Return True if text contains a word that strongly suggests a list context."""
+    return any(sig in text for sig in LIST_SIGNALS)
 
 def _classify_list_type(name: str) -> str:
     lc = name.lower()
@@ -130,8 +159,13 @@ def _extract_items_from_content(content: str) -> List[str]:
             continue
 
         # Bare line that looks like an item (short, no colon at end)
-        if line and not line.endswith(":") and len(line.split()) <= 8:
-            items.append(line)
+        if line and not line.endswith(":"):
+            if "," in line:
+                # comma-separated items on one line: "apple, banana, strawberry"
+                parts = [p.strip() for p in line.split(",") if p.strip()]
+                items.extend(parts)
+            elif len(line.split()) <= 8:
+                items.append(line)
 
     # Fallback: inline add — "add pen, mug and glue to list" / "add pen and mug to dmart"
     if not items:
@@ -166,19 +200,16 @@ class ListService:
         if lc.startswith(("search:", "find:", "/", "remind", "briefing:")):
             return None
         # CRITICAL: never intercept todo/task queries as list operations
-        # "New todo list for tomorrow" must go to message_processor, not list_service
         TODO_BLOCK = {"todo", "to-do", "to do", "task", "tasks", "pending"}
         if any(kw in lc for kw in TODO_BLOCK):
             return None
 
-        list_signals = [
-            "list", "bag", "packing", "shopping", "grocery",
-            "groceries", "checklist", "add to", "add in",
-            "dmart", "mall", "zepto", "blinkit", "swiggy",   # common store names
-        ]
-        # Also catch "add X to/in <name>" patterns even without "list" keyword
-        _add_pattern = re.search(r"\badd\b.{1,60}\bto\b", lc) or re.search(r"\bput\b.{1,60}\bin\b", lc)
-        if not any(sig in lc for sig in list_signals) and not _add_pattern:
+        # Also catch "add X to/in <name>" patterns even without list keyword
+        _add_pattern = (
+            re.search(r"\badd\b.{1,60}\bto\b", lc) or
+            re.search(r"\bput\b.{1,60}\bin\b", lc)
+        )
+        if not _has_list_signal(lc) and not _add_pattern:
             return None
 
         # ── Primary: LLM ──────────────────────────────────────────
@@ -280,41 +311,124 @@ class ListService:
         }
 
     def _regex_detect(self, content: str) -> Optional[Dict]:
-        """Regex fallback — used when LLM fails or for sync is_list_query."""
+        """
+        Pure-regex list detection. No LLM. Handles all common user formats:
+          1. "add ITEMS to LIST"               add eggs and milk to dmart
+          2. "add to LIST: ITEMS"              add to dmart list: eggs, milk
+          3. "add to LIST\\n- items"           add to grocery:\\n- butter
+          4. "NAME:\\n items"  (multi-line)    dmart:\\n- apple\\n- milk
+          5. "NAME\\n- items"  (no colon)      Mall shopping list\\n- shirt
+          6. "NAME: item1, item2"  (inline)    dmart: apple, milk, bread
+          7. show queries                      show my grocery list
+        """
         lc = content.lower().strip()
 
-        for pattern in LIST_HEADER_PATTERNS:
-            m = re.search(pattern, lc, re.MULTILINE)
-            if m:
-                raw_name = m.group(1).strip()
-                if any(kw in raw_name for kw in {"todo", "to-do", "task", "remind"}):
-                    continue
-                items = _extract_items_from_content(content)
-                if items:
-                    list_name = _normalize_list_name(raw_name)
-                    return {
-                        "intent":    "create_or_add",
-                        "list_name": list_name,
-                        "list_type": _classify_list_type(list_name),
-                        "items":     items,
-                    }
+        def _make(intent: str, raw_name: str, items: List[str]) -> Dict:
+            list_name = _normalize_list_name(raw_name)
+            return {
+                "intent":    intent,
+                "list_name": list_name,
+                "list_type": _classify_list_type(list_name),
+                "items":     items,
+            }
 
+        def _split(s: str) -> List[str]:
+            parts = re.split(r"[,;]|\band\b", s)
+            return [p.strip() for p in parts if 2 <= len(p.strip()) < 100]
+
+        # ── SHOW ──────────────────────────────────────────────────
         for pattern in LIST_SHOW_PATTERNS:
             m = re.search(pattern, lc)
             if m:
                 raw_name = m.group(1).strip()
-                if any(kw in raw_name for kw in {"todo", "to-do", "task", "pending"}):
+                if _name_blocked(raw_name):
                     continue
-                meaningful = [w for w in raw_name.split() if w not in SKIP_WORDS and len(w) > 1 and w != "list"]
+                meaningful = [
+                    w for w in raw_name.split()
+                    if w not in SKIP_WORDS and len(w) > 1 and w not in {"list", "bag"}
+                ]
                 if not meaningful:
                     continue
-                list_name = _normalize_list_name(raw_name)
-                return {
-                    "intent":    "show",
-                    "list_name": list_name,
-                    "list_type": _classify_list_type(list_name),
-                    "items":     [],
-                }
+                return _make("show", raw_name, [])
+
+        # ── ADD: "add/put ITEMS to/in LIST" ───────────────────────
+        # "add eggs and milk to dmart"
+        # "can you add sunscreen and sandals to japan packing list"
+        # "also add toothpaste to the dmart list"
+        m = re.match(
+            r"(?:(?:can\s+you|please|also|just)\s+)?"
+            r"(?:add|put)\s+"
+            r"(?!(?:to|in|into)\s)"          # exclude "add to X" handled below
+            r"(.+?)\s+(?:to|in|into)\s+"
+            r"(?:the\s+|my\s+)?([\w][\w\s\-\']+?)(?:\s*$|[.?!,\n])",
+            lc,
+        )
+        if m:
+            raw_items_str = m.group(1).strip()
+            raw_name      = m.group(2).strip()
+            if not _name_blocked(raw_name) and _has_list_signal(raw_name):
+                items = _split(raw_items_str)
+                if items:
+                    return _make("create_or_add", raw_name, items)
+
+        # ── ADD: "add to/in LIST: ITEMS" or "add to LIST\\n- items" ──
+        # "add to dmart list: eggs, milk, bread"
+        # "add in grocery list:\\n- butter\\n- jam"
+        m = re.match(
+            r"(?:add|put)\s+(?:to|in|into)\s+"
+            r"(?:the\s+|my\s+)?([\w][\w\s\-]+?)[\s:,]+(.+)$",
+            lc, re.DOTALL,
+        )
+        if m:
+            raw_name  = m.group(1).strip()
+            remainder = m.group(2).strip()
+            if not _name_blocked(raw_name):
+                first_line = remainder.split("\n")[0].strip()
+                items = _split(first_line) if first_line else []
+                if not items:
+                    items = _extract_items_from_content(f"{raw_name}:\n{remainder}")
+                if items:
+                    return _make("create_or_add", raw_name, items)
+
+        # ── CREATE: "NAME:\\n items" (multi-line, any item style) ─
+        # "dmart:\\n- apple\\n- milk"
+        # "grocery list:\\napple, milk, bread" (bare comma line)
+        # "Japan trip:\\n- book flights\\n- get visa"
+        m = re.search(r"^([\w][\w\s\-]+?):\s*\n(.+)", content, re.MULTILINE | re.DOTALL)
+        if m:
+            raw_name = m.group(1).strip().lower()
+            if not _name_blocked(raw_name):
+                items = _extract_items_from_content(content)
+                if items:
+                    has_bullets = bool(re.search(r"\n\s*[-*•]|\n\s*\d+[.)]", content))
+                    if _has_list_signal(raw_name) or has_bullets:
+                        return _make("create_or_add", raw_name, items)
+
+        # ── CREATE: "NAME\\n- items" (no colon, needs list signal) ─
+        # "Mall shopping list\\n- party shirt\\n- brown belt"
+        # "Packing list\\n1. passport\\n2. charger"
+        m = re.search(r"^([\w][\w\s\-]+?)\s*\n\s*[-*•\d]", content, re.MULTILINE)
+        if m:
+            raw_name = m.group(1).strip().lower()
+            if not _name_blocked(raw_name) and _has_list_signal(raw_name):
+                items = _extract_items_from_content(content)
+                if items:
+                    return _make("create_or_add", raw_name, items)
+
+        # ── CREATE: inline colon "NAME: item1, item2" (single line) ─
+        # "dmart: apple, milk, bread"
+        # "grocery list: eggs, butter, cheese"
+        # "movies to watch: interstellar, dune, oppenheimer"
+        # "zepto: soap, shampoo, toothpaste"
+        # Require list signal + ≥2 items to avoid "note: call mom" false positives
+        m = re.match(r"^([\w][\w\s\-]+?):\s*([^:\n]{5,})$", lc)
+        if m:
+            raw_name      = m.group(1).strip()
+            raw_items_str = m.group(2).strip()
+            if not _name_blocked(raw_name) and _has_list_signal(raw_name):
+                items = _split(raw_items_str)
+                if len(items) >= 2:
+                    return _make("create_or_add", raw_name, items)
 
         return None
 
