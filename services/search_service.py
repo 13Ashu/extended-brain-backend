@@ -181,6 +181,9 @@ class SearchService:
         limit: int = 15,
         category_filter: Optional[List[str]] = None,
     ) -> Dict:
+        if not query or not query.strip():
+            return {"results": [], "natural_response": "Please enter a search query."}
+
         user = await self._get_user(user_phone, db)
         if not user:
             return {"results": [], "natural_response": "User not found."}
@@ -548,7 +551,11 @@ Return ONLY this JSON:
   "search_focus": "content | summary | tags | all"
 }}"""
 
-        response = await self.cerebras.chat_lite(prompt, max_tokens=400)
+        try:
+            response = await self.cerebras.chat_lite(prompt, max_tokens=400)
+        except Exception as e:
+            print(f"[search] _expand_query failed ({type(e).__name__}): {e}")
+            response = {}
         response.setdefault("core_concepts", [])
         response.setdefault("keywords", [])
         response.setdefault("entities", [])
@@ -835,7 +842,11 @@ Instructions:
 
 Reply:"""
 
-        return await self.cerebras._chat_completion(prompt, max_tokens=300, temperature=0.2)
+        try:
+            return await self.cerebras._chat_completion(prompt, max_tokens=300, temperature=0.2)
+        except Exception as e:
+            print(f"[search] _natural_response failed ({type(e).__name__}): {e}")
+            return f"Found {len(results)} result(s) matching your query."
 
     # ──────────────────────────────────────────────────────────────
     # Helpers
