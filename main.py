@@ -831,13 +831,108 @@ TODO_SEARCH_KEYWORDS = {
     "pending", "checklist", "check list",
 }
 
+# Visual content signals → auto-route to image search
+IMAGE_CONTENT_SIGNALS = {
+    "boarding pass", "board pass", "flight ticket", "train ticket",
+    "bus ticket", "passport", "visa", "id card", "aadhar", "aadhaar",
+    "pan card", "driving licence", "driving license", "voter id",
+    "receipt", "invoice", "bill", "screenshot", "scan", "photo of",
+    "picture of", "pic of", "image of",
+}
+
+# Phrases that strongly indicate the user wants to retrieve something
+_RETRIEVAL_PHRASES = {
+    "show me", "show my", "find my", "find the", "get my", "get the",
+    "check my", "check the", "list my", "look up", "look for",
+    "what's my", "what is my", "where's my", "where is my",
+    "what did i", "what have i", "did i save", "did i add", "did i note",
+    "have i saved", "have i added", "do i have", "do i still have",
+    "anything about", "something about", "anything on", "something on",
+    "remind me of", "remind me what", "recall my", "recall what",
+    "my todo", "my todos", "my task", "my tasks", "my list", "my notes",
+    "my reminders", "my shopping", "my grocery", "my groceries",
+    "my events", "my ideas", "my password", "my pin", "my code",
+    "my schedule", "my plans", "my appointments", "my bookings",
+    "tell me about", "tell me what", "what about my",
+}
+
+# First words that (when starting a message) almost always signal retrieval
+_RETRIEVAL_STARTERS = {
+    "show", "find", "search", "recall", "retrieve",
+    "what", "where", "when", "who", "which", "how",
+    "did", "have", "is", "are", "was", "were",
+}
+
+# First words that are action/save verbs — never treat as retrieval even if
+# retrieval phrases appear later (e.g. "add X to my grocery list")
+_ACTION_STARTERS = {
+    "add", "put", "buy", "call", "send", "pay", "book", "order",
+    "create", "make", "write", "note", "save", "remind", "track",
+    "log", "schedule", "set", "plan", "prepare", "draft", "email",
+    "message", "text", "ping", "contact", "fix", "update", "check",
+    "submit", "upload", "share", "forward", "reserve", "register",
+    "transfer", "deposit", "clean", "wash", "read", "watch", "study",
+}
+
+# Overview / digest triggers
+_DIGEST_TRIGGERS = {
+    "overview", "digest", "summary", "summarize",
+    "what do i have", "what's on my plate", "what is on my plate",
+    "what's pending", "what is pending", "what's due", "what is due",
+    "show everything", "show me everything", "show all",
+    "what's new", "what is new", "catch me up",
+}
+
+
+def _is_digest_request(content: str) -> bool:
+    lc = content.lower().strip().rstrip("?").strip()
+    return lc in _DIGEST_TRIGGERS or any(lc.startswith(t) for t in _DIGEST_TRIGGERS)
+
+
+def _is_image_query(content: str) -> bool:
+    """Detect natural image retrieval without requiring 'image:' prefix."""
+    lc = content.lower().strip()
+    if lc.startswith("image:"):
+        return True
+    return any(sig in lc for sig in IMAGE_CONTENT_SIGNALS)
+
 
 def _is_search_query(content: str) -> bool:
     lc = content.lower().strip()
-    return (
-        lc.startswith(("search:", "find:", "get:"))
-        or lc.endswith("?")
-    )
+    first = lc.split()[0] if lc.split() else ""
+
+    # Action verbs at the start → always a save/action, never retrieval
+    # even if retrieval phrases appear later ("add X to my grocery list")
+    if first in _ACTION_STARTERS:
+        return False
+
+    # Legacy explicit syntax
+    if lc.startswith(("search:", "find:", "get:", "image:")) or lc.endswith("?"):
+        return True
+
+    # Digest / overview
+    if _is_digest_request(lc):
+        return True
+
+    # Strong retrieval phrases anywhere in the message
+    if any(phrase in lc for phrase in _RETRIEVAL_PHRASES):
+        return True
+
+    # First word is a clear retrieval verb or question word
+    if first in _RETRIEVAL_STARTERS:
+        # Guard against false positives like "did the dishes", "have a good day"
+        # Real retrieval almost always involves self-reference (my/i/me) or is a pure question
+        if any(w in lc for w in (" my ", " i ", " me ", " the ", " any ")):
+            return True
+        # Pure question starters (what, where, when, who, which) → always retrieval
+        if first in {"what", "where", "when", "who", "which"}:
+            return True
+
+    # Visual content → image retrieval
+    if _is_image_query(lc):
+        return True
+
+    return False
 
 
 def _extract_query(content: str) -> str:
@@ -1050,9 +1145,9 @@ async def process_webhook_message(webhook_data: Dict):
                         extracted_line    = f"\n📄 _{extracted_preview}..._" if extracted_preview else ""
 
                         response = (
-                            f"✓ Image saved!\n\n"
+                            f"✓ Got it! Image saved.\n\n"
                             f"🖼 *{title}*{extracted_line}\n\n"
-                            f"_Retrieve anytime:_ `image: {content or title}`"
+                            f"_Just ask me to find it anytime._"
                         )
                     except Exception as e:
                         print(f"[image] Processing failed: {e}")
@@ -1074,21 +1169,36 @@ async def process_webhook_message(webhook_data: Dict):
                 try:
 
                     # ── IMAGE RETRIEVAL ────────────────────────────────────────────
-                    if content.lower().strip().startswith("image:"):
+                    # Catches both explicit "image: X" and natural queries like
+                    # "show me my boarding pass" / "find that receipt"
+                    if _is_image_query(content):
+                        # Normalise: strip "image:" prefix if present, else use raw query
+                        lc_c = content.lower().strip()
+                        img_query = (
+                            content.split(":", 1)[1].strip()
+                            if lc_c.startswith("image:")
+                            else content
+                        )
                         search_result = await search_service.search(
-                            user_phone=user_phone, query=content, db=db
+                            user_phone=user_phone, query=f"image: {img_query}", db=db
                         )
                         results = search_result.get("results", [])
                         if not results:
                             response = search_result.get(
                                 "natural_response",
-                                "No images found. Try different keywords."
+                                "No images found matching that. Try describing what's in it."
                             )
                             await messaging_client.send_message(chat_id, response)
                         else:
                             await _send_image_results(chat_id, results)
                         continue
 
+
+                    # ── DIGEST / OVERVIEW ─────────────────────────────
+                    if _is_digest_request(content):
+                        response = await _build_digest(user, db)
+                        await messaging_client.send_message(chat_id, response)
+                        continue
 
                     # ── SEARCH ────────────────────────────────────────
                     if _is_search_query(content):
@@ -1260,6 +1370,84 @@ async def process_webhook_message(webhook_data: Dict):
 
 
 # ================== Feature Handlers ==================
+
+async def _build_digest(user: User, db: AsyncSession) -> str:
+    """Quick overview: today's todos, upcoming events, and recent saves."""
+    from datetime import date as date_type
+    today     = str(date_type.today())
+    tomorrow  = str(date_type.today() + timedelta(days=1))
+    week_end  = str(date_type.today() + timedelta(days=7))
+
+    # Today's pending todos
+    todo_res = await db.execute(
+        select(Message.summary, Message.tags)
+        .where(
+            Message.user_id == user.id,
+            text("messages.tags->>'due_date' = :today"),
+            text("(messages.tags->>'done')::boolean IS NOT TRUE"),
+            text("messages.tags->'all_buckets' @> '\"To-Do\"'::jsonb"),
+        )
+        .params(today=today)
+        .order_by(Message.created_at.asc())
+        .limit(5)
+    )
+    todos = todo_res.all()
+
+    # Upcoming events (next 7 days)
+    events_res = await db.execute(
+        select(Message.summary, Message.tags)
+        .where(
+            Message.user_id == user.id,
+            text("messages.tags->>'due_date' >= :today"),
+            text("messages.tags->>'due_date' <= :week_end"),
+            text("messages.tags->'all_buckets' @> '\"Events\"'::jsonb"),
+        )
+        .params(today=today, week_end=week_end)
+        .order_by(text("messages.tags->>'due_date' ASC"))
+        .limit(3)
+    )
+    events = events_res.all()
+
+    # Last 3 saves (any type)
+    recent_res = await db.execute(
+        select(Message.summary, Message.tags)
+        .where(Message.user_id == user.id)
+        .order_by(Message.created_at.desc())
+        .limit(3)
+    )
+    recent = recent_res.all()
+
+    lines = [f"📋 *Here's what's on your plate, {user.name.split()[0]}*\n"]
+
+    if todos:
+        lines.append("*Today's tasks:*")
+        for summary, tags in todos:
+            t = tags or {}
+            evt_time = t.get("event_time", "")
+            time_str = f" _{evt_time}_" if evt_time else ""
+            lines.append(f"• {summary or 'task'}{time_str}")
+    else:
+        lines.append("✅ No tasks due today.")
+
+    if events:
+        lines.append("\n*Upcoming events:*")
+        for summary, tags in events:
+            t = tags or {}
+            due = t.get("due_date", "")
+            evt_time = t.get("event_time", "")
+            when = f"{due} {evt_time}".strip()
+            lines.append(f"• {summary or 'event'} _{when}_")
+
+    if recent:
+        lines.append("\n*Recently saved:*")
+        for summary, tags in recent:
+            t = tags or {}
+            buckets = t.get("all_buckets", ["Note"])
+            label = buckets[0] if buckets else "Note"
+            lines.append(f"• [{label}] {summary or '…'}")
+
+    return "\n".join(lines)
+
 
 async def _build_status(user: User, db: AsyncSession) -> str:
     today      = datetime.utcnow().strftime("%Y-%m-%d")
@@ -1574,26 +1762,29 @@ def _build_save_response(result: Dict) -> str:
     essence     = result.get("essence") or result.get("summary", "")
     split_count = result.get("split_count", 0)
 
-    # Build search hint from essence
-    search_hint = essence[:30].strip() if essence else category
-    search_tip  = (
-        f"\n\n_Search anytime:_ `search: {search_hint}` _or_ `{search_hint}?`"
-    )
-
     if remind_at:
         remind_dt = datetime.fromisoformat(remind_at).replace(
             tzinfo=ZoneInfo("UTC")
         ).astimezone(ZoneInfo("Asia/Kolkata"))
         time_str = remind_dt.strftime("%I:%M %p, %d %b")
-        return f"✓ Saved & reminder set!\n\n⏰ {time_str} IST\n📝 {essence}{search_tip}"
+        return f"✓ Got it!\n\n📝 {essence}\n⏰ I'll remind you at {time_str} IST."
 
     if split_count > 1:
-        return f"✓ Saved {split_count} tasks!\n\n📝 {essence}{search_tip}"
+        return f"✓ Got it! Saved {split_count} tasks.\n\n📝 {essence}"
 
     if "To-Do" in all_buckets and due_date:
-        return f"✓ Added to To-Do!\n\n📝 {essence}\n📅 {due_date}{search_tip}"
+        return f"✓ Added to your to-do list!\n\n📝 {essence}\n📅 {due_date}"
 
-    return f"✓ Saved to '{category}'!\n\n📝 {essence}{search_tip}"
+    if "Ideas" in all_buckets:
+        return f"✓ Idea saved!\n\n💡 {essence}"
+
+    if "Track" in all_buckets:
+        return f"✓ Logged!\n\n📊 {essence}"
+
+    if "Events" in all_buckets:
+        return f"✓ Event saved!\n\n📅 {essence}"
+
+    return f"✓ Got it!\n\n📝 {essence}"
 
 
 

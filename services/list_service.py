@@ -133,11 +133,14 @@ def _extract_items_from_content(content: str) -> List[str]:
         if line and not line.endswith(":") and len(line.split()) <= 8:
             items.append(line)
 
-    # Fallback: comma-separated inline "add pen, mug, glue to list"
+    # Fallback: inline add — "add pen, mug and glue to list" / "add pen and mug to dmart"
     if not items:
-        m = re.search(r"(?:add|put)\s+(.+?)\s+(?:to|in|into)", content.lower())
+        m = re.search(r"(?:add|put)\s+(.+?)\s+(?:to|in|into)\b", content.lower())
         if m:
-            items = [i.strip() for i in re.split(r"[,;]", m.group(1)) if i.strip()]
+            raw = m.group(1).strip()
+            # Split on comma, semicolon, or " and "
+            parts = re.split(r"[,;]|\band\b", raw)
+            items = [p.strip() for p in parts if p.strip()]
 
     return [i for i in items if 0 < len(i) < 200]
 
@@ -171,8 +174,11 @@ class ListService:
         list_signals = [
             "list", "bag", "packing", "shopping", "grocery",
             "groceries", "checklist", "add to", "add in",
+            "dmart", "mall", "zepto", "blinkit", "swiggy",   # common store names
         ]
-        if not any(sig in lc for sig in list_signals):
+        # Also catch "add X to/in <name>" patterns even without "list" keyword
+        _add_pattern = re.search(r"\badd\b.{1,60}\bto\b", lc) or re.search(r"\bput\b.{1,60}\bin\b", lc)
+        if not any(sig in lc for sig in list_signals) and not _add_pattern:
             return None
 
         # ── Primary: LLM ──────────────────────────────────────────
@@ -192,17 +198,19 @@ class ListService:
             "You are classifying a user message for a personal knowledge base.\n\n"
             f"USER MESSAGE:\n{content}\n\n"
             "TASK: Classify into one of three categories:\n"
-            "1. create_or_add — user is creating a named list or adding items to one\n"
+            "1. create_or_add — user is creating a named list OR adding items to an existing one\n"
             "2. show — user wants to see/retrieve a named list\n"
             "3. none — regular note, todo, reminder, search, anything else\n\n"
             "RULES:\n"
-            "- A named list has a NAME and ITEMS under it (bullets or numbered)\n"
-            "- The list_name MUST preserve the context word: dmart→Dmart, mall→Mall, japan→Japan\n"
-            "- For show intent: infer full list name from query (dmart list → Dmart Shopping List)\n"
+            "- A named list has a NAME and ITEMS (bullets, numbered, or comma-separated inline)\n"
+            "- The list_name MUST preserve the context word: dmart→Dmart, mall→Mall, japan→Japan trip\n"
+            "- For show intent: infer full list name (dmart list → Dmart Shopping List)\n"
             "- todo batch with action items is NOT a list → none\n"
             "- reminders, notes, searches are NOT lists → none\n"
-            "- Extract ALL bullet/numbered items, never include the header line in items\n\n"
-            "EXAMPLES (study these carefully):\n\n"
+            "- Extract ALL items; never include the header line in items\n"
+            "- For inline adds ('add eggs and milk to dmart'), items = ['eggs', 'milk']\n"
+            "- Split items on comma, semicolon, and the word 'and'\n\n"
+            "EXAMPLES (study carefully):\n\n"
             "Input: dmart shopping:\n- Pen\n- coffee mug\n- glue\n"
             'Output: {"intent":"create_or_add","list_name":"Dmart Shopping List","list_type":"shopping","items":["Pen","coffee mug","glue"]}\n\n'
             "Input: My shopping list for mall:\n- party shirt\n- brown belt\n"
@@ -211,6 +219,18 @@ class ListService:
             'Output: {"intent":"create_or_add","list_name":"Exam Bag List","list_type":"bag","items":["pencil","eraser","graph book"]}\n\n'
             "Input: add to dmart list: eggs, milk, bread\n"
             'Output: {"intent":"create_or_add","list_name":"Dmart Shopping List","list_type":"shopping","items":["eggs","milk","bread"]}\n\n'
+            "Input: add eggs and milk to dmart\n"
+            'Output: {"intent":"create_or_add","list_name":"Dmart Shopping List","list_type":"shopping","items":["eggs","milk"]}\n\n'
+            "Input: add pasta, sauce and cheese to my grocery list\n"
+            'Output: {"intent":"create_or_add","list_name":"Grocery List","list_type":"shopping","items":["pasta","sauce","cheese"]}\n\n'
+            "Input: can you add sunscreen and sandals to japan trip packing list\n"
+            'Output: {"intent":"create_or_add","list_name":"Japan Trip Packing List","list_type":"packing","items":["sunscreen","sandals"]}\n\n'
+            "Input: put shampoo and soap in my dmart shopping list\n"
+            'Output: {"intent":"create_or_add","list_name":"Dmart Shopping List","list_type":"shopping","items":["shampoo","soap"]}\n\n'
+            "Input: Japan trip:\n- book flights\n- get visa\n- hotel\n"
+            'Output: {"intent":"create_or_add","list_name":"Japan Trip List","list_type":"packing","items":["book flights","get visa","hotel"]}\n\n'
+            "Input: movies to watch:\n- Interstellar\n- Dune\n- Oppenheimer\n"
+            'Output: {"intent":"create_or_add","list_name":"Movies To Watch List","list_type":"watching","items":["Interstellar","Dune","Oppenheimer"]}\n\n'
             "Input: Show dmart list?\n"
             'Output: {"intent":"show","list_name":"Dmart Shopping List","list_type":"shopping","items":[]}\n\n'
             "Input: show my mall shopping list\n"
@@ -219,9 +239,15 @@ class ListService:
             'Output: {"intent":"show","list_name":"Bag List","list_type":"bag","items":[]}\n\n'
             "Input: get my exam bag list\n"
             'Output: {"intent":"show","list_name":"Exam Bag List","list_type":"bag","items":[]}\n\n'
+            "Input: show me my grocery list\n"
+            'Output: {"intent":"show","list_name":"Grocery List","list_type":"shopping","items":[]}\n\n'
             "Input: todo for today:\n- call mom\n- buy milk\n"
             'Output: {"intent":"none","list_name":null,"list_type":null,"items":[]}\n\n'
             "Input: remind me to drink water every 2 hours\n"
+            'Output: {"intent":"none","list_name":null,"list_type":null,"items":[]}\n\n'
+            "Input: buy milk tomorrow\n"
+            'Output: {"intent":"none","list_name":null,"list_type":null,"items":[]}\n\n'
+            "Input: search my grocery notes\n"
             'Output: {"intent":"none","list_name":null,"list_type":null,"items":[]}\n\n'
             "Return ONLY valid JSON, no markdown:\n"
             '{"intent":"...","list_name":"..."|null,"list_type":"shopping"|"bag"|"packing"|"reading"|"watching"|"custom"|null,"items":[]}'
@@ -237,8 +263,12 @@ class ListService:
             return None
         if intent == "none" or not list_name:
             return None
+        # For create_or_add: if LLM found no items but content has inline items,
+        # try extracting them ourselves rather than giving up
         if intent == "create_or_add" and not items:
-            return None
+            items = _extract_items_from_content(content)
+            if not items:
+                return None
         if list_type not in ("shopping", "bag", "packing", "reading", "watching", "custom", None):
             list_type = "custom"
 
@@ -427,12 +457,11 @@ class ListService:
         tags["subtasks"]   = existing
         tags["item_count"] = len(existing)
 
-        async with async_session_maker() as session:
-            await session.execute(
-                update(Message).where(Message.id == msg.id).values(tags=tags)
-            )
-            await session.commit()
-            msg = await session.scalar(select(Message).where(Message.id == msg.id))
+        await db.execute(
+            update(Message).where(Message.id == msg.id).values(tags=tags)
+        )
+        await db.commit()
+        await db.refresh(msg)
 
         return msg, added, False
 

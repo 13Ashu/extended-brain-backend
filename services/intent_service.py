@@ -286,6 +286,16 @@ class IntentService:
             f'  tasks: [{{"task":"do x task","due_date":"{today}","time":"15:00","priority":"normal"}},{{"task":"do y task","due_date":"{today}","time":"19:00","priority":"normal"}}]\n'
             f'  reminder: null (multiple tasks each have own time)\n\n'
 
+            # ── Inline add to list → List (NOT todo) ─────────────────────
+            f'Message: "add eggs and milk to dmart shopping list"\n'
+            f'→ actions: save_as_list=true (NOT save_as_todo)\n'
+            f'  reasoning: "add X to [named list]" is a list operation, not a task\n'
+            f'  list: {{"list_name":"Dmart Shopping List","list_type":"shopping","items":["eggs","milk"]}}\n\n'
+
+            f'Message: "add pasta, sauce to my grocery list"\n'
+            f'→ actions: save_as_list=true (NOT save_as_todo)\n'
+            f'  list: {{"list_name":"Grocery List","list_type":"shopping","items":["pasta","sauce"]}}\n\n'
+
             # ── Named header → List (shopping) ────────────────────────────
             f'Message: "dmart shopping:\\n- Pen\\n- coffee mug\\n- glue"\n'
             f'→ actions: save_as_list=true\n'
@@ -328,6 +338,39 @@ class IntentService:
             f'Message: "Show dmart list?"\n'
             f'→ actions: is_query=true\n'
             f'  query: {{"query_text":"dmart shopping list","date_hint":null,"list_name":"Dmart Shopping List"}}\n\n'
+
+            # ── Query: natural language — no syntax ───────────────────────
+            f'Message: "what did I save about Japan"\n'
+            f'→ actions: is_query=true\n'
+            f'  query: {{"query_text":"Japan","date_hint":null,"list_name":null}}\n\n'
+
+            f'Message: "show me my tasks for today"\n'
+            f'→ actions: is_query=true\n'
+            f'  query: {{"query_text":"tasks for today","date_hint":"today","list_name":null}}\n\n'
+
+            f'Message: "find my wifi password"\n'
+            f'→ actions: is_query=true\n'
+            f'  query: {{"query_text":"wifi password","date_hint":null,"list_name":null}}\n\n'
+
+            f'Message: "do I have anything due this week"\n'
+            f'→ actions: is_query=true\n'
+            f'  query: {{"query_text":"due this week","date_hint":"this_week","list_name":null}}\n\n'
+
+            f'Message: "show me my grocery list"\n'
+            f'→ actions: is_query=true\n'
+            f'  query: {{"query_text":"grocery list","date_hint":null,"list_name":"Grocery List"}}\n\n'
+
+            f'Message: "what ideas have I saved"\n'
+            f'→ actions: is_query=true\n'
+            f'  query: {{"query_text":"ideas","date_hint":null,"list_name":null}}\n\n'
+
+            f'Message: "where did I park"\n'
+            f'→ actions: is_query=true\n'
+            f'  query: {{"query_text":"parking location","date_hint":null,"list_name":null}}\n\n'
+
+            f'Message: "find that recipe I saved"\n'
+            f'→ actions: is_query=true\n'
+            f'  query: {{"query_text":"recipe","date_hint":null,"list_name":null}}\n\n'
 
             # ── Track ─────────────────────────────────────────────────────
             f'Message: "weight 74kg, slept 7 hours, ran 3km"\n'
