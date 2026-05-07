@@ -33,8 +33,7 @@ passlib[bcrypt]
 loguru
 
 
-# AI/Embeddings
-fastembed
+# Embeddings (Gemini API via httpx — no local model needed)
 pgvector
 
 
