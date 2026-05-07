@@ -8,7 +8,7 @@ KEY CHANGES:
   • Temperature 0.1 for JSON calls (more reliable structured output)
   • Retry with backoff on 429/500
 ────────────────────────────────────────────────────────────────────────────
-Save as: cerebras_client.py
+Save as: cerebras_client.py.
 """
 
 from __future__ import annotations
