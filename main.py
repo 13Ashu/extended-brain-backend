@@ -1908,6 +1908,153 @@ async def manage_categories(
     raise HTTPException(status_code=400, detail="Invalid operation")
 
 
+@app.get("/api/admin/stats")
+async def admin_stats(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin-only endpoint — protected by ADMIN_SECRET env var."""
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    provided     = (
+        request.headers.get("X-Admin-Secret")
+        or request.query_params.get("admin_secret")
+        or ""
+    )
+    if not admin_secret or provided != admin_secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    now = datetime.utcnow()
+    day_ago   = now - timedelta(days=1)
+    week_ago  = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
+
+    # ── Totals ──────────────────────────────────────────────────
+    total_users   = await db.scalar(select(func.count(User.id)))
+    total_msgs    = await db.scalar(select(func.count(Message.id)))
+    active_today  = await db.scalar(
+        select(func.count(func.distinct(Message.user_id)))
+        .where(Message.created_at >= day_ago)
+    )
+    active_week   = await db.scalar(
+        select(func.count(func.distinct(Message.user_id)))
+        .where(Message.created_at >= week_ago)
+    )
+    new_users_week = await db.scalar(
+        select(func.count(User.id)).where(User.created_at >= week_ago)
+    )
+
+    # ── Per-user stats ──────────────────────────────────────────
+    user_rows = await db.execute(
+        select(
+            User.id, User.name, User.phone_number, User.email,
+            User.occupation, User.created_at, User.last_login,
+            User.telegram_chat_id,
+            func.count(Message.id).label("msg_count"),
+            func.max(Message.created_at).label("last_active"),
+        )
+        .outerjoin(Message, Message.user_id == User.id)
+        .group_by(User.id)
+        .order_by(func.count(Message.id).desc())
+    )
+    users = []
+    for row in user_rows.all():
+        users.append({
+            "id":           row.id,
+            "name":         row.name,
+            "phone":        row.phone_number,
+            "email":        row.email,
+            "occupation":   row.occupation,
+            "joined":       row.created_at.isoformat() if row.created_at else None,
+            "last_login":   row.last_login.isoformat() if row.last_login else None,
+            "last_active":  row.last_active.isoformat() if row.last_active else None,
+            "msg_count":    row.msg_count,
+            "has_telegram": bool(row.telegram_chat_id),
+        })
+
+    # ── Feature (bucket) usage ──────────────────────────────────
+    # primary_bucket is stored in tags JSONB
+    bucket_rows = await db.execute(
+        text("""
+            SELECT
+                COALESCE(
+                    tags->>'primary_bucket',
+                    tags->>'intent_bucket',
+                    'Unknown'
+                ) AS bucket,
+                COUNT(*) AS cnt
+            FROM messages
+            GROUP BY bucket
+            ORDER BY cnt DESC
+        """)
+    )
+    feature_usage = {row.bucket: row.cnt for row in bucket_rows.all()}
+
+    # ── Media type breakdown ─────────────────────────────────────
+    type_rows = await db.execute(
+        select(Message.message_type, func.count(Message.id))
+        .group_by(Message.message_type)
+    )
+    media_types = {
+        (row[0].value if row[0] else "unknown"): row[1]
+        for row in type_rows.all()
+    }
+
+    # ── Messages per day — last 14 days ─────────────────────────
+    daily_rows = await db.execute(
+        text("""
+            SELECT
+                DATE(created_at) AS day,
+                COUNT(*)         AS cnt
+            FROM messages
+            WHERE created_at >= NOW() - INTERVAL '14 days'
+            GROUP BY day
+            ORDER BY day
+        """)
+    )
+    daily_activity = {str(row.day): row.cnt for row in daily_rows.all()}
+
+    # ── Messages per day per user — last 7 days ──────────────────
+    user_daily_rows = await db.execute(
+        text("""
+            SELECT
+                m.user_id,
+                DATE(m.created_at) AS day,
+                COUNT(*)           AS cnt
+            FROM messages m
+            WHERE m.created_at >= NOW() - INTERVAL '7 days'
+            GROUP BY m.user_id, day
+            ORDER BY day, m.user_id
+        """)
+    )
+    user_daily: dict = {}
+    for row in user_daily_rows.all():
+        uid = str(row.user_id)
+        if uid not in user_daily:
+            user_daily[uid] = {}
+        user_daily[uid][str(row.day)] = row.cnt
+
+    # ── Retrieval vs Save ratio ──────────────────────────────────
+    # Queries are messages where is_query flag was set — proxy: content starts with common retrieval phrases
+    # (not stored separately, so approximate via category)
+    saves_count = total_msgs or 0
+
+    return {
+        "summary": {
+            "total_users":    total_users,
+            "total_messages": total_msgs,
+            "active_today":   active_today,
+            "active_week":    active_week,
+            "new_users_week": new_users_week,
+            "avg_msgs_per_user": round(total_msgs / total_users, 1) if total_users else 0,
+        },
+        "users":          users,
+        "feature_usage":  feature_usage,
+        "media_types":    media_types,
+        "daily_activity": daily_activity,
+        "user_daily":     user_daily,
+    }
+
+
 @app.get("/api/analytics")
 async def get_user_analytics(
     current_user: User = Depends(get_current_user),
