@@ -291,6 +291,41 @@ class GroupMember(Base):
     user: Mapped["User"] = relationship("User", back_populates="group_memberships")
 
 
+class CouponCode(Base):
+    """Coupon codes for Pro plan — free trials or discounts."""
+    __tablename__ = "coupon_codes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    description: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    # 'free' = full Pro access, 'percent' = % off, 'fixed' = fixed amount off
+    discount_type: Mapped[str] = mapped_column(String(20), default="free")
+    discount_value: Mapped[int] = mapped_column(Integer, default=100)  # % or ₹ amount
+    duration_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # None = forever
+    max_uses: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # None = unlimited
+    uses_count: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    redemptions: Mapped[List["CouponRedemption"]] = relationship(
+        "CouponRedemption", back_populates="coupon", cascade="all, delete-orphan"
+    )
+
+
+class CouponRedemption(Base):
+    """Tracks who redeemed which coupon."""
+    __tablename__ = "coupon_redemptions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    coupon_id: Mapped[int] = mapped_column(ForeignKey("coupon_codes.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    redeemed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    coupon: Mapped["CouponCode"] = relationship("CouponCode", back_populates="redemptions")
+    user: Mapped["User"] = relationship("User")
+
+
 # Database initialization
 async def init_db():
     """Create all tables and apply safe column migrations."""

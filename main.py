@@ -26,8 +26,9 @@ from messaging_factory import create_messaging_client, get_platform_name
 from messaging_interface import MessagingClient
 
 from database import get_db, init_db, engine, Base, async_session_maker
-from models import User, Message, Category, MessageType, ProAccount, ProAccountMember, Group, GroupMember
+from models import User, Message, Category, MessageType, ProAccount, ProAccountMember, Group, GroupMember, CouponCode, CouponRedemption
 from services.group_service import group_service as grp_svc
+from services.coupon_service import coupon_service as cpn_svc
 from cerebras_client import CerebrasClient
 from services.message_processor import MessageProcessor
 from services.search_service import SearchService
@@ -1051,6 +1052,21 @@ async def process_webhook_message(webhook_data: Dict):
                     continue
 
                 user_phone = user.phone_number
+
+                # ── /redeem <code> ────────────────────────────────────
+                if content.lower().startswith("/redeem "):
+                    code   = content.split(" ", 1)[1].strip()
+                    result = await cpn_svc.redeem(code, user, db)
+                    if result["success"]:
+                        dur = f" ({result['duration_days']} days)" if result.get("duration_days") else ""
+                        await messaging_client.send_message(
+                            chat_id,
+                            f"🎉 *Coupon redeemed!* Pro activated{dur}\n\n"
+                            f"Now try:\n`/creategroup Goa Trip`\n`/invite +91XXXXXXXXXX`"
+                        )
+                    else:
+                        await messaging_client.send_message(chat_id, f"❌ {result['message']}")
+                    continue
 
                 # ── /upgrade ─────────────────────────────────────────
                 if content.lower().strip() in {"/upgrade", "upgrade"}:
@@ -2168,9 +2184,93 @@ async def admin_stats(
             user_daily[uid] = {}
         user_daily[uid][str(row.day)] = row.cnt
 
-    # ── Retrieval vs Save ratio ──────────────────────────────────
-    # Queries are messages where is_query flag was set — proxy: content starts with common retrieval phrases
-    # (not stored separately, so approximate via category)
+    # ── Group analytics ──────────────────────────────────────────
+    total_pro_accounts = await db.scalar(select(func.count(ProAccount.id))) or 0
+    total_groups       = await db.scalar(select(func.count(Group.id))) or 0
+    total_group_msgs   = await db.scalar(
+        select(func.count(Message.id)).where(Message.group_id.isnot(None))
+    ) or 0
+    total_assigned     = await db.scalar(
+        select(func.count(Message.id)).where(Message.assigned_to_user_id.isnot(None))
+    ) or 0
+
+    # Per-group stats
+    group_rows = await db.execute(
+        text("""
+            SELECT
+                g.id,
+                g.name,
+                g.emoji,
+                g.created_at,
+                u.name            AS owner_name,
+                COUNT(DISTINCT gm.user_id)   AS member_count,
+                COUNT(DISTINCT m.id)         AS msg_count,
+                MAX(m.created_at)            AS last_active
+            FROM groups g
+            JOIN pro_accounts pa ON pa.id = g.account_id
+            JOIN users u         ON u.id  = pa.owner_id
+            LEFT JOIN group_members gm ON gm.group_id = g.id
+            LEFT JOIN messages m       ON m.group_id  = g.id
+            GROUP BY g.id, g.name, g.emoji, g.created_at, u.name
+            ORDER BY msg_count DESC
+        """)
+    )
+    groups_detail = []
+    for row in group_rows.all():
+        groups_detail.append({
+            "id":           row.id,
+            "name":         row.name,
+            "emoji":        row.emoji or "👥",
+            "owner":        row.owner_name,
+            "member_count": row.member_count,
+            "msg_count":    row.msg_count,
+            "last_active":  row.last_active.isoformat() if row.last_active else None,
+            "created_at":   row.created_at.isoformat() if row.created_at else None,
+        })
+
+    # Per-pro-account: owner + how many members invited
+    pro_rows = await db.execute(
+        text("""
+            SELECT
+                u.name              AS owner_name,
+                u.phone_number      AS owner_phone,
+                pa.plan_type,
+                pa.created_at,
+                COUNT(DISTINCT pam.id)     AS invited_count,
+                SUM(CASE WHEN pam.status = 'active' THEN 1 ELSE 0 END) AS active_members,
+                COUNT(DISTINCT g.id)       AS group_count
+            FROM pro_accounts pa
+            JOIN users u ON u.id = pa.owner_id
+            LEFT JOIN pro_account_members pam ON pam.account_id = pa.id
+            LEFT JOIN groups g ON g.account_id = pa.id
+            GROUP BY pa.id, u.name, u.phone_number, pa.plan_type, pa.created_at
+            ORDER BY pa.created_at DESC
+        """)
+    )
+    pro_accounts_detail = []
+    for row in pro_rows.all():
+        pro_accounts_detail.append({
+            "owner":          row.owner_name,
+            "phone":          row.owner_phone,
+            "plan_type":      row.plan_type,
+            "invited":        row.invited_count,
+            "active_members": row.active_members or 0,
+            "group_count":    row.group_count,
+            "created_at":     row.created_at.isoformat() if row.created_at else None,
+        })
+
+    # Group message activity — last 14 days
+    group_daily_rows = await db.execute(
+        text("""
+            SELECT DATE(created_at) AS day, COUNT(*) AS cnt
+            FROM messages
+            WHERE group_id IS NOT NULL
+              AND created_at >= NOW() - INTERVAL '14 days'
+            GROUP BY day ORDER BY day
+        """)
+    )
+    group_daily_activity = {str(row.day): row.cnt for row in group_daily_rows.all()}
+
     saves_count = total_msgs or 0
 
     return {
@@ -2187,6 +2287,15 @@ async def admin_stats(
         "media_types":    media_types,
         "daily_activity": daily_activity,
         "user_daily":     user_daily,
+        "groups": {
+            "total_pro_accounts":  total_pro_accounts,
+            "total_groups":        total_groups,
+            "total_group_messages": total_group_msgs,
+            "total_assigned_tasks": total_assigned,
+            "pro_accounts":        pro_accounts_detail,
+            "groups_detail":       groups_detail,
+            "group_daily_activity": group_daily_activity,
+        },
     }
 
 
@@ -2400,6 +2509,95 @@ async def leave_group(
     if current_user.active_group_id == group_id:
         await grp_svc.set_active_group(current_user.id, None, db)
     return {"success": True}
+
+
+# ── Coupon: validate (public, no auth needed for preview) ─────────────
+class CouponValidateRequest(BaseModel):
+    code: str
+
+class CouponRedeemRequest(BaseModel):
+    code: str
+
+class CouponCreateRequest(BaseModel):
+    code: Optional[str] = None
+    description: Optional[str] = None
+    discount_type: str = "free"      # free | percent | fixed
+    discount_value: int = 100
+    duration_days: Optional[int] = 30
+    max_uses: Optional[int] = None
+    expires_in_days: Optional[int] = None
+
+
+@app.post("/api/pro/validate-coupon")
+async def validate_coupon(
+    req: CouponValidateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await cpn_svc.validate(req.code, current_user, db)
+    return result
+
+
+@app.post("/api/pro/redeem-coupon")
+async def redeem_coupon(
+    req: CouponRedeemRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await cpn_svc.redeem(req.code, current_user, db)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+# ── Admin: coupon management ────────────────────────────────────────────
+@app.post("/api/admin/coupons")
+async def admin_create_coupon(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    provided = request.headers.get("X-Admin-Secret") or request.query_params.get("admin_secret") or ""
+    if not admin_secret or provided != admin_secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    body = await request.json()
+    req  = CouponCreateRequest(**body)
+    result = await cpn_svc.create_coupon(
+        code=req.code, description=req.description,
+        discount_type=req.discount_type, discount_value=req.discount_value,
+        duration_days=req.duration_days, max_uses=req.max_uses,
+        expires_in_days=req.expires_in_days, db=db,
+    )
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@app.get("/api/admin/coupons")
+async def admin_list_coupons(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    provided = request.headers.get("X-Admin-Secret") or request.query_params.get("admin_secret") or ""
+    if not admin_secret or provided != admin_secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    coupons = await cpn_svc.list_coupons(db)
+    return {"coupons": coupons}
+
+
+@app.delete("/api/admin/coupons/{coupon_id}")
+async def admin_deactivate_coupon(
+    coupon_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    provided = request.headers.get("X-Admin-Secret") or request.query_params.get("admin_secret") or ""
+    if not admin_secret or provided != admin_secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    ok = await cpn_svc.deactivate(coupon_id, db)
+    return {"success": ok}
 
 
 # ── Admin: grant Pro ────────────────────────────────────────────────
