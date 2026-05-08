@@ -26,7 +26,8 @@ from messaging_factory import create_messaging_client, get_platform_name
 from messaging_interface import MessagingClient
 
 from database import get_db, init_db, engine, Base, async_session_maker
-from models import User, Message, Category, MessageType
+from models import User, Message, Category, MessageType, ProAccount, ProAccountMember, Group, GroupMember
+from services.group_service import group_service as grp_svc
 from cerebras_client import CerebrasClient
 from services.message_processor import MessageProcessor
 from services.search_service import SearchService
@@ -1029,6 +1030,19 @@ async def process_webhook_message(webhook_data: Dict):
                     await messaging_client.send_message(chat_id, response)
                     continue
 
+                # ── /joingroup <token> — accept invite (works pre-login too) ───
+                if content.lower().startswith("/joingroup "):
+                    token     = content.split(" ", 1)[1].strip()
+                    if user:
+                        result = await grp_svc.accept_invite(token, user, db)
+                        await messaging_client.send_message(chat_id, result["message"])
+                    else:
+                        await messaging_client.send_message(
+                            chat_id,
+                            "🚫 Link your account first: /link +91XXXXXXXXXX\nThen send this again."
+                        )
+                    continue
+
                 if not user:
                     await messaging_client.send_message(
                         chat_id,
@@ -1037,6 +1051,111 @@ async def process_webhook_message(webhook_data: Dict):
                     continue
 
                 user_phone = user.phone_number
+
+                # ── /upgrade ─────────────────────────────────────────
+                if content.lower().strip() in {"/upgrade", "upgrade"}:
+                    await messaging_client.send_message(chat_id, (
+                        "⭐ *Extended Brain Pro*\n\n"
+                        "Unlock collaborative groups:\n"
+                        "• Add up to 4 members to your account\n"
+                        "• Create unlimited groups (trip planning, family, work…)\n"
+                        "• Assign tasks with @mentions\n"
+                        "• Shared lists everyone can check off\n\n"
+                        "💰 *₹299/month* · Cancel anytime\n\n"
+                        "To get Pro, visit: https://your-digital-mind.vercel.app/#pricing\n"
+                        "or contact support to activate manually."
+                    ))
+                    continue
+
+                # ── /creategroup <name> ───────────────────────────────
+                if content.lower().startswith("/creategroup "):
+                    name   = content.split(" ", 1)[1].strip()
+                    result = await grp_svc.create_group(user, name, None, db)
+                    if result["success"]:
+                        await messaging_client.send_message(
+                            chat_id,
+                            f"✅ Group *{name}* created!\n\n"
+                            f"Now invite members: `/invite +91XXXXXXXXXX`\n"
+                            f"Or activate it: `/setgroup {name}`"
+                        )
+                    else:
+                        await messaging_client.send_message(chat_id, f"❌ {result['message']}")
+                    continue
+
+                # ── /invite <phone> ───────────────────────────────────
+                if content.lower().startswith("/invite "):
+                    phone  = content.split(" ", 1)[1].strip()
+                    result = await grp_svc.invite_member(user, phone, db)
+                    if result["success"]:
+                        token      = result["invite_token"]
+                        invitee    = result.get("invitee_name") or phone
+                        invite_url = f"https://t.me/ExtendedMindsBot?start=join_{token}"
+                        msg = (
+                            f"✅ Invite sent to *{invitee}*!\n\n"
+                            f"Share this link with them:\n{invite_url}\n\n"
+                            f"Or they can send: `/joingroup {token}`"
+                        )
+                        # Notify invitee via Telegram if they exist
+                        if result.get("invitee_exists"):
+                            invitee_user = await db.scalar(select(User).where(User.phone_number == phone))
+                            if invitee_user and invitee_user.telegram_chat_id:
+                                await messaging_client.send_message(
+                                    invitee_user.telegram_chat_id,
+                                    f"👋 *{user.name}* has invited you to their Extended Brain Pro account!\n\n"
+                                    f"Tap to join: `/joingroup {token}`"
+                                )
+                    else:
+                        msg = f"❌ {result['message']}"
+                    await messaging_client.send_message(chat_id, msg)
+                    continue
+
+                # ── /mygroups ─────────────────────────────────────────
+                if content.lower().strip() in {"/mygroups", "mygroups", "/groups"}:
+                    groups = await grp_svc.get_user_groups(user.id, db)
+                    response = grp_svc.format_groups_list(groups)
+                    await messaging_client.send_message(chat_id, response)
+                    continue
+
+                # ── /setgroup <name> ──────────────────────────────────
+                if content.lower().startswith("/setgroup "):
+                    gname = content.split(" ", 1)[1].strip()
+                    group = await grp_svc.get_group_by_name(user.id, gname, db)
+                    if not group:
+                        await messaging_client.send_message(
+                            chat_id, f"❌ No group named *{gname}* found. Check `/mygroups`"
+                        )
+                    else:
+                        await grp_svc.set_active_group(user.id, group.id, db)
+                        # Reload user to get updated active_group_id
+                        await db.refresh(user)
+                        await messaging_client.send_message(
+                            chat_id,
+                            f"✅ Now posting to group *{group.name}*\n\n"
+                            f"_All your messages go to the group until you send `/unsetgroup`_"
+                        )
+                    continue
+
+                # ── /unsetgroup ───────────────────────────────────────
+                if content.lower().strip() in {"/unsetgroup", "unsetgroup"}:
+                    await grp_svc.set_active_group(user.id, None, db)
+                    await messaging_client.send_message(chat_id, "✅ Back to personal mode.")
+                    continue
+
+                # ── /groupmembers ─────────────────────────────────────
+                if content.lower().strip() in {"/groupmembers", "/members"}:
+                    gid = user.active_group_id
+                    if not gid:
+                        await messaging_client.send_message(
+                            chat_id, "❌ No active group. Use `/setgroup <name>` first."
+                        )
+                    else:
+                        group = await grp_svc.get_group_by_id(gid, user.id, db)
+                        if group:
+                            members = await grp_svc.get_group_members(gid, db)
+                            await messaging_client.send_message(
+                                chat_id, grp_svc.format_group_members(group.name, members)
+                            )
+                    continue
 
                 # ── /status ───────────────────────────────────────────
                 if content.lower().strip() in {"/status", "status"}:
@@ -1244,6 +1363,13 @@ async def process_webhook_message(webhook_data: Dict):
                     # ── SAVE ───────────────────────────────────────────
                     else:
 
+                        # ── Group routing: tag message with group_id + @mention ──
+                        active_gid   = user.active_group_id
+                        assigned_uid = None
+                        if active_gid:
+                            members  = await grp_svc.get_group_members(active_gid, db)
+                            assigned_uid, content = grp_svc.parse_mention(content, members)
+
                         # ── Check list intent FIRST (before subtask) ──────────────
                         # "add to the galleria list: x, y" must route to list_service,
                         # not subtask_service — subtask detection would greedily match
@@ -1291,6 +1417,15 @@ async def process_webhook_message(webhook_data: Dict):
                                     user_phone=user_phone, content=content,
                                     message_type=message_type, media_url=media_url, db=db,
                                 )
+
+                                # Tag message with group_id / assigned_to if in group mode
+                                if active_gid and result.get("message_id"):
+                                    await db.execute(
+                                        update(Message)
+                                        .where(Message.id == result["message_id"])
+                                        .values(group_id=active_gid, assigned_to_user_id=assigned_uid)
+                                    )
+                                    await db.commit()
 
                                 if result.get("_is_query"):
                                     qdata  = result.get("query_data", {})
@@ -2100,3 +2235,190 @@ async def get_webhook_info():
             "configured_url": Config.TELEGRAM_WEBHOOK_URL,
             "status":         "not_configured",
         }
+
+
+# ================== Pro Plan Endpoints ==================
+
+class InviteRequest(BaseModel):
+    phone_number: str
+
+class AcceptInviteRequest(BaseModel):
+    token: str
+
+class CreateGroupRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = None
+    emoji: Optional[str] = None
+
+class AddGroupMemberRequest(BaseModel):
+    user_id: int
+
+
+@app.get("/api/pro/status")
+async def get_pro_status(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    acct = await grp_svc.get_pro_account_for_user(current_user.id, db)
+    if not acct:
+        return {
+            "is_pro": current_user.is_pro,
+            "account": None,
+            "members": [],
+        }
+    members = await grp_svc.get_account_members(acct.id, db)
+    return {
+        "is_pro": current_user.is_pro,
+        "account": {
+            "id": acct.id,
+            "plan_type": acct.plan_type,
+            "max_members": acct.max_members,
+            "expires_at": acct.expires_at.isoformat() if acct.expires_at else None,
+        },
+        "members": members,
+    }
+
+
+@app.post("/api/pro/invite")
+async def invite_member(
+    req: InviteRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await grp_svc.invite_member(current_user, req.phone_number, db)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@app.post("/api/pro/accept-invite")
+async def accept_invite(
+    req: AcceptInviteRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await grp_svc.accept_invite(req.token, current_user, db)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+# ================== Groups Endpoints ==================
+
+@app.get("/api/groups")
+async def list_groups(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    groups = await grp_svc.get_user_groups(current_user.id, db)
+    return {"success": True, "groups": groups}
+
+
+@app.post("/api/groups")
+async def create_group(
+    req: CreateGroupRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await grp_svc.create_group(current_user, req.name, req.description, db)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    # Optionally store emoji
+    if req.emoji and result.get("group_id"):
+        grp = await db.get(Group, result["group_id"])
+        if grp:
+            grp.emoji = req.emoji
+            await db.commit()
+    return result
+
+
+@app.get("/api/groups/{group_id}/messages")
+async def get_group_messages(
+    group_id: int,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found or access denied")
+    messages = await grp_svc.get_group_messages(group_id, limit, db)
+    return {"success": True, "group": {"id": group.id, "name": group.name, "emoji": group.emoji}, "messages": messages}
+
+
+@app.get("/api/groups/{group_id}/members")
+async def get_group_members(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found or access denied")
+    members = await grp_svc.get_group_members(group_id, db)
+    return {"success": True, "members": members}
+
+
+@app.post("/api/groups/{group_id}/members")
+async def add_group_member(
+    group_id: int,
+    req: AddGroupMemberRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found or access denied")
+    # Verify the target user is in the same Pro account
+    acct = await grp_svc.get_pro_account_for_user(current_user.id, db)
+    if not acct:
+        raise HTTPException(status_code=403, detail="Pro account required")
+    member_phones = [m["phone"] for m in await grp_svc.get_account_members(acct.id, db)]
+    target = await db.get(User, req.user_id)
+    if not target or target.phone_number not in member_phones:
+        raise HTTPException(status_code=403, detail="User is not in your Pro account")
+    added = await grp_svc.add_member_to_group(group, req.user_id, "member", db)
+    return {"success": True, "added": added}
+
+
+@app.delete("/api/groups/{group_id}/leave")
+async def leave_group(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    row = await db.scalar(
+        select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == current_user.id,
+        )
+    )
+    if row:
+        await db.delete(row)
+        await db.commit()
+    # Clear active group if it was this one
+    if current_user.active_group_id == group_id:
+        await grp_svc.set_active_group(current_user.id, None, db)
+    return {"success": True}
+
+
+# ── Admin: grant Pro ────────────────────────────────────────────────
+@app.post("/api/admin/grant-pro")
+async def admin_grant_pro(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    provided = request.headers.get("X-Admin-Secret") or request.query_params.get("admin_secret") or ""
+    if not admin_secret or provided != admin_secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    body = await request.json()
+    phone = body.get("phone_number")
+    user  = await db.scalar(select(User).where(User.phone_number == phone))
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.is_pro = True
+    # Create Pro account if not exists
+    acct = await grp_svc.get_or_create_pro_account(user, db)
+    await db.commit()
+    return {"success": True, "message": f"Pro granted to {user.name}", "account_id": acct.id}

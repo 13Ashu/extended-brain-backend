@@ -5,7 +5,7 @@ Updated with full user registration fields
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Text, DateTime, ForeignKey, Enum as SQLEnum, Integer
+from sqlalchemy import String, Text, DateTime, ForeignKey, Enum as SQLEnum, Integer, Boolean
 from sqlalchemy.dialects.postgresql import JSON, JSONB
 from datetime import datetime
 from typing import Optional, List, AsyncGenerator
@@ -104,9 +104,11 @@ class User(Base):
     
     # Settings
     timezone: Mapped[str] = mapped_column(String(50), default="Asia/Kolkata")
-    briefing_time: Mapped[Optional[str]] = mapped_column(String(5), default="08:00", nullable=True)  # ← ADD THIS
+    briefing_time: Mapped[Optional[str]] = mapped_column(String(5), default="08:00", nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True)
     is_verified: Mapped[bool] = mapped_column(default=False)
+    is_pro: Mapped[bool] = mapped_column(Boolean, default=False)
+    active_group_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -121,12 +123,20 @@ class User(Base):
     messages: Mapped[List["Message"]] = relationship(
         "Message",
         back_populates="user",
-        cascade="all, delete-orphan"
+        cascade="all, delete-orphan",
+        foreign_keys="Message.user_id",
     )
     categories: Mapped[List["Category"]] = relationship(
         "Category",
         back_populates="user",
         cascade="all, delete-orphan"
+    )
+    pro_account: Mapped[Optional["ProAccount"]] = relationship(
+        "ProAccount", back_populates="owner", uselist=False,
+        foreign_keys="ProAccount.owner_id",
+    )
+    group_memberships: Mapped[List["GroupMember"]] = relationship(
+        "GroupMember", back_populates="user", cascade="all, delete-orphan"
     )
     
     def __repr__(self):
@@ -182,7 +192,9 @@ class Message(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     category_id: Mapped[Optional[int]] = mapped_column(ForeignKey("categories.id"), index=True)
-    
+    group_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    assigned_to_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     content: Mapped[str] = mapped_column(Text)
     message_type: Mapped[MessageType] = mapped_column(SQLEnum(MessageType))
     media_url: Mapped[Optional[str]] = mapped_column(String(500))
@@ -203,18 +215,100 @@ class Message(Base):
     )
     
     # Relationships
-    user: Mapped["User"] = relationship("User", back_populates="messages")
+    user: Mapped["User"] = relationship("User", back_populates="messages", foreign_keys=[user_id])
     category: Mapped[Optional["Category"]] = relationship("Category", back_populates="messages")
     
     def __repr__(self):
         return f"<Message {self.id} - {self.message_type.value}>"
 
 
+class ProAccount(Base):
+    """One Pro account per paying user. Holds up to max_members members."""
+    __tablename__ = "pro_accounts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, index=True)
+    plan_type: Mapped[str] = mapped_column(String(20), default="pro")
+    max_members: Mapped[int] = mapped_column(Integer, default=4)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    owner: Mapped["User"] = relationship("User", back_populates="pro_account", foreign_keys=[owner_id])
+    members: Mapped[List["ProAccountMember"]] = relationship(
+        "ProAccountMember", back_populates="account", cascade="all, delete-orphan"
+    )
+    groups: Mapped[List["Group"]] = relationship(
+        "Group", back_populates="account", cascade="all, delete-orphan"
+    )
+
+
+class ProAccountMember(Base):
+    """Invited members of a Pro account. Pending until they accept."""
+    __tablename__ = "pro_account_members"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("pro_accounts.id"), index=True)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    phone_number: Mapped[str] = mapped_column(String(20), index=True)
+    invited_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    invite_token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    invited_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    joined_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    account: Mapped["ProAccount"] = relationship("ProAccount", back_populates="members")
+
+
+class Group(Base):
+    """Collaborative group within a Pro account."""
+    __tablename__ = "groups"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("pro_accounts.id"), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    emoji: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    account: Mapped["ProAccount"] = relationship("ProAccount", back_populates="groups")
+    members: Mapped[List["GroupMember"]] = relationship(
+        "GroupMember", back_populates="group", cascade="all, delete-orphan"
+    )
+
+
+class GroupMember(Base):
+    """Membership in a group."""
+    __tablename__ = "group_members"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    group_id: Mapped[int] = mapped_column(ForeignKey("groups.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    role: Mapped[str] = mapped_column(String(20), default="member")
+    joined_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    group: Mapped["Group"] = relationship("Group", back_populates="members")
+    user: Mapped["User"] = relationship("User", back_populates="group_memberships")
+
+
 # Database initialization
 async def init_db():
-    """Create all tables"""
+    """Create all tables and apply safe column migrations."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Safe migrations for columns added after initial deploy
+        from sqlalchemy import text as sa_text
+        migrations = [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_pro BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS active_group_id INTEGER",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS group_id INTEGER",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS assigned_to_user_id INTEGER",
+        ]
+        for stmt in migrations:
+            try:
+                await conn.execute(sa_text(stmt))
+            except Exception as e:
+                print(f"[migration] skipped: {e}")
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

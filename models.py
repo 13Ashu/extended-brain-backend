@@ -2,15 +2,14 @@
 Database models export
 """
 
-from database import Base, User, Category, Message, MessageType, engine, get_db, init_db
+from database import (
+    Base, User, Category, Message, MessageType,
+    ProAccount, ProAccountMember, Group, GroupMember,
+    engine, get_db, init_db,
+)
 
 __all__ = [
-    "Base",
-    "User",
-    "Category",
-    "Message",
-    "MessageType",
-    "engine",
-    "get_db",
-    "init_db"
+    "Base", "User", "Category", "Message", "MessageType",
+    "ProAccount", "ProAccountMember", "Group", "GroupMember",
+    "engine", "get_db", "init_db",
 ]
