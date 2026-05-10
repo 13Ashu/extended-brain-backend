@@ -991,8 +991,23 @@ async def process_webhook_message(webhook_data: Dict):
                 else:
                     user = await db.scalar(select(User).where(User.phone_number == chat_id))
 
-                # ── /start ────────────────────────────────────────────
-                if content.lower().strip() == "/start":
+                # ── /start [join_<token>] ─────────────────────────────
+                if content.lower().strip() == "/start" or content.lower().startswith("/start "):
+                    # Handle invite deep link: /start join_<token>
+                    parts = content.split(" ", 1)
+                    start_param = parts[1].strip() if len(parts) > 1 else ""
+                    if start_param.startswith("join_"):
+                        token = start_param[len("join_"):]
+                        if user:
+                            result = await grp_svc.accept_invite(token, user, db)
+                            await messaging_client.send_message(chat_id, result["message"])
+                        else:
+                            await messaging_client.send_message(
+                                chat_id,
+                                "🚫 Link your account first: /link +91XXXXXXXXXX\nThen send this again."
+                            )
+                        continue
+
                     if user:
                         response = (
                             f"👋 Welcome back, {user.name}!\n\n"

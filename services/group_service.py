@@ -110,8 +110,24 @@ class GroupService:
         member_row.user_id = user.id
         member_row.status = "active"
         member_row.joined_at = datetime.utcnow()
+        await db.flush()
+
+        # Auto-add to all existing groups in this Pro account
+        groups = await db.execute(
+            select(Group).where(Group.account_id == member_row.account_id)
+        )
+        for group in groups.scalars():
+            already = await db.scalar(
+                select(GroupMember).where(
+                    GroupMember.group_id == group.id,
+                    GroupMember.user_id == user.id,
+                )
+            )
+            if not already:
+                db.add(GroupMember(group_id=group.id, user_id=user.id, role="member"))
+
         await db.commit()
-        return {"success": True, "message": "You've joined the Pro account!"}
+        return {"success": True, "message": "You've joined the Pro account! ✅\n\nUse `/mygroups` to see shared groups, then `/setgroup <name>` to activate one."}
 
     async def get_account_members(self, account_id: int, db: AsyncSession) -> List[Dict]:
         rows = await db.execute(
