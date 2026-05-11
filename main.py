@@ -1142,8 +1142,11 @@ async def process_webhook_message(webhook_data: Dict):
 
                 # ── /accountmembers ───────────────────────────────────
                 if content.lower().strip() in {"/accountmembers", "/invites"}:
+                    print(f"[accountmembers] triggered by user_id={user.id} phone={user.phone_number}")
                     acct = await grp_svc.get_or_create_pro_account(user, db)
+                    print(f"[accountmembers] pro_account_id={acct.id} max_members={acct.max_members}")
                     members = await grp_svc.get_account_members(acct.id, db)
+                    print(f"[accountmembers] found {len(members)} member(s): {[{m['phone']: m['status']} for m in members]}")
                     if not members:
                         msg = "No members in your Pro account yet.\nUse `/invite +91XXXXXXXXXX` to invite someone."
                     else:
@@ -1153,6 +1156,7 @@ async def process_webhook_message(webhook_data: Dict):
                             lines.append(f"{status_icon} {m['name']} — {m['phone']} ({m['status']})")
                         lines.append("\nTo cancel a pending invite: `/cancelinvite +91XXXXXXXXXX`")
                         msg = "\n".join(lines)
+                    print(f"[accountmembers] sending response to chat_id={chat_id}")
                     await messaging_client.send_message(chat_id, msg)
                     continue
 
