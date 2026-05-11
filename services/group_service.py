@@ -142,7 +142,7 @@ class GroupService:
                 db.add(GroupMember(group_id=group.id, user_id=user.id, role="member"))
 
         await db.commit()
-        return {"success": True, "message": "You've joined the Pro account! ✅\n\nUse `/mygroups` to see shared groups, then `/setgroup <name>` to activate one."}
+        return {"success": True, "message": "✅ You've joined the Pro account!\n\nSend /mygroups to see your shared groups, then /setgroup GroupName to start posting."}
 
     async def cancel_invite(
         self, owner: User, phone_number: str, db: AsyncSession
