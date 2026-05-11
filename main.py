@@ -1088,7 +1088,7 @@ async def process_webhook_message(webhook_data: Dict):
                     await messaging_client.send_message(chat_id, (
                         "⭐ *Extended Brain Pro*\n\n"
                         "Unlock collaborative groups:\n"
-                        "• Add up to 4 members to your account\n"
+                        "• Add up to 6 members to your account\n"
                         "• Create unlimited groups (trip planning, family, work…)\n"
                         "• Assign tasks with @mentions\n"
                         "• Shared lists everyone can check off\n\n"
