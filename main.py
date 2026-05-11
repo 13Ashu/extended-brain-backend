@@ -1140,6 +1140,31 @@ async def process_webhook_message(webhook_data: Dict):
                     await messaging_client.send_message(chat_id, msg)
                     continue
 
+                # ── /accountmembers ───────────────────────────────────
+                if content.lower().strip() in {"/accountmembers", "/invites"}:
+                    acct = await grp_svc.get_or_create_pro_account(user, db)
+                    members = await grp_svc.get_account_members(acct.id, db)
+                    if not members:
+                        msg = "No members in your Pro account yet.\nUse `/invite +91XXXXXXXXXX` to invite someone."
+                    else:
+                        lines = ["👥 *Pro Account Members*\n"]
+                        for m in members:
+                            status_icon = "✅" if m["status"] == "active" else "⏳"
+                            lines.append(f"{status_icon} {m['name']} — {m['phone']} ({m['status']})")
+                        lines.append("\nTo cancel a pending invite: `/cancelinvite +91XXXXXXXXXX`")
+                        msg = "\n".join(lines)
+                    await messaging_client.send_message(chat_id, msg)
+                    continue
+
+                # ── /cancelinvite <phone> ──────────────────────────────
+                if content.lower().startswith("/cancelinvite "):
+                    phone = content.split(" ", 1)[1].strip()
+                    result = await grp_svc.cancel_invite(user, phone, db)
+                    await messaging_client.send_message(
+                        chat_id, f"✅ {result['message']}" if result["success"] else f"❌ {result['message']}"
+                    )
+                    continue
+
                 # ── /mygroups ─────────────────────────────────────────
                 if content.lower().strip() in {"/mygroups", "mygroups", "/groups"}:
                     groups = await grp_svc.get_user_groups(user.id, db)

@@ -70,7 +70,21 @@ class GroupService:
             )
         )
         if existing:
-            return {"success": False, "message": f"{phone_number} is already invited."}
+            if existing.status == "active":
+                return {"success": False, "message": f"{phone_number} is already an active member."}
+            # Pending — refresh the token so they can re-join
+            token = secrets.token_urlsafe(32)
+            existing.invite_token = token
+            invitee_user = await db.scalar(select(User).where(User.phone_number == phone_number))
+            await db.commit()
+            return {
+                "success": True,
+                "invite_token": token,
+                "invitee_exists": invitee_user is not None,
+                "invitee_name": invitee_user.name if invitee_user else None,
+                "resent": True,
+                "message": f"Invite resent to {phone_number}",
+            }
 
         token = secrets.token_urlsafe(32)
         invitee_user = await db.scalar(select(User).where(User.phone_number == phone_number))
@@ -128,6 +142,23 @@ class GroupService:
 
         await db.commit()
         return {"success": True, "message": "You've joined the Pro account! ✅\n\nUse `/mygroups` to see shared groups, then `/setgroup <name>` to activate one."}
+
+    async def cancel_invite(
+        self, owner: User, phone_number: str, db: AsyncSession
+    ) -> Dict[str, Any]:
+        acct = await self.get_or_create_pro_account(owner, db)
+        row = await db.scalar(
+            select(ProAccountMember).where(
+                ProAccountMember.account_id == acct.id,
+                ProAccountMember.phone_number == phone_number,
+                ProAccountMember.status == "pending",
+            )
+        )
+        if not row:
+            return {"success": False, "message": f"No pending invite for {phone_number}."}
+        await db.delete(row)
+        await db.commit()
+        return {"success": True, "message": f"Invite for {phone_number} cancelled. Slot freed."}
 
     async def get_account_members(self, account_id: int, db: AsyncSession) -> List[Dict]:
         rows = await db.execute(
