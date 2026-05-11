@@ -1169,6 +1169,20 @@ async def process_webhook_message(webhook_data: Dict):
                     )
                     continue
 
+                # ── /addmember <phone> ────────────────────────────────
+                if content.lower().startswith("/addmember "):
+                    phone = content.split(" ", 1)[1].strip()
+                    result = await grp_svc.add_member_to_active_group(user, phone, db)
+                    if result["success"]:
+                        await messaging_client.send_message(
+                            chat_id,
+                            f"✅ *{result['name']}* added to *{result['group_name']}*!\n\n"
+                            f"They can now use `/setgroup {result['group_name']}` to activate it."
+                        )
+                    else:
+                        await messaging_client.send_message(chat_id, f"❌ {result['message']}")
+                    continue
+
                 # ── /mygroups ─────────────────────────────────────────
                 if content.lower().strip() in {"/mygroups", "mygroups", "/groups"}:
                     groups = await grp_svc.get_user_groups(user.id, db)

@@ -160,6 +160,48 @@ class GroupService:
         await db.commit()
         return {"success": True, "message": f"Invite for {phone_number} cancelled. Slot freed."}
 
+    async def add_member_to_active_group(
+        self, owner: User, phone_number: str, db: AsyncSession
+    ) -> Dict[str, Any]:
+        acct = await self.get_pro_account_for_user(owner.id, db)
+        if not acct:
+            return {"success": False, "message": "You need a Pro plan to manage groups."}
+
+        # Verify the phone is an active member of this Pro account
+        member_row = await db.scalar(
+            select(ProAccountMember).where(
+                ProAccountMember.account_id == acct.id,
+                ProAccountMember.phone_number == phone_number,
+                ProAccountMember.status == "active",
+            )
+        )
+        if not member_row:
+            return {"success": False, "message": f"{phone_number} is not an active member of your Pro account."}
+
+        if not owner.active_group_id:
+            return {"success": False, "message": "You have no active group. Use `/setgroup <name>` first."}
+
+        group = await db.get(Group, owner.active_group_id)
+        if not group:
+            return {"success": False, "message": "Active group not found."}
+
+        target_user = await db.scalar(select(User).where(User.id == member_row.user_id))
+        if not target_user:
+            return {"success": False, "message": f"{phone_number} has not linked their account yet."}
+
+        existing = await db.scalar(
+            select(GroupMember).where(
+                GroupMember.group_id == group.id,
+                GroupMember.user_id == target_user.id,
+            )
+        )
+        if existing:
+            return {"success": False, "message": f"{target_user.name} is already in *{group.name}*."}
+
+        db.add(GroupMember(group_id=group.id, user_id=target_user.id, role="member"))
+        await db.commit()
+        return {"success": True, "name": target_user.name, "group_name": group.name}
+
     async def get_account_members(self, account_id: int, db: AsyncSession) -> List[Dict]:
         rows = await db.execute(
             select(ProAccountMember, User)
