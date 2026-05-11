@@ -32,6 +32,7 @@ class Config:
     
     # Telegram Configuration
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "ExtendedMindsBot")
     TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL")
     
     # Cerebras AI

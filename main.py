@@ -1120,7 +1120,7 @@ async def process_webhook_message(webhook_data: Dict):
                     if result["success"]:
                         token      = result["invite_token"]
                         invitee    = result.get("invitee_name") or phone
-                        invite_url = f"https://t.me/ExtendedMindsBot?start=join_{token}"
+                        invite_url = f"https://t.me/{Config.TELEGRAM_BOT_USERNAME}?start=join_{token}"
                         msg = (
                             f"✅ Invite sent to *{invitee}*!\n\n"
                             f"Share this link with them:\n{invite_url}\n\n"

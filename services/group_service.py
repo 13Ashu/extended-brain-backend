@@ -127,10 +127,11 @@ class GroupService:
         await db.flush()
 
         # Auto-add to all existing groups in this Pro account
-        groups = await db.execute(
-            select(Group).where(Group.account_id == member_row.account_id)
-        )
-        for group in groups.scalars():
+        # Fetch all groups eagerly before iterating to avoid open-cursor conflicts in async SQLAlchemy
+        all_groups = (
+            await db.execute(select(Group).where(Group.account_id == member_row.account_id))
+        ).scalars().all()
+        for group in all_groups:
             already = await db.scalar(
                 select(GroupMember).where(
                     GroupMember.group_id == group.id,
