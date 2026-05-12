@@ -18,7 +18,7 @@ import os
 import re
 import asyncio
 import httpx
-from sqlalchemy import select, update, func, text
+from sqlalchemy import and_, or_, select, update, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import Config, MessagingPlatform
