@@ -2119,6 +2119,23 @@ async def get_recent_messages(
     return {"success": True, "results": messages, "total": len(messages)}
 
 
+@app.delete("/api/messages/{message_id}")
+async def delete_message(
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a message owned by the current user."""
+    msg = await db.get(Message, message_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your message")
+    await db.delete(msg)
+    await db.commit()
+    return {"success": True}
+
+
 @app.post("/api/messages/capture")
 async def capture_message(
     message: MessageCreate,
