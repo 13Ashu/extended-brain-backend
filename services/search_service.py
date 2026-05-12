@@ -318,6 +318,7 @@ class SearchService:
                     "results": [{
                         "id":           msg.id,
                         "content":      msg.content,
+                        "message_type": "text",
                         "essence":      list_name,
                         "category":     "List",
                         "all_buckets":  ["List"],
@@ -330,7 +331,6 @@ class SearchService:
                         "relevance":    100.0,
                         "preview":      f"{len(subtasks)} items",
                         "is_list":      True,
-                        "list_message": msg,
                     }],
                     "natural_response": "",
                     "is_list":          True,
@@ -365,6 +365,7 @@ class SearchService:
             "results": [{
                 "id":           msg.id,
                 "content":      msg.content,
+                "message_type": "text",
                 "essence":      tags.get("list_name", msg.content),
                 "category":     "List",
                 "all_buckets":  ["List"],
@@ -377,7 +378,6 @@ class SearchService:
                 "relevance":    100.0,
                 "preview":      f"{len(subtasks)} items",
                 "is_list":      True,
-                "list_message": msg,
             }],
             "natural_response": "",
             "is_list":          True,
