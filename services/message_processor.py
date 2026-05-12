@@ -13,6 +13,9 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timedelta
+import pytz
+
+_IST = pytz.timezone("Asia/Kolkata")
 from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import select, update
@@ -100,7 +103,10 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _today_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d")
+    return datetime.now(_IST).strftime("%Y-%m-%d")
+
+def _ist_now() -> datetime:
+    return datetime.now(_IST)
 
 
 def _detect_priority(content: str) -> str:
@@ -238,7 +244,7 @@ class MessageProcessor:
         if not user:
             raise ValueError("User not registered")
 
-        ref = datetime.utcnow()
+        ref = datetime.now(_IST)
 
         # ── Single LLM call: multi-action intent parse ────────────
         from services.intent_service import get_intent_service
@@ -373,7 +379,7 @@ class MessageProcessor:
 
         saved_ids   = []
         saved_items = []
-        ref         = datetime.utcnow()
+        ref         = datetime.now(_IST)
         people      = parsed.get("people", [])
 
         for task_data in tasks:
@@ -875,7 +881,7 @@ Return ONLY this JSON:
 
         saved_ids   = []
         saved_items = []
-        ref         = datetime.utcnow()
+        ref         = datetime.now(_IST)
 
         for item in items:
             task     = str(item.get("task", "")).strip()

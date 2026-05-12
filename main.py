@@ -275,6 +275,34 @@ async def link_telegram(request: TelegramLinkRequest, db: AsyncSession = Depends
     return {"success": True, "message": "Telegram linked successfully"}
 
 
+@app.get("/api/messages/{message_id}")
+async def get_message(
+    message_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Message).where(
+            and_(Message.id == message_id, Message.user_id == current_user.id)
+        )
+    )
+    msg = result.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return {
+        "success": True,
+        "data": {
+            "id": msg.id,
+            "content": msg.content,
+            "essence": msg.essence,
+            "category": msg.category,
+            "tags": msg.tags or {},
+            "message_type": msg.message_type,
+            "created_at": msg.created_at.isoformat(),
+        }
+    }
+
+
 @app.get("/api/users/me")
 async def get_me(
     db: AsyncSession = Depends(get_db),

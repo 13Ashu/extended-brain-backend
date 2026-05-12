@@ -27,8 +27,8 @@ CEREBRAS_BASE_URL   = "https://api.cerebras.ai/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 GEMINI_BASE_URL     = "https://generativelanguage.googleapis.com/v1beta/models"
 
-CEREBRAS_DEFAULT_MODEL = "gpt-oss-120b"
-CEREBRAS_FALLBACK_MODELS = []
+CEREBRAS_DEFAULT_MODEL = "qwen-3-235b-a22b-instruct-2507"
+CEREBRAS_FALLBACK_MODELS = ["llama3.1-8b"]
 OPENROUTER_DEFAULT_MODEL = "google/gemma-3-4b-it:free"
 GEMINI_DEFAULT_MODEL     = "gemini-2.0-flash-lite"   # faster than 2.5-flash-lite, better JSON
 GEMINI_LITE_MODEL = "gemini-2.0-flash-lite"
