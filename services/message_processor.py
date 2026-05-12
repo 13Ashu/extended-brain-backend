@@ -245,7 +245,7 @@ class MessageProcessor:
         if not user:
             raise ValueError("User not registered")
 
-        ref = datetime.now(_IST)
+        ref = _ist_now()
 
         # ── Single LLM call: multi-action intent parse ────────────
         from services.intent_service import get_intent_service
@@ -380,7 +380,7 @@ class MessageProcessor:
 
         saved_ids   = []
         saved_items = []
-        ref         = datetime.now(_IST)
+        ref         = _ist_now()
         people      = parsed.get("people", [])
 
         for task_data in tasks:
@@ -882,7 +882,7 @@ Return ONLY this JSON:
 
         saved_ids   = []
         saved_items = []
-        ref         = datetime.now(_IST)
+        ref         = _ist_now()
 
         for item in items:
             task     = str(item.get("task", "")).strip()
