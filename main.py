@@ -2539,6 +2539,9 @@ class CreateGroupRequest(BaseModel):
 class AddGroupMemberRequest(BaseModel):
     user_id: int
 
+class AddGroupMemberByPhoneRequest(BaseModel):
+    phone_number: str
+
 
 @app.get("/api/pro/status")
 async def get_pro_status(
@@ -2665,6 +2668,50 @@ async def add_group_member(
         raise HTTPException(status_code=403, detail="User is not in your Pro account")
     added = await grp_svc.add_member_to_group(group, req.user_id, "member", db)
     return {"success": True, "added": added}
+
+
+@app.post("/api/groups/{group_id}/invite")
+async def invite_group_member_by_phone(
+    group_id: int,
+    req: AddGroupMemberByPhoneRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Add a group member by phone number (must be in same Pro account)."""
+    group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found or access denied")
+
+    acct = await grp_svc.get_pro_account_for_user(current_user.id, db)
+    if not acct:
+        raise HTTPException(status_code=403, detail="Pro account required to add members")
+
+    member_row = await db.scalar(
+        select(ProAccountMember).where(
+            ProAccountMember.account_id == acct.id,
+            ProAccountMember.phone_number == req.phone_number,
+            ProAccountMember.status == "active",
+        )
+    )
+    if not member_row:
+        raise HTTPException(status_code=404, detail=f"{req.phone_number} is not in your Pro account")
+
+    target_user = await db.scalar(select(User).where(User.id == member_row.user_id))
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User has not linked their account yet")
+
+    existing = await db.scalar(
+        select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == target_user.id,
+        )
+    )
+    if existing:
+        return {"success": True, "added": False, "name": target_user.name}
+
+    db.add(GroupMember(group_id=group_id, user_id=target_user.id, role="member"))
+    await db.commit()
+    return {"success": True, "added": True, "name": target_user.name}
 
 
 @app.delete("/api/groups/{group_id}/leave")
