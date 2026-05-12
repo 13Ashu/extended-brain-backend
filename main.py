@@ -275,6 +275,24 @@ async def link_telegram(request: TelegramLinkRequest, db: AsyncSession = Depends
     return {"success": True, "message": "Telegram linked successfully"}
 
 
+@app.get("/api/users/me")
+async def get_me(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return {
+        "success": True,
+        "data": {
+            "id": current_user.id,
+            "name": current_user.name,
+            "email": current_user.email,
+            "phone_number": current_user.phone_number,
+            "timezone": current_user.timezone,
+            "is_pro": current_user.is_pro,
+        }
+    }
+
+
 @app.post("/api/users/register")
 async def register_user(user_data: UserRegistrationRequest, db: AsyncSession = Depends(get_db)):
     result = await auth_service.register_user(
