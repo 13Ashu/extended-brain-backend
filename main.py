@@ -275,7 +275,7 @@ async def link_telegram(request: TelegramLinkRequest, db: AsyncSession = Depends
     return {"success": True, "message": "Telegram linked successfully"}
 
 
-@app.get("/api/messages/{message_id}")
+@app.get("/api/messages/detail/{message_id}")
 async def get_message(
     message_id: int,
     db: AsyncSession = Depends(get_db),
