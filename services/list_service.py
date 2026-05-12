@@ -463,14 +463,32 @@ class ListService:
         return result.scalar_one_or_none()
 
     async def find_best_matching_list(
-        self, user_id: int, list_name: str, db: AsyncSession
+        self, user_id: int, list_name: str, db: AsyncSession,
+        group_id: Optional[int] = None,
     ) -> Optional[Message]:
         """
-        Find best matching list — exact first, then fuzzy by key words.
-        "Dmart Shopping List" matches "dmart list" or "dmart shopping".
+        Find best matching list — group-scoped when group_id is set, else personal.
+        Exact name match first, then fuzzy by key words.
         """
+        # Determine the scope filter: group messages OR personal messages
+        scope_filter = (Message.group_id == group_id) if group_id else (
+            and_(Message.user_id == user_id, Message.group_id.is_(None))
+        )
+
         # Exact match
-        msg = await self.get_list_by_name(user_id, list_name, db)
+        result = await db.execute(
+            select(Message)
+            .where(and_(
+                scope_filter,
+                text("messages.tags->>'list_name' ILIKE :name"),
+                text("messages.tags->'all_buckets' @> '\"List\"'::jsonb"),
+                text("(messages.tags->>'is_active')::boolean IS NOT FALSE"),
+            ))
+            .params(name=list_name)
+            .order_by(Message.created_at.desc())
+            .limit(1)
+        )
+        msg = result.scalar_one_or_none()
         if msg:
             return msg
 
@@ -489,7 +507,7 @@ class ListService:
                     select(Message)
                     .where(
                         and_(
-                            Message.user_id == user_id,
+                            scope_filter,
                             text("messages.tags->>'list_type' = :lt"),
                             text("messages.tags->'all_buckets' @> '\"List\"'::jsonb"),
                             text("(messages.tags->>'is_active')::boolean IS NOT FALSE"),
@@ -513,7 +531,7 @@ class ListService:
             select(Message)
             .where(
                 and_(
-                    Message.user_id == user_id,
+                    scope_filter,
                     text("messages.tags->'all_buckets' @> '\"List\"'::jsonb"),
                     text("(messages.tags->>'is_active')::boolean IS NOT FALSE"),
                     or_(*conditions),
@@ -528,13 +546,11 @@ class ListService:
         if not candidates:
             return None
 
-        # Score: count how many key words match
         def score(m: Message) -> int:
             stored = (m.tags or {}).get("list_name", "").lower()
             return sum(1 for kw in key_words if kw in stored)
 
         candidates.sort(key=score, reverse=True)
-        # Return best scoring match, or most recent if no distinctive keywords matched
         return candidates[0]
 
     async def create_or_add(
@@ -544,15 +560,17 @@ class ListService:
         list_type: str,
         items: List[str],
         db: AsyncSession,
+        group_id: Optional[int] = None,
     ) -> Tuple[Message, int, bool]:
         """
         Create if not exists, add items if exists.
+        When group_id is provided, the list is shared across the group.
         Returns (message, items_added, was_created).
         """
-        msg = await self.find_best_matching_list(user_id, list_name, db)
+        msg = await self.find_best_matching_list(user_id, list_name, db, group_id=group_id)
 
         if not msg:
-            msg = await self._create_list(user_id, list_name, list_type, items, db)
+            msg = await self._create_list(user_id, list_name, list_type, items, db, group_id=group_id)
             return msg, len(items), True
 
         # Add to existing
@@ -582,6 +600,7 @@ class ListService:
     async def _create_list(
         self, user_id: int, list_name: str, list_type: str,
         items: List[str], db: AsyncSession,
+        group_id: Optional[int] = None,
     ) -> Message:
         cat = await db.scalar(
             select(Category).where(
@@ -598,6 +617,7 @@ class ListService:
 
         msg = Message(
             user_id=user_id,
+            group_id=group_id,
             category_id=cat.id,
             content=list_name,
             message_type=MT("text"),

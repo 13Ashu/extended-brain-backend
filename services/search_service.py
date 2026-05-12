@@ -180,6 +180,7 @@ class SearchService:
         db: AsyncSession,
         limit: int = 15,
         category_filter: Optional[List[str]] = None,
+        group_id: Optional[int] = None,
     ) -> Dict:
         if not query or not query.strip():
             return {"results": [], "natural_response": "Please enter a search query."}
@@ -197,7 +198,7 @@ class SearchService:
         # ── 1. List fetch FIRST — before any LLM call ────────────────
         # All ? queries are searches. List queries are the most common
         # and can be resolved purely from DB — no LLM needed.
-        list_result = await self._try_list_fetch(user.id, query, db)
+        list_result = await self._try_list_fetch(user.id, query, db, group_id=group_id)
         if list_result is not None:
             return list_result
 
@@ -216,7 +217,7 @@ class SearchService:
         # IntentService may have extracted a list_name we missed in step 1
         if is_query and list_name_hint:
             list_result = await self._try_list_fetch(
-                user.id, query, db, list_name_hint=list_name_hint
+                user.id, query, db, list_name_hint=list_name_hint, group_id=group_id
             )
             if list_result is not None:
                 return list_result
@@ -273,6 +274,7 @@ class SearchService:
         messages = await self._retrieve(
             user=user, query=query, expansion=expansion,
             use_due_filter=use_due_filter, db=db, limit=limit * 3,
+            group_id=group_id,
         )
 
         ranked = self._rank(
@@ -294,6 +296,7 @@ class SearchService:
     async def _try_list_fetch(
         self, user_id: int, query: str, db: AsyncSession,
         list_name_hint: Optional[str] = None,
+        group_id: Optional[int] = None,
     ) -> Optional[Dict]:
         from services.list_service import ListService
         ls = ListService(self.cerebras)
@@ -306,7 +309,7 @@ class SearchService:
 
         # Fast path: IntentService already extracted the list name
         if list_name_hint:
-            msg = await ls.find_best_matching_list(user_id, list_name_hint, db)
+            msg = await ls.find_best_matching_list(user_id, list_name_hint, db, group_id=group_id)
             if msg:
                 tags      = msg.tags if isinstance(msg.tags, dict) else {}
                 subtasks  = tags.get("subtasks", [])
@@ -342,7 +345,7 @@ class SearchService:
         list_name = intent["list_name"]
         list_type = intent["list_type"]
 
-        msg = await ls.find_best_matching_list(user_id, list_name, db)
+        msg = await ls.find_best_matching_list(user_id, list_name, db, group_id=group_id)
         if not msg:
             return {
                 "results":          [],
@@ -571,20 +574,31 @@ Return ONLY this JSON:
     async def _retrieve(
         self, user: User, query: str, expansion: Dict,
         use_due_filter: bool, db: AsyncSession, limit: int,
+        group_id: Optional[int] = None,
     ) -> List[tuple]:
         semantic_hits: Dict[int, float] = {}
         try:
             from services.embedding_service import embedding_service
             query_embedding = await embedding_service.aembed_query(query)
             embedding_str   = f"[{','.join(map(str, query_embedding))}]"
-            sem_sql = text("""
-                SELECT m.id, 1 - (m.embedding <=> :emb ::vector) AS similarity
-                FROM messages m
-                WHERE m.user_id = :uid AND m.embedding IS NOT NULL
-                ORDER BY m.embedding <=> :emb ::vector
-                LIMIT :lim
-            """)
-            sem_result    = await db.execute(sem_sql, {"emb": embedding_str, "uid": user.id, "lim": limit})
+            if group_id:
+                sem_sql = text("""
+                    SELECT m.id, 1 - (m.embedding <=> :emb ::vector) AS similarity
+                    FROM messages m
+                    WHERE m.group_id = :gid AND m.embedding IS NOT NULL
+                    ORDER BY m.embedding <=> :emb ::vector
+                    LIMIT :lim
+                """)
+                sem_result = await db.execute(sem_sql, {"emb": embedding_str, "gid": group_id, "lim": limit})
+            else:
+                sem_sql = text("""
+                    SELECT m.id, 1 - (m.embedding <=> :emb ::vector) AS similarity
+                    FROM messages m
+                    WHERE m.user_id = :uid AND m.group_id IS NULL AND m.embedding IS NOT NULL
+                    ORDER BY m.embedding <=> :emb ::vector
+                    LIMIT :lim
+                """)
+                sem_result = await db.execute(sem_sql, {"emb": embedding_str, "uid": user.id, "lim": limit})
             semantic_hits = {row.id: float(row.similarity) for row in sem_result}
         except Exception as e:
             print(f"⚠ Semantic search failed: {e}")
@@ -592,8 +606,11 @@ Return ONLY this JSON:
         stmt = (
             select(Message, Category)
             .join(Category, Message.category_id == Category.id, isouter=True)
-            .where(Message.user_id == user.id)
         )
+        if group_id:
+            stmt = stmt.where(Message.group_id == group_id)
+        else:
+            stmt = stmt.where(and_(Message.user_id == user.id, Message.group_id.is_(None)))
 
         bucket_filter  = expansion.get("bucket_filter")
         extra_buckets  = expansion.get("extra_buckets", [])

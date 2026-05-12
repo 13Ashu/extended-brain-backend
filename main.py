@@ -177,12 +177,14 @@ class MessageCreate(BaseModel):
     message_type: MessageTypeEnum = MessageTypeEnum.TEXT
     media_url:    Optional[str]   = None
     metadata:     Optional[Dict[str, Any]] = None
+    group_id:     Optional[int]   = None
 
 
 class SearchQuery(BaseModel):
     query:           str
     limit:           int = 10
     category_filter: Optional[List[str]] = None
+    group_id:        Optional[int] = None
 
 
 class CategoryOperation(BaseModel):
@@ -2023,17 +2025,65 @@ async def handle_category_command(phone: str, content: str, db: AsyncSession) ->
 
 # ================== REST API Endpoints ==================
 
-@app.get("/api/messages/recent")
-async def get_recent_messages(
-    limit: int = 100,
+@app.get("/api/messages/assigned")
+async def get_assigned_messages(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return the user's most recent messages, newest first."""
+    """Return tasks assigned to the current user across all groups."""
+    result = await db.execute(
+        select(Message, Category, User)
+        .outerjoin(Category, Message.category_id == Category.id)
+        .join(User, User.id == Message.user_id)
+        .where(Message.assigned_to_user_id == current_user.id)
+        .order_by(Message.created_at.desc())
+        .limit(100)
+    )
+    rows = result.all()
+    messages = []
+    for msg, cat, sender in rows:
+        tags = msg.tags if isinstance(msg.tags, dict) else {}
+        bucket = tags.get("primary_bucket") or tags.get("intent_bucket") or (cat.name if cat else "To-Do")
+        messages.append({
+            "id":             msg.id,
+            "content":        msg.content,
+            "essence":        msg.summary or msg.content[:80],
+            "message_type":   msg.message_type.value if msg.message_type else "text",
+            "media_url":      msg.media_url,
+            "category":       bucket,
+            "all_buckets":    tags.get("all_buckets", [bucket]),
+            "priority":       tags.get("priority", "normal"),
+            "tags":           tags,
+            "created_at":     msg.created_at.isoformat(),
+            "due_date":       tags.get("due_date"),
+            "group_id":       msg.group_id,
+            "sender_name":    sender.name,
+            "assigned_to_user_id": msg.assigned_to_user_id,
+        })
+    return {"success": True, "results": messages, "total": len(messages)}
+
+
+@app.get("/api/messages/recent")
+async def get_recent_messages(
+    limit: int = 100,
+    group_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return recent messages — personal if no group_id, group feed if group_id provided."""
+    if group_id:
+        # Verify membership
+        group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
+        if not group:
+            raise HTTPException(status_code=403, detail="Not a member of this group")
+        base_filter = Message.group_id == group_id
+    else:
+        base_filter = and_(Message.user_id == current_user.id, Message.group_id.is_(None))
+
     result = await db.execute(
         select(Message, Category)
         .outerjoin(Category, Message.category_id == Category.id)
-        .where(Message.user_id == current_user.id)
+        .where(base_filter)
         .order_by(Message.created_at.desc())
         .limit(min(limit, 200))
     )
@@ -2048,20 +2098,22 @@ async def get_recent_messages(
             or (cat.name if cat else "Random")
         )
         messages.append({
-            "id":           msg.id,
-            "content":      msg.content,
-            "essence":      msg.summary or msg.content[:80],
-            "message_type": msg.message_type.value if msg.message_type else "text",
-            "media_url":    msg.media_url,
-            "category":     bucket,
-            "all_buckets":  tags.get("all_buckets", [bucket]),
-            "priority":     tags.get("priority", "normal"),
-            "tags":         tags,
-            "created_at":   msg.created_at.isoformat(),
-            "due_date":     tags.get("due_date"),
-            "event_time":   tags.get("event_time"),
-            "events":       tags.get("events", []),
-            "starred":      tags.get("starred", False),
+            "id":                    msg.id,
+            "content":               msg.content,
+            "essence":               msg.summary or msg.content[:80],
+            "message_type":          msg.message_type.value if msg.message_type else "text",
+            "media_url":             msg.media_url,
+            "category":              bucket,
+            "all_buckets":           tags.get("all_buckets", [bucket]),
+            "priority":              tags.get("priority", "normal"),
+            "tags":                  tags,
+            "created_at":            msg.created_at.isoformat(),
+            "due_date":              tags.get("due_date"),
+            "event_time":            tags.get("event_time"),
+            "events":                tags.get("events", []),
+            "starred":               tags.get("starred", False),
+            "group_id":              msg.group_id,
+            "assigned_to_user_id":   msg.assigned_to_user_id,
         })
 
     return {"success": True, "results": messages, "total": len(messages)}
@@ -2073,10 +2125,37 @@ async def capture_message(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    group_id      = message.group_id
+    content       = message.content
+    assigned_uid  = None
+    assigned_name = None
+
+    # ── Group context: parse @mention before processing ──────────────
+    if group_id:
+        members = await grp_svc.get_group_members(group_id, db)
+        uid, cleaned = grp_svc.parse_mention(content, members)
+        if uid:
+            assigned_uid  = uid
+            assigned_name = next((m["name"] for m in members if m["id"] == uid), None)
+            content       = cleaned   # strip "@Name " prefix before saving
+
     result = await message_processor.process(
-        user_phone=current_user.phone_number, content=message.content,
+        user_phone=current_user.phone_number, content=content,
         message_type=message.message_type, media_url=message.media_url, db=db,
     )
+
+    # ── Tag message with group_id / assigned_to ───────────────────────
+    if group_id and result.get("message_id"):
+        await db.execute(
+            update(Message)
+            .where(Message.id == result["message_id"])
+            .values(group_id=group_id, assigned_to_user_id=assigned_uid)
+        )
+        await db.commit()
+        result["group_id"]       = group_id
+        result["assigned_to"]    = assigned_name
+        result["assigned_to_id"] = assigned_uid
+
     return {"success": True, "message": "Content captured successfully", "data": result}
 
 
@@ -2086,9 +2165,15 @@ async def search_messages(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if search.group_id:
+        # Verify membership before searching the group
+        group = await grp_svc.get_group_by_id(search.group_id, current_user.id, db)
+        if not group:
+            raise HTTPException(status_code=403, detail="Not a member of this group")
     search_data = await search_service.search(
         user_phone=current_user.phone_number, query=search.query,
-        limit=search.limit, category_filter=search.category_filter, db=db,
+        limit=search.limit, category_filter=search.category_filter,
+        group_id=search.group_id, db=db,
     )
     return {
         "success":          True,
@@ -2097,6 +2182,40 @@ async def search_messages(
         "results":          search_data.get("results", []),
         "total":            len(search_data.get("results", [])),
     }
+
+
+@app.patch("/api/messages/{message_id}/done")
+async def mark_message_done(
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import update as sa_update
+    result = await db.execute(
+        sa_update(Message)
+        .where(and_(Message.id == message_id, Message.user_id == current_user.id))
+        .values(tags=text(
+            "jsonb_set(COALESCE(tags, '{}'), '{done}', 'true'::jsonb)"
+        ))
+    )
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return {"success": True}
+
+
+@app.patch("/api/messages/{message_id}/items/{item_index}/complete")
+async def complete_list_item(
+    message_id: int,
+    item_index: int,
+    current_user: User = Depends(get_current_user),
+):
+    from services.list_service import ListService
+    ls = ListService(cerebras_client)
+    success = await ls.complete_item(message_id, item_index)
+    if not success:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return {"success": True}
 
 
 @app.post("/api/categories/manage")
