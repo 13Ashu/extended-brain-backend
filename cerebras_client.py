@@ -27,8 +27,8 @@ CEREBRAS_BASE_URL   = "https://api.cerebras.ai/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 GEMINI_BASE_URL     = "https://generativelanguage.googleapis.com/v1beta/models"
 
-CEREBRAS_DEFAULT_MODEL = "qwen-3-235b-a22b-instruct-2507"
-CEREBRAS_FALLBACK_MODELS = ["llama3.1-8b"]
+CEREBRAS_DEFAULT_MODEL = "gpt-oss-120b"
+CEREBRAS_FALLBACK_MODELS = []
 OPENROUTER_DEFAULT_MODEL = "google/gemma-3-4b-it:free"
 GEMINI_DEFAULT_MODEL     = "gemini-2.0-flash-lite"   # faster than 2.5-flash-lite, better JSON
 GEMINI_LITE_MODEL = "gemini-2.0-flash-lite"
@@ -248,6 +248,7 @@ class CerebrasClient:
 
             for attempt in range(3):
                 try:
+                    t0 = time.monotonic()
                     async with httpx.AsyncClient(timeout=30.0) as client:
                         resp = await client.post(
                             f"{self.base_url}/chat/completions",
@@ -267,9 +268,8 @@ class CerebrasClient:
                             print(f"[cerebras] No content for model {model}")
                             break  # try next model
 
-                        if model != self.model:
-                            print(f"[cerebras] Succeeded with fallback model: {model}")
-
+                        elapsed = time.monotonic() - t0
+                        print(f"[cerebras] model={model} tokens≤{max_tokens} → {elapsed:.2f}s")
                         return content.strip()
 
                 except httpx.HTTPStatusError as e:

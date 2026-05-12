@@ -195,17 +195,32 @@ class SearchService:
         if query.lower().strip().startswith("image:"):
             return await self._fetch_images_direct(user.id, query, db, limit)
 
+        import time as _time
+        _t0 = _time.monotonic()
+
         # ── 1. List fetch FIRST — before any LLM call ────────────────
-        # All ? queries are searches. List queries are the most common
-        # and can be resolved purely from DB — no LLM needed.
         list_result = await self._try_list_fetch(user.id, query, db, group_id=group_id)
         if list_result is not None:
+            print(f"[search] list_fetch hit → {_time.monotonic()-_t0:.2f}s total")
             return list_result
 
-        # ── 2. IntentService — only if list fetch didn't resolve it ──
+        # ── 2. Intent parse + embedding in parallel ───────────────────
+        # Embedding is independent of intent; start it immediately.
         from services.intent_service import get_intent_service
-        intent_svc = get_intent_service(self.cerebras)
-        parsed     = await intent_svc.parse(query, user.name, user.timezone or "Asia/Kolkata")
+        from services.embedding_service import embedding_service
+        import asyncio as _asyncio
+
+        intent_svc   = get_intent_service(self.cerebras)
+        intent_task  = _asyncio.create_task(
+            intent_svc.parse(query, user.name, user.timezone or "Asia/Kolkata")
+        )
+        embed_task   = _asyncio.create_task(
+            embedding_service.aembed_query(query)
+        )
+
+        parsed = await intent_task
+        _t1 = _time.monotonic()
+        print(f"[search] intent parse → {_t1-_t0:.2f}s")
 
         actions        = parsed.get("actions", {})
         is_query       = actions.get("is_query", False)
@@ -214,18 +229,17 @@ class SearchService:
         date_hint      = query_sub.get("date_hint")
 
         # ── 3. Second list fetch attempt with IntentService hint ──────
-        # IntentService may have extracted a list_name we missed in step 1
         if is_query and list_name_hint:
             list_result = await self._try_list_fetch(
                 user.id, query, db, list_name_hint=list_name_hint, group_id=group_id
             )
             if list_result is not None:
+                embed_task.cancel()
+                print(f"[search] list_fetch(hint) hit → {_time.monotonic()-_t0:.2f}s total")
                 return list_result
 
         # ── 4. Resolve date range ─────────────────────────────────────
         date_from, date_to = _resolve_date_range(query, today)
-        print(f"[search] _resolve_date_range({query!r}) → {date_from}, {date_to}")
-
         if not date_from and is_query:
             if date_hint == "today":
                 date_from = date_to = str(today)
@@ -237,8 +251,8 @@ class SearchService:
                 date_from = str(monday)
                 date_to   = str(monday + timedelta(days=6))
 
-
         print(f"[search] query={query!r} date_from={date_from} date_to={date_to} is_query={is_query} is_todo={_is_todo_query(query)}")
+
         # ── 5. Direct todo fetch ──────────────────────────────────────
         if _is_todo_query(query):
             fetch_from  = date_from or str(today)
@@ -246,11 +260,10 @@ class SearchService:
             todo_result = await self._fetch_todos_direct(
                 user.id, fetch_from, fetch_to, db, limit
             )
-            if _is_todo_query(query):
-                return todo_result        # always return for explicit todo queries
-            if todo_result["results"]:
-                return todo_result        # return if found, else fall through
-            
+            embed_task.cancel()
+            print(f"[search] todo_direct hit → {_time.monotonic()-_t0:.2f}s total")
+            return todo_result
+
         # ── 6. Standard semantic + keyword search ─────────────────────
         bucket_hint    = _detect_bucket(query)
         use_due_filter = _is_due_date_query(query) and date_from is not None
@@ -260,6 +273,8 @@ class SearchService:
             query=query, user=user, db=db,
             date_from=date_from, date_to=date_to, bucket_hint=bucket_hint,
         )
+        _t2 = _time.monotonic()
+        print(f"[search] expand_query → {_t2-_t1:.2f}s")
 
         if date_from:
             expansion["date_from"] = date_from
@@ -271,11 +286,23 @@ class SearchService:
             if person_hint not in expansion["entities"]:
                 expansion["entities"].insert(0, person_hint)
 
+        # Wait for embedding (likely already done since it ran in parallel)
+        try:
+            query_embedding = await embed_task
+        except Exception as e:
+            print(f"[search] embed_task failed: {e}")
+            query_embedding = None
+        _t3 = _time.monotonic()
+        print(f"[search] embedding ready → {_t3-_t0:.2f}s total")
+
         messages = await self._retrieve(
             user=user, query=query, expansion=expansion,
             use_due_filter=use_due_filter, db=db, limit=limit * 3,
             group_id=group_id,
+            precomputed_embedding=query_embedding,
         )
+        _t4 = _time.monotonic()
+        print(f"[search] retrieve ({len(messages)} msgs) → {_t4-_t3:.2f}s")
 
         ranked = self._rank(
             messages=messages, query=query, expansion=expansion,
@@ -286,6 +313,7 @@ class SearchService:
             query=query, results=ranked,
             date_from=date_from, date_to=date_to, today=today,
         )
+        print(f"[search] natural_response → {_time.monotonic()-_t4:.2f}s | total={_time.monotonic()-_t0:.2f}s")
 
         return {"results": ranked, "natural_response": natural}
 
@@ -575,11 +603,12 @@ Return ONLY this JSON:
         self, user: User, query: str, expansion: Dict,
         use_due_filter: bool, db: AsyncSession, limit: int,
         group_id: Optional[int] = None,
+        precomputed_embedding: Optional[List[float]] = None,
     ) -> List[tuple]:
         semantic_hits: Dict[int, float] = {}
         try:
             from services.embedding_service import embedding_service
-            query_embedding = await embedding_service.aembed_query(query)
+            query_embedding = precomputed_embedding or await embedding_service.aembed_query(query)
             embedding_str   = f"[{','.join(map(str, query_embedding))}]"
             if group_id:
                 sem_sql = text("""
