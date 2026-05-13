@@ -219,6 +219,7 @@ class SearchQuery(BaseModel):
     limit:           int = 10
     category_filter: Optional[List[str]] = None
     group_id:        Optional[int] = None
+    fast:            bool = False  # skip LLM; return embedding+keyword results instantly
 
 
 class CategoryOperation(BaseModel):
@@ -2669,7 +2670,7 @@ async def search_messages(
     search_data = await search_service.search(
         user_phone=current_user.phone_number, query=search.query,
         limit=search.limit, category_filter=search.category_filter,
-        group_id=search.group_id, db=db,
+        group_id=search.group_id, db=db, fast=search.fast,
     )
     return {
         "success":          True,

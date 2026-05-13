@@ -183,6 +183,7 @@ class SearchService:
         limit: int = 15,
         category_filter: Optional[List[str]] = None,
         group_id: Optional[int] = None,
+        fast: bool = False,
     ) -> Dict:
         if not query or not query.strip():
             return {"results": [], "natural_response": "Please enter a search query."}
@@ -217,7 +218,42 @@ class SearchService:
             print(f"[search] list_fetch hit → {_time.monotonic()-_t0:.2f}s total")
             return list_result
 
-        # ── 2. Intent parse + embedding in parallel ───────────────────
+        # ── 2a. FAST PATH — skip all LLM, pure embedding + keyword ──────
+        if fast:
+            from services.embedding_service import embedding_service
+            date_from, date_to = _resolve_date_range(query, today)
+            bucket_hint        = _detect_bucket(query)
+            words              = [w for w in query.lower().split() if len(w) > 2]
+            expansion = {
+                "core_concepts": words,
+                "keywords":      words,
+                "entities":      [],
+                "intent":        "find_specific",
+                "search_focus":  "all",
+                "extra_buckets": [],
+                "bucket_filter": bucket_hint,
+            }
+            if date_from:
+                expansion["date_from"] = date_from
+                expansion["date_to"]   = date_to
+            try:
+                query_embedding = await embedding_service.aembed_query(query)
+            except Exception:
+                query_embedding = None
+            messages = await self._retrieve(
+                user=user, query=query, expansion=expansion,
+                use_due_filter=bool(date_from), db=db, limit=limit * 2,
+                group_id=group_id, precomputed_embedding=query_embedding,
+            )
+            ranked = self._rank(messages=messages, query=query, expansion=expansion,
+                                use_due_filter=bool(date_from))[:limit]
+            print(f"[search] fast path → {_time.monotonic()-_t0:.2f}s ({len(ranked)} results)")
+            result = {"results": ranked, "natural_response": ""}
+            if ck:
+                await redis_cache.cache_set(ck, result, ex=120)  # shorter TTL for fast results
+            return result
+
+        # ── 2b. Intent parse + embedding in parallel ──────────────────
         # Embedding is independent of intent; start it immediately.
         from services.intent_service import get_intent_service
         from services.embedding_service import embedding_service
