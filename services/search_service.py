@@ -172,8 +172,6 @@ class SearchService:
 
     def __init__(self, cerebras_client: CerebrasClient):
         self.cerebras = cerebras_client
-        # Gemini for search LLM calls — no Cerebras rate-limit issues
-        self.gemini = CerebrasClient(provider="gemini")
 
     async def search(
         self,
@@ -379,7 +377,7 @@ class SearchService:
         group_id: Optional[int] = None,
     ) -> Optional[Dict]:
         from services.list_service import ListService
-        ls = ListService(self.gemini)
+        ls = ListService(self.cerebras)
 
         # Never intercept todo/task queries as list queries
         q_lower = query.lower().strip()
@@ -655,7 +653,7 @@ Return ONLY this JSON:
 }}"""
 
         try:
-            response = await self.gemini.chat_lite(prompt, max_tokens=300)
+            response = await self.cerebras.chat_lite(prompt, max_tokens=300)
         except Exception as e:
             print(f"[search] _expand_query failed ({type(e).__name__}): {e}")
             response = {}
@@ -965,7 +963,7 @@ Instructions:
 Reply:"""
 
         try:
-            return await self.gemini.chat_text(prompt, max_tokens=250, temperature=0.2)
+            return await self.cerebras.chat_text(prompt, max_tokens=250, temperature=0.2)
         except Exception as e:
             print(f"[search] _natural_response failed ({type(e).__name__}): {e}")
             return f"Found {len(results)} result(s) matching your query."
