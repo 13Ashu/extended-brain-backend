@@ -6,7 +6,7 @@ KEY CHANGES:
   • Better JSON extraction (handles nested/partial JSON)
   • Async embedding via EmbeddingService (not in this file — see embedding_service.py)
   • Temperature 0.1 for JSON calls (more reliable structured output)
-  • Retry with backoff on 429/500
+  • Retry with backoff on 429/500.
 ────────────────────────────────────────────────────────────────────────────
 Save as: cerebras_client.py.
 """
