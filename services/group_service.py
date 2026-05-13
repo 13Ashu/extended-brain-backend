@@ -358,17 +358,16 @@ class GroupService:
 
     def parse_mention(self, content: str, members: List[Dict]) -> tuple[Optional[int], str]:
         """
-        Detect @name prefix and return (assigned_user_id, cleaned_content).
-        Matches case-insensitively against first names of group members.
+        Detect @name prefix and return (assigned_user_id, original_content).
+        @mention is preserved in content so group members can see who was tagged.
         """
         m = re.match(r"^@(\w+)[:\s]+(.+)$", content, re.DOTALL | re.IGNORECASE)
         if not m:
             return None, content
         mention_name = m.group(1).lower()
-        rest = m.group(2).strip()
         for member in members:
             if member["name"].split()[0].lower() == mention_name:
-                return member["id"], rest
+                return member["id"], content   # keep @name in the stored text
         return None, content
 
     # ── Bot response helpers ──────────────────────────────────────────

@@ -189,6 +189,17 @@ class SearchService:
         if not user:
             return {"results": [], "natural_response": "User not found."}
 
+        from services import redis_cache
+
+        # ── Cache check (skip for group searches — group data changes frequently) ──
+        if not group_id:
+            ck = redis_cache.search_key(user.id, query)
+            cached = await redis_cache.cache_get(ck)
+            if cached:
+                return cached
+        else:
+            ck = None
+
         today = datetime.utcnow().date()
 
         # ── 0. Image search — highest priority ───────────────────────
@@ -315,7 +326,10 @@ class SearchService:
         )
         print(f"[search] natural_response → {_time.monotonic()-_t4:.2f}s | total={_time.monotonic()-_t0:.2f}s")
 
-        return {"results": ranked, "natural_response": natural}
+        result = {"results": ranked, "natural_response": natural}
+        if ck:
+            await redis_cache.cache_set(ck, result, ex=300)
+        return result
 
     # ──────────────────────────────────────────────────────────────
     # Direct list fetch — ZERO hallucination

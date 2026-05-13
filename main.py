@@ -2182,6 +2182,11 @@ async def bootstrap(
 ):
     """Single round-trip that returns everything iOS needs to open a context:
     recent messages, group members, assigned tasks, and unread counts."""
+    from services import redis_cache
+    bk = redis_cache.bootstrap_key(current_user.id, group_id)
+    cached = await redis_cache.cache_get(bk)
+    if cached:
+        return cached
 
     # 1. Recent messages ──────────────────────────────────────────────
     if group_id:
@@ -2288,13 +2293,15 @@ async def bootstrap(
             )
             unread_counts[str(gid)] = cnt or 0
 
-    return {
-        "success":      True,
-        "recent":       recent,
-        "members":      members,
-        "assigned":     assigned,
+    payload = {
+        "success":       True,
+        "recent":        recent,
+        "members":       members,
+        "assigned":      assigned,
         "unread_counts": unread_counts,
     }
+    await redis_cache.cache_set(bk, payload, ex=30)
+    return payload
 
 
 @app.get("/api/messages/recent")
@@ -2510,11 +2517,11 @@ async def capture_message(
     # ── Group context: parse @mention before processing ──────────────
     if group_id:
         members = await grp_svc.get_group_members(group_id, db)
-        uid, cleaned = grp_svc.parse_mention(content, members)
+        uid, _ = grp_svc.parse_mention(content, members)
         if uid:
             assigned_uid  = uid
             assigned_name = next((m["name"] for m in members if m["id"] == uid), None)
-            content       = cleaned   # strip "@Name " prefix before saving
+            # content unchanged — @mention preserved so other members see who was tagged
 
     result = await message_processor.process(
         user_phone=current_user.phone_number, content=content,
@@ -2532,6 +2539,10 @@ async def capture_message(
         result["group_id"]       = group_id
         result["assigned_to"]    = assigned_name
         result["assigned_to_id"] = assigned_uid
+
+        # ── Bust bootstrap cache so next open reflects new message ──────
+        from services import redis_cache as _rc
+        asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(current_user.id, group_id)))
 
         # ── Broadcast to connected group members via WebSocket ───────
         asyncio.create_task(ws_manager.broadcast(group_id, {
