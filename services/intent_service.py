@@ -148,15 +148,19 @@ class IntentService:
 
     def __init__(self, cerebras_client: CerebrasClient):
         self.cerebras = cerebras_client
+        # Fast model for intent — llama3.1-8b is ~10x faster than qwen-3-235b
+        self.fast = CerebrasClient(model="llama3.1-8b")
 
     async def parse(
         self,
         content: str,
         user_name: str,
         user_timezone: str = "Asia/Kolkata",
+        check_query: bool = True,
     ) -> Dict:
         """
         Parse a message into multi-action structured output.
+        check_query=False for iOS dump (always saving — no query detection needed).
         Never raises — returns safe default on failure.
         """
         if _is_command(content):
@@ -179,7 +183,8 @@ class IntentService:
 
         try:
             return await self._llm_parse(
-                content, user_name, now_str, today, tomorrow, day_map
+                content, user_name, now_str, today, tomorrow, day_map,
+                check_query=check_query,
             )
         except Exception as e:
             print(f"[intent] LLM parse failed: {e}")
@@ -193,198 +198,137 @@ class IntentService:
         today: str,
         tomorrow: str,
         day_map: Dict,
+        check_query: bool = True,
     ) -> Dict:
 
-        prompt = (
+        header = (
             f"You are parsing a message from {user_name} for their personal knowledge base.\n\n"
             f"NOW: {now_str}\n"
             f"TODAY: {today}\n"
             f"TOMORROW: {tomorrow}\n"
             f"NEXT 7 DAYS: {day_map}\n\n"
             f"MESSAGE:\n\"\"\"\n{content}\n\"\"\"\n\n"
-            "TASK: Determine ALL actions this message should trigger. Multiple actions can be true simultaneously.\n\n"
-            "ACTION FLAGS:\n"
-            "  save_as_todo  — message contains one or more tasks/things to do\n"
-            "  save_as_event — message is a scheduled appointment/meeting with a specific time\n"
-            "  save_as_note  — message is a fact/info to remember (credential, location, info)\n"
-            "  save_as_idea  — message is a creative thought/insight/concept\n"
-            "  save_as_track — message logs health/habit data (weight, steps, mood, sleep)\n"
-            "  save_as_list  — message is a named list (shopping, bag, packing) with items\n"
-            "  set_reminder  — message has a specific time → should create a reminder\n"
-            "  is_query      — user wants to retrieve/search something they saved before\n\n"
-            "KEY RULES:\n"
-            "  - A reminder IS ALWAYS also a todo → both save_as_todo AND set_reminder = true\n"
-            "  - An event with time IS ALWAYS also a todo → both save_as_event AND save_as_todo = true\n"
-            "  - set_reminder = true ONLY when a specific time is mentioned\n"
-            "  - Time without explicit date → assume TODAY\n"
-            "  - Extract ALL tasks even from unstructured prose\n"
-            "  - Priority: urgent/asap/critical/important → high, else normal\n\n"
-            "  NAMED HEADER RULE (most important for Header:\\n- items structure):\n"
-            "  A header has its OWN IDENTITY if it refers to a specific named thing:\n"
-            "  a project, place, brand, person, product, or feature set.\n"
-            "  A header is NEUTRAL if it's just a time/category label with no specific identity.\n\n"
-            "  Named header + bullet items = save_as_list=true\n"
-            "    (items belong to that named thing as a collection)\n"
-            "  Named header + bullet items WITH time/date = save_as_list=true AND save_as_todo=true\n"
-            "    (items are both a collection AND actionable tasks)\n"
-            "  Neutral header + bullet items = save_as_todo=true (NOT save_as_list)\n\n"
-            "  NAMED headers (have own identity) → save_as_list:\n"
-            "    'Extended minds changes', 'Japan trip', 'Grocery', 'Dmart',\n"
-            "    'House renovation', 'Birthday party', 'Project X', 'Client ABC'\n"
-            "  NEUTRAL headers (time/category labels) → save_as_todo:\n"
-            "    'Todo', 'Tasks', 'Today', 'Tomorrow', 'This week',\n"
-            "    'Office tasks', 'Urgent', 'Things to do', 'New todo list'\n\n"
-            "Return ONLY this JSON (no markdown):\n"
-            "{\n"
-            '  "actions": {\n'
-            '    "save_as_todo": bool,\n'
-            '    "save_as_event": bool,\n'
-            '    "save_as_note": bool,\n'
-            '    "save_as_idea": bool,\n'
-            '    "save_as_track": bool,\n'
-            '    "save_as_list": bool,\n'
-            '    "set_reminder": bool,\n'
-            '    "is_query": bool\n'
-            "  },\n"
-            '  "tasks": [{"task": "...", "due_date": "YYYY-MM-DD", "time": "HH:MM|null", "priority": "normal|high|urgent"}],\n'
-            '  "reminder": {"due_date": "YYYY-MM-DD", "time": "HH:MM", "priority": "normal"} | null,\n'
-            '  "event": {"title": "...", "due_date": "YYYY-MM-DD", "time": "HH:MM|null", "people": []} | null,\n'
-            '  "list": {"list_name": "...", "list_type": "shopping|bag|packing|reading|watching|custom", "items": []} | null,\n'
-            '  "track": {"logs": [{"metric": "...", "value": "...", "unit": "..."}]} | null,\n'
-            '  "note": {"content": "...", "keywords": []} | null,\n'
-            '  "idea": {"content": "...", "keywords": []} | null,\n'
-            '  "query": {"query_text": "...", "date_hint": "today|tomorrow|this_week|null", "list_name": "...|null"} | null,\n'
-            '  "people": [],\n'
-            '  "priority": "normal|high|urgent",\n'
-            '  "essence": "one sentence summary"\n'
-            "}\n\n"
-            "EXAMPLES:\n\n"
-
-            # ── Reminder ──────────────────────────────────────────────────
-            f'Message: "remind me to call mom at 10pm"\n'
-            f'→ actions: save_as_todo=true, set_reminder=true\n'
-            f'  tasks: [{{"task":"call mom","due_date":"{today}","time":"22:00","priority":"normal"}}]\n'
-            f'  reminder: {{"due_date":"{today}","time":"22:00","priority":"normal"}}\n\n'
-
-            # ── Event ─────────────────────────────────────────────────────
-            f'Message: "dentist appointment Friday 3pm"\n'
-            f'→ actions: save_as_todo=true, save_as_event=true, set_reminder=true\n'
-            f'  tasks: [{{"task":"dentist appointment","due_date":"{day_map.get("friday", tomorrow)}","time":"15:00","priority":"normal"}}]\n'
-            f'  event: {{"title":"dentist appointment","due_date":"{day_map.get("friday", tomorrow)}","time":"15:00","people":[]}}\n'
-            f'  reminder: {{"due_date":"{day_map.get("friday", tomorrow)}","time":"15:00","priority":"normal"}}\n\n'
-
-            # ── Neutral header → Todo (NOT list) ──────────────────────────
-            f'Message: "New todo list for tomorrow:\\n- Work on meraki 4hrs\\n- Follow up with Aditi\\n- Order clothes"\n'
-            f'→ actions: save_as_todo=true (NOT save_as_list)\n'
-            f'  reasoning: "New todo list for tomorrow" is a NEUTRAL label — time reference, no specific identity\n'
-            f'  tasks: [{{"task":"Work on meraki matter for 4 hours","due_date":"{tomorrow}","time":null,"priority":"normal"}},{{"task":"Follow up with Aditi","due_date":"{tomorrow}","time":null,"priority":"normal"}},{{"task":"Order clothes","due_date":"{tomorrow}","time":null,"priority":"normal"}}]\n\n'
-
-            # ── Neutral header with times → Todo ──────────────────────────
-            f'Message: "My todo for today: - do x task at 3 pm, -do y task at 7 pm"\n'
-            f'→ actions: save_as_todo=true, set_reminder=true\n'
-            f'  reasoning: "My todo for today" is a NEUTRAL time label\n'
-            f'  tasks: [{{"task":"do x task","due_date":"{today}","time":"15:00","priority":"normal"}},{{"task":"do y task","due_date":"{today}","time":"19:00","priority":"normal"}}]\n'
-            f'  reminder: null (multiple tasks each have own time)\n\n'
-
-            # ── Inline add to list → List (NOT todo) ─────────────────────
-            f'Message: "add eggs and milk to dmart shopping list"\n'
-            f'→ actions: save_as_list=true (NOT save_as_todo)\n'
-            f'  reasoning: "add X to [named list]" is a list operation, not a task\n'
-            f'  list: {{"list_name":"Dmart Shopping List","list_type":"shopping","items":["eggs","milk"]}}\n\n'
-
-            f'Message: "add pasta, sauce to my grocery list"\n'
-            f'→ actions: save_as_list=true (NOT save_as_todo)\n'
-            f'  list: {{"list_name":"Grocery List","list_type":"shopping","items":["pasta","sauce"]}}\n\n'
-
-            # ── Named header → List (shopping) ────────────────────────────
-            f'Message: "dmart shopping:\\n- Pen\\n- coffee mug\\n- glue"\n'
-            f'→ actions: save_as_list=true\n'
-            f'  reasoning: "dmart shopping" is a NAMED thing — specific store identity\n'
-            f'  list: {{"list_name":"Dmart Shopping List","list_type":"shopping","items":["Pen","coffee mug","glue"]}}\n\n'
-
-            # ── Named header → List (custom/project) ──────────────────────
-            f'Message: "Extended minds changes:\\n- Image with space\\n- improve search message"\n'
-            f'→ actions: save_as_list=true\n'
-            f'  reasoning: "Extended minds changes" is a NAMED project — has its own identity\n'
-            f'  list: {{"list_name":"Extended Minds Changes List","list_type":"custom","items":["Image with space","improve search message"]}}\n\n'
-
-            # ── Named header + actionable items with dates → List AND Todo ─
-            f'Message: "Japan trip:\\n- book flights\\n- get visa\\n- pack bags"\n'
-            f'→ actions: save_as_list=true, save_as_todo=true\n'
-            f'  reasoning: "Japan trip" is a NAMED thing AND items are also actionable tasks\n'
-            f'  list: {{"list_name":"Japan Trip List","list_type":"packing","items":["book flights","get visa","pack bags"]}}\n'
-            f'  tasks: [{{"task":"book flights","due_date":null,"time":null,"priority":"normal"}},{{"task":"get visa","due_date":null,"time":null,"priority":"normal"}},{{"task":"pack bags","due_date":null,"time":null,"priority":"normal"}}]\n\n'
-
-            # ── Named header + items with explicit time → List AND Todo ───
-            f'Message: "Client ABC meeting prep:\\n- send agenda by 9am\\n- book conference room"\n'
-            f'→ actions: save_as_list=true, save_as_todo=true, set_reminder=true\n'
-            f'  reasoning: "Client ABC meeting prep" is a NAMED thing AND items have time ref\n'
-            f'  list: {{"list_name":"Client ABC Meeting Prep List","list_type":"custom","items":["send agenda by 9am","book conference room"]}}\n'
-            f'  tasks: [{{"task":"send agenda","due_date":"{today}","time":"09:00","priority":"normal"}},{{"task":"book conference room","due_date":"{today}","time":null,"priority":"normal"}}]\n'
-            f'  reminder: {{"due_date":"{today}","time":"09:00","priority":"normal"}}\n\n'
-
-            # ── Single task with time ──────────────────────────────────────
-            f'Message: "pay sabziwala at 10pm"\n'
-            f'→ actions: save_as_todo=true, set_reminder=true\n'
-            f'  tasks: [{{"task":"pay sabziwala","due_date":"{today}","time":"22:00","priority":"normal"}}]\n'
-            f'  reminder: {{"due_date":"{today}","time":"22:00","priority":"normal"}}\n\n'
-
-            # ── Query: todo ───────────────────────────────────────────────
-            f'Message: "Todo list for tomorrow?"\n'
-            f'→ actions: is_query=true\n'
-            f'  query: {{"query_text":"todos for tomorrow","date_hint":"tomorrow","list_name":null}}\n\n'
-
-            # ── Query: named list ─────────────────────────────────────────
-            f'Message: "Show dmart list?"\n'
-            f'→ actions: is_query=true\n'
-            f'  query: {{"query_text":"dmart shopping list","date_hint":null,"list_name":"Dmart Shopping List"}}\n\n'
-
-            # ── Query: natural language — no syntax ───────────────────────
-            f'Message: "what did I save about Japan"\n'
-            f'→ actions: is_query=true\n'
-            f'  query: {{"query_text":"Japan","date_hint":null,"list_name":null}}\n\n'
-
-            f'Message: "show me my tasks for today"\n'
-            f'→ actions: is_query=true\n'
-            f'  query: {{"query_text":"tasks for today","date_hint":"today","list_name":null}}\n\n'
-
-            f'Message: "find my wifi password"\n'
-            f'→ actions: is_query=true\n'
-            f'  query: {{"query_text":"wifi password","date_hint":null,"list_name":null}}\n\n'
-
-            f'Message: "do I have anything due this week"\n'
-            f'→ actions: is_query=true\n'
-            f'  query: {{"query_text":"due this week","date_hint":"this_week","list_name":null}}\n\n'
-
-            f'Message: "show me my grocery list"\n'
-            f'→ actions: is_query=true\n'
-            f'  query: {{"query_text":"grocery list","date_hint":null,"list_name":"Grocery List"}}\n\n'
-
-            f'Message: "what ideas have I saved"\n'
-            f'→ actions: is_query=true\n'
-            f'  query: {{"query_text":"ideas","date_hint":null,"list_name":null}}\n\n'
-
-            f'Message: "where did I park"\n'
-            f'→ actions: is_query=true\n'
-            f'  query: {{"query_text":"parking location","date_hint":null,"list_name":null}}\n\n'
-
-            f'Message: "find that recipe I saved"\n'
-            f'→ actions: is_query=true\n'
-            f'  query: {{"query_text":"recipe","date_hint":null,"list_name":null}}\n\n'
-
-            # ── Track ─────────────────────────────────────────────────────
-            f'Message: "weight 74kg, slept 7 hours, ran 3km"\n'
-            f'→ actions: save_as_track=true\n'
-            f'  track: {{"logs":[{{"metric":"weight","value":"74","unit":"kg"}},{{"metric":"sleep","value":"7","unit":"hours"}},{{"metric":"run","value":"3","unit":"km"}}]}}\n\n'
-
-            # ── Note ──────────────────────────────────────────────────────
-            f'Message: "wifi password is airtel123"\n'
-            f'→ actions: save_as_note=true\n'
-            f'  note: {{"content":"wifi password is airtel123","keywords":["wifi","password"]}}\n\n'
+            "TASK: Determine ALL save actions this message should trigger.\n\n"
         )
 
-        response = await self.cerebras.chat(prompt, max_tokens=1000)
+        if check_query:
+            action_flags = (
+                "ACTION FLAGS:\n"
+                "  save_as_todo  — message contains one or more tasks/things to do\n"
+                "  save_as_event — message is a scheduled appointment/meeting with a specific time\n"
+                "  save_as_note  — message is a fact/info to remember (credential, location, info)\n"
+                "  save_as_idea  — message is a creative thought/insight/concept\n"
+                "  save_as_track — message logs health/habit data (weight, steps, mood, sleep)\n"
+                "  save_as_list  — message is a named list (shopping, bag, packing) with items\n"
+                "  set_reminder  — message has a specific time → should create a reminder\n"
+                "  is_query      — user wants to retrieve/search something they saved before\n\n"
+                "is_query=true ONLY for: questions ending with '?', or explicit search phrases\n"
+                "  ('show me', 'find', 'search', 'what did I save', 'recall', 'where is', 'do I have').\n"
+                "  Imperative statements are NEVER is_query — they are save_as_todo.\n\n"
+            )
+            json_schema = (
+                "Return ONLY this JSON (no markdown):\n"
+                "{\n"
+                '  "actions": {"save_as_todo":bool,"save_as_event":bool,"save_as_note":bool,'
+                '"save_as_idea":bool,"save_as_track":bool,"save_as_list":bool,"set_reminder":bool,"is_query":bool},\n'
+                '  "tasks": [{"task":"...","due_date":"YYYY-MM-DD","time":"HH:MM|null","priority":"normal|high|urgent"}],\n'
+                '  "reminder": {"due_date":"YYYY-MM-DD","time":"HH:MM","priority":"normal"} | null,\n'
+                '  "event": {"title":"...","due_date":"YYYY-MM-DD","time":"HH:MM|null","people":[]} | null,\n'
+                '  "list": {"list_name":"...","list_type":"shopping|bag|packing|reading|watching|custom","items":[]} | null,\n'
+                '  "track": {"logs":[{"metric":"...","value":"...","unit":"..."}]} | null,\n'
+                '  "note": {"content":"...","keywords":[]} | null,\n'
+                '  "idea": {"content":"...","keywords":[]} | null,\n'
+                '  "query": {"query_text":"...","date_hint":"today|tomorrow|this_week|null","list_name":"...|null"} | null,\n'
+                '  "people":[],"priority":"normal|high|urgent","essence":"one sentence summary"\n'
+                "}\n\n"
+            )
+        else:
+            # Save-only mode: no is_query, shorter prompt, faster
+            action_flags = (
+                "ACTION FLAGS (this message will always be saved — classify HOW to save it):\n"
+                "  save_as_todo  — contains one or more tasks/things to do\n"
+                "  save_as_event — scheduled appointment/meeting with a specific time\n"
+                "  save_as_note  — a fact/info to remember (credential, location, info)\n"
+                "  save_as_idea  — creative thought/insight/concept\n"
+                "  save_as_track — logs health/habit data (weight, steps, mood, sleep)\n"
+                "  save_as_list  — named list (shopping, bag, packing) with items\n"
+                "  set_reminder  — has a specific time → create a reminder\n\n"
+            )
+            json_schema = (
+                "Return ONLY this JSON (no markdown):\n"
+                "{\n"
+                '  "actions": {"save_as_todo":bool,"save_as_event":bool,"save_as_note":bool,'
+                '"save_as_idea":bool,"save_as_track":bool,"save_as_list":bool,"set_reminder":bool,"is_query":false},\n'
+                '  "tasks": [{"task":"...","due_date":"YYYY-MM-DD","time":"HH:MM|null","priority":"normal|high|urgent"}],\n'
+                '  "reminder": {"due_date":"YYYY-MM-DD","time":"HH:MM","priority":"normal"} | null,\n'
+                '  "event": {"title":"...","due_date":"YYYY-MM-DD","time":"HH:MM|null","people":[]} | null,\n'
+                '  "list": {"list_name":"...","list_type":"shopping|bag|packing|reading|watching|custom","items":[]} | null,\n'
+                '  "track": {"logs":[{"metric":"...","value":"...","unit":"..."}]} | null,\n'
+                '  "note": {"content":"...","keywords":[]} | null,\n'
+                '  "idea": {"content":"...","keywords":[]} | null,\n'
+                '  "people":[],"priority":"normal|high|urgent","essence":"one sentence summary"\n'
+                "}\n\n"
+            )
 
+        rules = (
+            "KEY RULES:\n"
+            "  - A reminder IS ALWAYS also a todo → save_as_todo AND set_reminder = true\n"
+            "  - An event with time IS ALWAYS also a todo → save_as_event AND save_as_todo = true\n"
+            "  - set_reminder = true ONLY when a specific time is mentioned\n"
+            "  - Time without explicit date → assume TODAY\n"
+            "  - Any task/actionable without a date → due_date = TODAY\n"
+            "  - Extract ALL tasks even from unstructured prose\n"
+            "  - Priority: urgent/asap/critical/important → high, else normal\n\n"
+            "  NAMED HEADER RULE:\n"
+            "  Named header (project/brand/place/person) + bullet items → save_as_list=true\n"
+            "  Neutral header (Todo, Tasks, Today, Tomorrow, This week) + bullet items → save_as_todo=true (NOT list)\n\n"
+            "  NAMED: 'Extended minds changes', 'Japan trip', 'Grocery', 'Dmart', 'Client ABC'\n"
+            "  NEUTRAL: 'Todo', 'Tasks', 'Today', 'Todo for today', 'Tomorrow', 'This week'\n\n"
+        )
+
+        examples = (
+            "EXAMPLES:\n\n"
+            f'M: "remind me to call mom at 10pm" → save_as_todo=true, set_reminder=true\n'
+            f'  tasks:[{{"task":"call mom","due_date":"{today}","time":"22:00","priority":"normal"}}]\n\n'
+
+            f'M: "dentist appointment Friday 3pm" → save_as_todo=true, save_as_event=true, set_reminder=true\n'
+            f'  tasks:[{{"task":"dentist","due_date":"{day_map.get("friday", tomorrow)}","time":"15:00","priority":"normal"}}]\n\n'
+
+            f'M: "See the study table" → save_as_todo=true\n'
+            f'  tasks:[{{"task":"See the study table","due_date":"{today}","time":null,"priority":"normal"}}]\n\n'
+
+            f'M: "Todo for today:\\n- Check apple dev\\n- Pack for trip" → save_as_todo=true (NOT save_as_list)\n'
+            f'  tasks:[{{"task":"Check apple dev","due_date":"{today}","time":null,"priority":"normal"}},{{"task":"Pack for trip","due_date":"{today}","time":null,"priority":"normal"}}]\n\n'
+
+            f'M: "New todo list for tomorrow:\\n- Work on meraki\\n- Follow up with Aditi" → save_as_todo=true (NOT save_as_list)\n'
+            f'  tasks:[{{"task":"Work on meraki","due_date":"{tomorrow}","time":null,"priority":"normal"}},{{"task":"Follow up with Aditi","due_date":"{tomorrow}","time":null,"priority":"normal"}}]\n\n'
+
+            f'M: "dmart shopping:\\n- milk\\n- eggs" → save_as_list=true\n'
+            f'  list:{{"list_name":"Dmart Shopping List","list_type":"shopping","items":["milk","eggs"]}}\n\n'
+
+            f'M: "Japan trip:\\n- book flights\\n- get visa" → save_as_list=true, save_as_todo=true\n'
+            f'  list:{{"list_name":"Japan Trip List","list_type":"packing","items":["book flights","get visa"]}}\n'
+            f'  tasks:[{{"task":"book flights","due_date":null,"time":null,"priority":"normal"}},{{"task":"get visa","due_date":null,"time":null,"priority":"normal"}}]\n\n'
+
+            f'M: "weight 74kg, slept 7h" → save_as_track=true\n'
+            f'  track:{{"logs":[{{"metric":"weight","value":"74","unit":"kg"}},{{"metric":"sleep","value":"7","unit":"hours"}}]}}\n\n'
+
+            f'M: "wifi password is airtel123" → save_as_note=true\n'
+            f'  note:{{"content":"wifi password is airtel123","keywords":["wifi","password"]}}\n\n'
+        )
+
+        if check_query:
+            examples += (
+                f'M: "what did I save about Japan" → is_query=true\n'
+                f'  query:{{"query_text":"Japan","date_hint":null,"list_name":null}}\n\n'
+                f'M: "show me my grocery list" → is_query=true\n'
+                f'  query:{{"query_text":"grocery list","date_hint":null,"list_name":"Grocery List"}}\n\n'
+                f'M: "find my wifi password" → is_query=true\n'
+                f'  query:{{"query_text":"wifi password","date_hint":null,"list_name":null}}\n\n'
+            )
+
+        prompt = header + action_flags + json_schema + rules + examples
+        response = await self.fast.chat(prompt, max_tokens=600)
         return self._validate(response)
 
     def _validate(self, raw: Dict) -> Dict:

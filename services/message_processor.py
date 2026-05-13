@@ -74,6 +74,8 @@ ACTION_VERBS = {
     "write", "draft", "prepare", "create", "build",
     "read", "watch", "listen", "study", "learn",
     "clean", "wash", "organize", "sort",
+    "see", "do", "take", "make", "go", "keep", "put",
+    "run", "start", "find", "add", "remove", "print",
     "need to", "have to", "must", "should",
 }
 
@@ -147,15 +149,18 @@ def _sniff_buckets_fast(content: str) -> List[str]:
         if "To-Do" not in buckets:
             buckets.append("To-Do")
 
-    # Events
-    if re.search(
-        r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday"
-        r"|tonight|morning|afternoon|evening|noon|\d{1,2}(am|pm)|\d{1,2}:\d{2})\b",
-        lc,
-    ):
+    # Events — requires a specific time OR a named day-of-week.
+    # "today" alone does NOT make something an Event; it just anchors a To-Do to today.
+    has_specific_time = bool(re.search(
+        r"\b(\d{1,2}(am|pm)|\d{1,2}:\d{2}|noon|midnight|tonight|morning|afternoon|evening)\b", lc
+    ))
+    has_day_of_week = bool(re.search(
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lc
+    ))
+    if has_specific_time or has_day_of_week:
         if "Events" not in buckets:
             buckets.append("Events")
-        if not buckets:
+        if "To-Do" not in buckets:
             buckets.append("To-Do")
 
     # Ideas
@@ -240,6 +245,7 @@ class MessageProcessor:
         message_type: str,
         db: AsyncSession,
         media_url: Optional[str] = None,
+        skip_query: bool = False,
     ) -> Dict:
         user = await self._get_user(user_phone, db)
         if not user:
@@ -250,7 +256,10 @@ class MessageProcessor:
         # ── Single LLM call: multi-action intent parse ────────────
         from services.intent_service import get_intent_service
         intent_svc = get_intent_service(self.cerebras)
-        parsed     = await intent_svc.parse(content, user.name, user.timezone or "Asia/Kolkata")
+        parsed     = await intent_svc.parse(
+            content, user.name, user.timezone or "Asia/Kolkata",
+            check_query=not skip_query,
+        )
 
         actions = parsed.get("actions", {})
         print(f"[processor] actions={[k for k,v in actions.items() if v]} for: {content[:60]}")
@@ -263,9 +272,16 @@ class MessageProcessor:
             )
 
         # ── Query — user wants to retrieve something ──────────────
-        if actions.get("is_query"):
-            # Return a special marker — process_webhook_message will route to search
+        # skip_query=True when called from the iOS capture endpoint (dump tab always saves)
+        # Also reclassify as todo if the LLM marked is_query but there's no "?" — imperative sentence
+        if actions.get("is_query") and not skip_query and "?" in content:
             return {"_is_query": True, "query_data": parsed.get("query", {})}
+        if actions.get("is_query") and not skip_query:
+            # Imperative without "?" — treat as a todo for today
+            actions["is_query"] = False
+            actions["save_as_todo"] = True
+            if not parsed.get("tasks"):
+                parsed["tasks"] = [{"task": content, "due_date": _today_str(), "time": None, "priority": "normal"}]
 
         # ── Tasks (todo + optional event + optional reminder) ─────
         if actions.get("save_as_todo") and parsed.get("tasks"):

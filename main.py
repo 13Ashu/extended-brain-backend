@@ -2526,6 +2526,7 @@ async def capture_message(
     result = await message_processor.process(
         user_phone=current_user.phone_number, content=content,
         message_type=message.message_type, media_url=message.media_url, db=db,
+        skip_query=True,  # iOS capture endpoint always saves — queries go through /api/messages/search
     )
 
     # ── Tag message with group_id / assigned_to ───────────────────────
