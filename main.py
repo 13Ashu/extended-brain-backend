@@ -25,7 +25,7 @@ from config import Config, MessagingPlatform
 from messaging_factory import create_messaging_client, get_platform_name
 from messaging_interface import MessagingClient
 
-from database import get_db, init_db, engine, Base, async_session_maker, DeviceToken, StoredImage
+from database import get_db, init_db, engine, Base, async_session_maker, DeviceToken, StoredImage, GroupLastSeen
 from models import User, Message, Category, MessageType, ProAccount, ProAccountMember, Group, GroupMember, CouponCode, CouponRedemption
 from services.group_service import group_service as grp_svc
 from services.coupon_service import coupon_service as cpn_svc
@@ -34,7 +34,7 @@ from services.message_processor import MessageProcessor
 from services.search_service import SearchService
 from services.category_manager import CategoryManager
 from services.auth_service import AuthService, get_current_user
-from services.reminder_service import ReminderService
+from services.reminder_service import ReminderService, send_apns_notification
 from services.briefing_service import briefing_service
 from services.nudge_service import nudge_service
 from services.context_service import context_service
@@ -2133,12 +2133,13 @@ async def get_assigned_messages(
 async def get_recent_messages(
     limit: int = 100,
     group_id: Optional[int] = None,
+    after: Optional[str] = None,   # ISO timestamp — only return messages newer than this
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return recent messages — personal if no group_id, group feed if group_id provided."""
+    """Return recent messages — personal if no group_id, group feed if group_id provided.
+    Pass ?after=<iso_ts> to get only messages newer than that timestamp (for polling)."""
     if group_id:
-        # Verify membership
         group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
         if not group:
             raise HTTPException(status_code=403, detail="Not a member of this group")
@@ -2146,17 +2147,30 @@ async def get_recent_messages(
     else:
         base_filter = and_(Message.user_id == current_user.id, Message.group_id.is_(None))
 
-    result = await db.execute(
-        select(Message, Category)
+    # Parse optional `after` timestamp for incremental polling
+    after_dt = None
+    if after:
+        try:
+            after_dt = datetime.fromisoformat(after.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+
+    query = (
+        select(Message, Category, User)
         .outerjoin(Category, Message.category_id == Category.id)
+        .outerjoin(User, Message.user_id == User.id)
         .where(base_filter)
-        .order_by(Message.created_at.desc())
-        .limit(min(limit, 200))
+    )
+    if after_dt:
+        query = query.where(Message.created_at > after_dt)
+
+    result = await db.execute(
+        query.order_by(Message.created_at.desc()).limit(min(limit, 200))
     )
     rows = result.all()
 
     messages = []
-    for msg, cat in rows:
+    for msg, cat, sender in rows:
         tags = msg.tags if isinstance(msg.tags, dict) else {}
         bucket = (
             tags.get("primary_bucket")
@@ -2181,6 +2195,8 @@ async def get_recent_messages(
             "starred":               tags.get("starred", False),
             "group_id":              msg.group_id,
             "assigned_to_user_id":   msg.assigned_to_user_id,
+            "sender_name":           sender.name if sender else None,
+            "sender_id":             msg.user_id,
         })
 
     # Debug: log todo items and their due_dates so we can trace iOS classification
@@ -2191,6 +2207,68 @@ async def get_recent_messages(
             print(f"  id={mid} due_date={due!r} tags_is_dict={has_dict_tags} content='{content}'")
 
     return {"success": True, "results": messages, "total": len(messages)}
+
+
+# ── Group unread counts ────────────────────────────────────────────────────────
+
+@app.get("/api/groups/unread")
+async def get_unread_counts(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return unread message counts per group for the current user."""
+    # Get user's groups
+    memberships = await db.execute(
+        select(GroupMember.group_id).where(GroupMember.user_id == current_user.id)
+    )
+    group_ids = [r[0] for r in memberships.all()]
+    if not group_ids:
+        return {"counts": {}}
+
+    # Get last-seen timestamps
+    seen_rows = await db.execute(
+        select(GroupLastSeen).where(
+            GroupLastSeen.user_id == current_user.id,
+            GroupLastSeen.group_id.in_(group_ids)
+        )
+    )
+    last_seen: dict[int, datetime] = {r.group_id: r.last_seen_at for r in seen_rows.scalars()}
+
+    counts = {}
+    for gid in group_ids:
+        cutoff = last_seen.get(gid, datetime.min)
+        count = await db.scalar(
+            select(func.count(Message.id)).where(
+                Message.group_id == gid,
+                Message.created_at > cutoff,
+                Message.user_id != current_user.id,   # don't count own messages
+            )
+        )
+        counts[gid] = count or 0
+
+    return {"counts": counts}
+
+
+@app.post("/api/groups/{group_id}/seen")
+async def mark_group_seen(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark all current messages in a group as seen by this user."""
+    existing = await db.scalar(
+        select(GroupLastSeen).where(
+            GroupLastSeen.user_id == current_user.id,
+            GroupLastSeen.group_id == group_id
+        )
+    )
+    now = datetime.utcnow()
+    if existing:
+        existing.last_seen_at = now
+    else:
+        db.add(GroupLastSeen(user_id=current_user.id, group_id=group_id, last_seen_at=now))
+    await db.commit()
+    return {"success": True}
 
 
 @app.delete("/api/messages/{message_id}")
@@ -2251,6 +2329,42 @@ async def capture_message(
         result["group_id"]       = group_id
         result["assigned_to"]    = assigned_name
         result["assigned_to_id"] = assigned_uid
+
+        # ── Mirror a To-Do in the assigned user's personal feed ──────
+        if assigned_uid and assigned_uid != current_user.id:
+            todo_tags = {
+                "primary_bucket": "To-Do",
+                "intent_bucket":  "To-Do",
+                "due_date":       result.get("due_date"),
+                "assigned_by":    current_user.name,
+                "group_id":       group_id,
+            }
+            mirror = Message(
+                user_id=assigned_uid,
+                content=content,
+                message_type=MessageType.TEXT,
+                summary=result.get("essence") or content[:80],
+                tags=todo_tags,
+                group_id=group_id,
+                assigned_to_user_id=assigned_uid,
+            )
+            db.add(mirror)
+            await db.commit()
+
+            # ── Push notification to assigned user ───────────────────
+            try:
+                tokens_rows = await db.execute(
+                    select(DeviceToken.token).where(DeviceToken.user_id == assigned_uid)
+                )
+                for (token,) in tokens_rows.all():
+                    await send_apns_notification(
+                        device_token=token,
+                        title=f"{current_user.name} assigned you a task",
+                        body=content[:80],
+                        data={"type": "assignment", "group_id": group_id},
+                    )
+            except Exception as e:
+                print(f"[push] assignment notify failed: {e}")
 
     return {"success": True, "message": "Content captured successfully", "data": result}
 

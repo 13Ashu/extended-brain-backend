@@ -5,7 +5,7 @@ Updated with full user registration fields
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Text, DateTime, ForeignKey, Enum as SQLEnum, Integer, Boolean, LargeBinary
+from sqlalchemy import String, Text, DateTime, ForeignKey, Enum as SQLEnum, Integer, Boolean, LargeBinary, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSON, JSONB
 from datetime import datetime
 from typing import Optional, List, AsyncGenerator
@@ -341,6 +341,17 @@ class CouponRedemption(Base):
     user: Mapped["User"] = relationship("User")
 
 
+class GroupLastSeen(Base):
+    """Tracks the last time a user read a group's feed — used for unread counts."""
+    __tablename__ = "group_last_seen"
+    __table_args__ = (UniqueConstraint("user_id", "group_id", name="uq_group_last_seen"),)
+
+    id:           Mapped[int]      = mapped_column(primary_key=True)
+    user_id:      Mapped[int]      = mapped_column(ForeignKey("users.id"), index=True)
+    group_id:     Mapped[int]      = mapped_column(Integer, index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class StoredImage(Base):
     """Binary image storage — no external CDN needed."""
     __tablename__ = "stored_images"
@@ -366,6 +377,7 @@ async def init_db():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS active_group_id INTEGER",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS group_id INTEGER",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS assigned_to_user_id INTEGER",
+            "CREATE TABLE IF NOT EXISTS group_last_seen (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), group_id INTEGER, last_seen_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, group_id))",
         ]
         for stmt in migrations:
             try:
