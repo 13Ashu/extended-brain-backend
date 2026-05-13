@@ -316,23 +316,33 @@ async def get_message(
     current_user: User = Depends(get_current_user),
 ):
     result = await db.execute(
-        select(Message).where(
-            and_(Message.id == message_id, Message.user_id == current_user.id)
-        )
+        select(Message, Category)
+        .outerjoin(Category, Message.category_id == Category.id)
+        .where(and_(Message.id == message_id, Message.user_id == current_user.id))
     )
-    msg = result.scalar_one_or_none()
-    if not msg:
+    row = result.first()
+    if not row:
         raise HTTPException(status_code=404, detail="Message not found")
+    msg, cat = row
+    tags   = msg.tags if isinstance(msg.tags, dict) else {}
+    bucket = tags.get("primary_bucket") or tags.get("intent_bucket") or (cat.name if cat else "Random")
+    raw_items = tags.get("subtasks", [])
+    items = [{"task": s["task"], "done": s.get("done", False)}
+             for s in raw_items if isinstance(s, dict) and "task" in s]
     return {
         "success": True,
         "data": {
-            "id": msg.id,
-            "content": msg.content,
-            "essence": msg.essence,
-            "category": msg.category,
-            "tags": msg.tags or {},
-            "message_type": msg.message_type,
-            "created_at": msg.created_at.isoformat(),
+            "id":                  msg.id,
+            "content":             msg.content,
+            "essence":             msg.summary,
+            "category":            bucket,
+            "tags":                tags,
+            "items":               items,
+            "message_type":        msg.message_type.value if msg.message_type else "text",
+            "created_at":          msg.created_at.isoformat(),
+            "group_id":            msg.group_id,
+            "sender_id":           msg.user_id,
+            "assigned_to_user_id": msg.assigned_to_user_id,
         }
     }
 

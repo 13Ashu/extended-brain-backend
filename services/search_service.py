@@ -342,6 +342,8 @@ class SearchService:
                 tags      = msg.tags if isinstance(msg.tags, dict) else {}
                 subtasks  = tags.get("subtasks", [])
                 list_name = tags.get("list_name", msg.content)
+                items     = [{"task": s["task"], "done": s.get("done", False)}
+                             for s in subtasks if isinstance(s, dict) and "task" in s]
                 return {
                     "results": [{
                         "id":           msg.id,
@@ -352,6 +354,7 @@ class SearchService:
                         "all_buckets":  ["List"],
                         "priority":     "normal",
                         "tags":         tags,
+                        "items":        items,
                         "created_at":   msg.created_at.isoformat(),
                         "due_date":     None,
                         "event_time":   None,
@@ -388,6 +391,8 @@ class SearchService:
 
         tags     = msg.tags if isinstance(msg.tags, dict) else {}
         subtasks = tags.get("subtasks", [])
+        items    = [{"task": s["task"], "done": s.get("done", False)}
+                    for s in subtasks if isinstance(s, dict) and "task" in s]
 
         return {
             "results": [{
@@ -399,6 +404,7 @@ class SearchService:
                 "all_buckets":  ["List"],
                 "priority":     "normal",
                 "tags":         tags,
+                "items":        items,
                 "created_at":   msg.created_at.isoformat(),
                 "due_date":     None,
                 "event_time":   None,
