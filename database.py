@@ -5,7 +5,7 @@ Updated with full user registration fields
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Text, DateTime, ForeignKey, Enum as SQLEnum, Integer, Boolean
+from sqlalchemy import String, Text, DateTime, ForeignKey, Enum as SQLEnum, Integer, Boolean, LargeBinary
 from sqlalchemy.dialects.postgresql import JSON, JSONB
 from datetime import datetime
 from typing import Optional, List, AsyncGenerator
@@ -338,6 +338,19 @@ class CouponRedemption(Base):
     redeemed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     coupon: Mapped["CouponCode"] = relationship("CouponCode", back_populates="redemptions")
+    user: Mapped["User"] = relationship("User")
+
+
+class StoredImage(Base):
+    """Binary image storage — no external CDN needed."""
+    __tablename__ = "stored_images"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    data: Mapped[bytes] = mapped_column(LargeBinary)
+    mime_type: Mapped[str] = mapped_column(String(50), default="image/jpeg")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
     user: Mapped["User"] = relationship("User")
 
 

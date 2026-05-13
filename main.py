@@ -6,7 +6,7 @@ Multi-platform messaging support (WhatsApp/Telegram)
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List, Dict, Any
@@ -25,7 +25,7 @@ from config import Config, MessagingPlatform
 from messaging_factory import create_messaging_client, get_platform_name
 from messaging_interface import MessagingClient
 
-from database import get_db, init_db, engine, Base, async_session_maker, DeviceToken
+from database import get_db, init_db, engine, Base, async_session_maker, DeviceToken, StoredImage
 from models import User, Message, Category, MessageType, ProAccount, ProAccountMember, Group, GroupMember, CouponCode, CouponRedemption
 from services.group_service import group_service as grp_svc
 from services.coupon_service import coupon_service as cpn_svc
@@ -2163,6 +2163,7 @@ async def get_recent_messages(
             or tags.get("intent_bucket")
             or (cat.name if cat else "Random")
         )
+        due_date_val = tags.get("due_date")
         messages.append({
             "id":                    msg.id,
             "content":               msg.content,
@@ -2174,13 +2175,20 @@ async def get_recent_messages(
             "priority":              tags.get("priority", "normal"),
             "tags":                  tags,
             "created_at":            msg.created_at.isoformat(),
-            "due_date":              tags.get("due_date"),
+            "due_date":              due_date_val,
             "event_time":            tags.get("event_time"),
             "events":                tags.get("events", []),
             "starred":               tags.get("starred", False),
             "group_id":              msg.group_id,
             "assigned_to_user_id":   msg.assigned_to_user_id,
         })
+
+    # Debug: log todo items and their due_dates so we can trace iOS classification
+    todo_msgs = [(m["id"], m["content"][:30], m["due_date"], isinstance(m["tags"], dict)) for m in messages if m["category"] == "To-Do"]
+    if todo_msgs:
+        print(f"[recent] {len(messages)} messages total, {len(todo_msgs)} To-Do items:")
+        for mid, content, due, has_dict_tags in todo_msgs:
+            print(f"  id={mid} due_date={due!r} tags_is_dict={has_dict_tags} content='{content}'")
 
     return {"success": True, "results": messages, "total": len(messages)}
 
@@ -2227,6 +2235,11 @@ async def capture_message(
         message_type=message.message_type, media_url=message.media_url, db=db,
     )
 
+    # Debug: log what was saved so we can correlate with iOS TodoView logs
+    print(f"[capture] category={result.get('category')} due_date={result.get('due_date')!r} "
+          f"remind_at={result.get('remind_at')!r} msg_id={result.get('message_id')} "
+          f"content='{content[:50]}'")
+
     # ── Tag message with group_id / assigned_to ───────────────────────
     if group_id and result.get("message_id"):
         await db.execute(
@@ -2240,6 +2253,57 @@ async def capture_message(
         result["assigned_to_id"] = assigned_uid
 
     return {"success": True, "message": "Content captured successfully", "data": result}
+
+
+@app.post("/api/upload")
+async def upload_image(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload an image; stores binary data in the DB (stored_images table).
+    Returns a URL like /api/images/{id} that the iOS app can load via AsyncImage.
+    No external storage service required.
+    """
+    data         = await file.read()
+    mime_type    = file.content_type or "image/jpeg"
+
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(data) > 10 * 1024 * 1024:   # 10 MB hard cap
+        raise HTTPException(status_code=413, detail="Image too large (max 10 MB)")
+
+    img = StoredImage(user_id=current_user.id, data=data, mime_type=mime_type)
+    db.add(img)
+    await db.commit()
+    await db.refresh(img)
+
+    # Return an absolute URL so the iOS app can load it via AsyncImage
+    base_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+    if base_url:
+        url = f"https://{base_url}/api/images/{img.id}"
+    else:
+        url = f"/api/images/{img.id}"
+
+    print(f"[upload] user={current_user.id} stored_image={img.id} size={len(data)} → {url}")
+    return {"url": url}
+
+
+@app.get("/api/images/{image_id}")
+async def serve_image(
+    image_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve a stored image by ID. Auth-gated to the owning user."""
+    from fastapi.responses import Response
+    img = await db.get(StoredImage, image_id)
+    if not img:
+        raise HTTPException(status_code=404, detail="Image not found")
+    if img.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not your image")
+    return Response(content=img.data, media_type=img.mime_type)
 
 
 @app.post("/api/search")

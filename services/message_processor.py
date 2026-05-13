@@ -531,6 +531,11 @@ class MessageProcessor:
         await db.commit()
         await db.refresh(msg)
 
+        # Debug: confirm what was stored in DB tags
+        stored_tags = msg.tags if isinstance(msg.tags, dict) else {}
+        print(f"[task_save] id={msg.id} stored tags.due_date={stored_tags.get('due_date')!r} "
+              f"event_time={stored_tags.get('event_time')!r} task='{task_text[:50]}'")
+
         result = {
             "message_id":  msg.id,
             "category":    "To-Do",
