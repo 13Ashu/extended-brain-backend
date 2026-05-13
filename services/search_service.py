@@ -172,6 +172,8 @@ class SearchService:
 
     def __init__(self, cerebras_client: CerebrasClient):
         self.cerebras = cerebras_client
+        # Gemini for search LLM calls — no Cerebras rate-limit issues
+        self.gemini = CerebrasClient(provider="gemini")
 
     async def search(
         self,
@@ -341,7 +343,7 @@ class SearchService:
         group_id: Optional[int] = None,
     ) -> Optional[Dict]:
         from services.list_service import ListService
-        ls = ListService(self.cerebras)
+        ls = ListService(self.gemini)
 
         # Never intercept todo/task queries as list queries
         q_lower = query.lower().strip()
@@ -580,12 +582,26 @@ class SearchService:
         self, query: str, user: User, db: AsyncSession,
         date_from: Optional[str], date_to: Optional[str], bucket_hint: Optional[str],
     ) -> Dict:
+        words = [w for w in query.lower().split() if len(w) > 2]
+
+        # Short queries (≤ 3 meaningful words) — embedding handles semantics, skip LLM
+        if len(words) <= 3:
+            return {
+                "core_concepts": words,
+                "keywords":      words,
+                "entities":      [],
+                "intent":        "find_specific",
+                "search_focus":  "all",
+                "extra_buckets": [],
+                "bucket_filter": bucket_hint,
+            }
+
         today_str = datetime.utcnow().strftime("%Y-%m-%d (%A, %d %B %Y)")
         user_cats = await self._get_user_categories(user.id, db)
 
         prompt = f"""Expand a search query for a personal knowledge base.
 
-USER: {user.name} ({user.occupation})
+USER: {user.name}
 TODAY: {today_str}
 CATEGORIES: {", ".join(user_cats)}
 QUERY: "{query}"
@@ -603,16 +619,18 @@ Return ONLY this JSON:
 }}"""
 
         try:
-            response = await self.cerebras.chat_lite(prompt, max_tokens=400)
+            response = await self.gemini.chat_lite(prompt, max_tokens=300)
         except Exception as e:
             print(f"[search] _expand_query failed ({type(e).__name__}): {e}")
             response = {}
-        response.setdefault("core_concepts", [])
-        response.setdefault("keywords", [])
+        response.setdefault("core_concepts", words)
+        response.setdefault("keywords", words)
         response.setdefault("entities", [])
         response.setdefault("intent", "find_specific")
         response.setdefault("search_focus", "all")
         response.setdefault("extra_buckets", [])
+        if bucket_hint and not response.get("bucket_filter"):
+            response["bucket_filter"] = bucket_hint
         return response
 
     # ──────────────────────────────────────────────────────────────
@@ -911,7 +929,7 @@ Instructions:
 Reply:"""
 
         try:
-            return await self.cerebras._chat_completion(prompt, max_tokens=300, temperature=0.2)
+            return await self.gemini.chat_text(prompt, max_tokens=250, temperature=0.2)
         except Exception as e:
             print(f"[search] _natural_response failed ({type(e).__name__}): {e}")
             return f"Found {len(results)} result(s) matching your query."

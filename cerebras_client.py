@@ -38,7 +38,7 @@ _response_cache: dict = {}  # simple TTL-less cache for identical prompts
 
 import time
 _last_request_time: float = 0.0
-_min_request_gap: float = 2.0  # safe for 30 RPM combined
+_min_request_gap: float = 0.0  # rely on 429 retry backoff; proactive throttle removed
 
 class CerebrasClient:
     """
@@ -129,7 +129,7 @@ class CerebrasClient:
     # Provider implementations
     # ──────────────────────────────────────────────────────────────
 
-    async def _gemini(self, prompt: str, max_tokens: int, temperature: float, model_override: Optional[str] = None,) -> str:
+    async def _gemini(self, prompt: str, max_tokens: int, temperature: float, model_override: Optional[str] = None, json_mode: bool = True) -> str:
         global _last_request_time
 
         model = model_override or self.model
@@ -143,6 +143,12 @@ class CerebrasClient:
 
         url = f"{self.base_url}/{model}:generateContent"
         headers = {"Content-Type": "application/json", "X-goog-api-key": self.api_key}
+        gen_config: Dict[str, Any] = {
+            "maxOutputTokens": max_tokens,
+            "temperature": temperature,
+        }
+        if json_mode:
+            gen_config["responseMimeType"] = "application/json"
         payload = {
             "system_instruction": {
                 "parts": [{"text": (
@@ -152,11 +158,7 @@ class CerebrasClient:
                 )}]
             },
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "maxOutputTokens": max_tokens,
-                "temperature": temperature,
-                "responseMimeType": "application/json",
-            },
+            "generationConfig": gen_config,
         }
 
         delays = [2, 5, 15]  # more patient backoff
@@ -189,6 +191,17 @@ class CerebrasClient:
 
         return "{}"
 
+
+    async def chat_text(
+        self,
+        prompt: str,
+        max_tokens: int = 300,
+        temperature: float = 0.2,
+    ) -> str:
+        """Plain text (non-JSON) completion — Gemini text mode, Cerebras falls back to openai-compat."""
+        if self.provider == "gemini":
+            return await self._gemini(prompt, max_tokens, temperature, json_mode=False)
+        return await self._openai_compat(prompt, max_tokens, temperature)
 
     # Add a lite method
     async def chat_lite(
