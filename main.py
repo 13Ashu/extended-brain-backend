@@ -2151,7 +2151,7 @@ async def get_recent_messages(
     after_dt = None
     if after:
         try:
-            after_dt = datetime.fromisoformat(after.replace("Z", "+00:00"))
+            after_dt = datetime.fromisoformat(after.replace("Z", "+00:00")).replace(tzinfo=None)
         except ValueError:
             pass
 
