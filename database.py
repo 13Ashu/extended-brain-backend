@@ -143,6 +143,21 @@ class User(Base):
         return f"<User {self.phone_number} - {self.name}>"
 
 
+class DeviceToken(Base):
+    """APNs device tokens for push notifications"""
+    __tablename__ = "device_tokens"
+
+    id:         Mapped[int]      = mapped_column(primary_key=True)
+    user_id:    Mapped[int]      = mapped_column(ForeignKey("users.id"), index=True)
+    token:      Mapped[str]      = mapped_column(String(255), unique=True, index=True)
+    platform:   Mapped[str]      = mapped_column(String(20), default="ios")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<DeviceToken user={self.user_id} token={self.token[:8]}...>"
+
+
 class OTPVerification(Base):
     """Store OTP codes for phone verification"""
     __tablename__ = "otp_verifications"

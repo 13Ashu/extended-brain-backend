@@ -13,7 +13,7 @@ alembic
 upstash-redis
 
 # HTTP Client
-httpx
+httpx[http2]
 email-validator
 dnspython
 

@@ -106,8 +106,8 @@ def _today_str() -> str:
     return datetime.now(_IST).strftime("%Y-%m-%d")
 
 def _ist_now() -> datetime:
-    # Strip tzinfo so asyncpg can write to TIMESTAMP WITHOUT TIME ZONE columns
-    return datetime.now(_IST).replace(tzinfo=None)
+    # DB stores UTC naive; _today_str() handles IST date logic separately
+    return datetime.utcnow()
 
 
 def _detect_priority(content: str) -> str:

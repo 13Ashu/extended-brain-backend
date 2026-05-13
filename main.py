@@ -25,7 +25,7 @@ from config import Config, MessagingPlatform
 from messaging_factory import create_messaging_client, get_platform_name
 from messaging_interface import MessagingClient
 
-from database import get_db, init_db, engine, Base, async_session_maker
+from database import get_db, init_db, engine, Base, async_session_maker, DeviceToken
 from models import User, Message, Category, MessageType, ProAccount, ProAccountMember, Group, GroupMember, CouponCode, CouponRedemption
 from services.group_service import group_service as grp_svc
 from services.coupon_service import coupon_service as cpn_svc
@@ -319,6 +319,26 @@ async def get_me(
             "is_pro": current_user.is_pro,
         }
     }
+
+
+@app.post("/api/users/device-token")
+async def register_device_token(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    token = (body.get("device_token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="device_token required")
+
+    existing = await db.scalar(select(DeviceToken).where(DeviceToken.token == token))
+    if existing:
+        existing.user_id    = current_user.id
+        existing.updated_at = datetime.utcnow()
+    else:
+        db.add(DeviceToken(user_id=current_user.id, token=token, platform="ios"))
+    await db.commit()
+    return {"success": True}
 
 
 @app.post("/api/users/register")
