@@ -2345,7 +2345,8 @@ async def capture_message(
                 message_type=MessageType.TEXT,
                 summary=result.get("essence") or content[:80],
                 tags=todo_tags,
-                group_id=group_id,
+                # no group_id — this is a personal To-Do for the assigned user only,
+                # it should not appear in the group's shared feed
                 assigned_to_user_id=assigned_uid,
             )
             db.add(mirror)
