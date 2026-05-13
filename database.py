@@ -378,6 +378,11 @@ async def init_db():
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS group_id INTEGER",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS assigned_to_user_id INTEGER",
             "CREATE TABLE IF NOT EXISTS group_last_seen (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), group_id INTEGER, last_seen_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, group_id))",
+            # Performance indexes
+            "CREATE INDEX IF NOT EXISTS idx_messages_user_created ON messages(user_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_group_created ON messages(group_id, created_at DESC) WHERE group_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_messages_assigned ON messages(assigned_to_user_id) WHERE assigned_to_user_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_group_last_seen_lookup ON group_last_seen(user_id, group_id)",
         ]
         for stmt in migrations:
             try:

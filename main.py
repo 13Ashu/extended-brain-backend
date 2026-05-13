@@ -6,7 +6,7 @@ Multi-platform messaging support (WhatsApp/Telegram)
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, UploadFile, File, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List, Dict, Any
@@ -126,6 +126,40 @@ message_processor  = MessageProcessor(cerebras_client, reminder_service=reminder
 project_service    = ProjectService(cerebras_client)
 subtask_service    = SubtaskService(cerebras_client)
 recurrence_service = RecurrenceService(cerebras_client)
+
+
+# ================== WebSocket Connection Manager ==================
+
+class WSConnectionManager:
+    """Tracks live WebSocket connections per group, broadcasts new messages instantly."""
+
+    def __init__(self):
+        # group_id → { user_id → set[WebSocket] }
+        self._conns: dict[int, dict[int, set]] = {}
+
+    async def connect(self, ws: WebSocket, group_id: int, user_id: int) -> None:
+        await ws.accept()
+        self._conns.setdefault(group_id, {}).setdefault(user_id, set()).add(ws)
+
+    def disconnect(self, ws: WebSocket, group_id: int, user_id: int) -> None:
+        group = self._conns.get(group_id, {})
+        sockets = group.get(user_id, set())
+        sockets.discard(ws)
+        if not sockets:
+            group.pop(user_id, None)
+
+    async def broadcast(self, group_id: int, data: dict, exclude_user_id: Optional[int] = None) -> None:
+        for uid, sockets in list(self._conns.get(group_id, {}).items()):
+            if uid == exclude_user_id:
+                continue
+            for ws in list(sockets):
+                try:
+                    await ws.send_json(data)
+                except Exception:
+                    sockets.discard(ws)
+
+
+ws_manager = WSConnectionManager()
 
 
 # ================== Pydantic Models ==================
@@ -2129,6 +2163,130 @@ async def get_assigned_messages(
     return {"success": True, "results": messages, "total": len(messages)}
 
 
+@app.get("/api/bootstrap")
+async def bootstrap(
+    group_id: Optional[int] = None,
+    limit: int = 100,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Single round-trip that returns everything iOS needs to open a context:
+    recent messages, group members, assigned tasks, and unread counts."""
+
+    # 1. Recent messages ──────────────────────────────────────────────
+    if group_id:
+        group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
+        if not group:
+            raise HTTPException(status_code=403, detail="Not a member of this group")
+        base_filter = Message.group_id == group_id
+    else:
+        base_filter = and_(Message.user_id == current_user.id, Message.group_id.is_(None))
+
+    recent_rows = await db.execute(
+        select(Message, Category, User)
+        .outerjoin(Category, Message.category_id == Category.id)
+        .outerjoin(User, Message.user_id == User.id)
+        .where(base_filter)
+        .order_by(Message.created_at.desc())
+        .limit(min(limit, 200))
+    )
+
+    def _serialize(msg, cat, sender):
+        tags = msg.tags if isinstance(msg.tags, dict) else {}
+        bucket = tags.get("primary_bucket") or tags.get("intent_bucket") or (cat.name if cat else "Random")
+        return {
+            "id":                  msg.id,
+            "content":             msg.content,
+            "essence":             msg.summary or msg.content[:80],
+            "message_type":        msg.message_type.value if msg.message_type else "text",
+            "media_url":           msg.media_url,
+            "category":            bucket,
+            "all_buckets":         tags.get("all_buckets", [bucket]),
+            "priority":            tags.get("priority", "normal"),
+            "tags":                tags,
+            "created_at":          msg.created_at.isoformat(),
+            "due_date":            tags.get("due_date"),
+            "event_time":          tags.get("event_time"),
+            "events":              tags.get("events", []),
+            "starred":             tags.get("starred", False),
+            "group_id":            msg.group_id,
+            "assigned_to_user_id": msg.assigned_to_user_id,
+            "sender_name":         sender.name if sender else None,
+            "sender_id":           msg.user_id,
+        }
+
+    recent = [_serialize(m, c, s) for m, c, s in recent_rows.all()]
+
+    # 2. Group members ────────────────────────────────────────────────
+    members: list = []
+    if group_id:
+        members = await grp_svc.get_group_members(group_id, db)
+
+    # 3. Assigned tasks ───────────────────────────────────────────────
+    assigned_rows = await db.execute(
+        select(Message, Category, User)
+        .outerjoin(Category, Message.category_id == Category.id)
+        .join(User, User.id == Message.user_id)
+        .where(Message.assigned_to_user_id == current_user.id)
+        .order_by(Message.created_at.desc())
+        .limit(100)
+    )
+    assigned = []
+    for msg, cat, sender in assigned_rows.all():
+        tags = msg.tags if isinstance(msg.tags, dict) else {}
+        bucket = tags.get("primary_bucket") or tags.get("intent_bucket") or (cat.name if cat else "To-Do")
+        assigned.append({
+            "id":                  msg.id,
+            "content":             msg.content,
+            "essence":             msg.summary or msg.content[:80],
+            "message_type":        msg.message_type.value if msg.message_type else "text",
+            "media_url":           msg.media_url,
+            "category":            bucket,
+            "all_buckets":         tags.get("all_buckets", [bucket]),
+            "priority":            tags.get("priority", "normal"),
+            "tags":                tags,
+            "created_at":          msg.created_at.isoformat(),
+            "due_date":            tags.get("due_date"),
+            "group_id":            msg.group_id,
+            "sender_name":         sender.name,
+            "assigned_to_user_id": msg.assigned_to_user_id,
+            "sender_id":           msg.user_id,
+        })
+
+    # 4. Unread counts ────────────────────────────────────────────────
+    unread_counts: dict[str, int] = {}
+    memberships = await db.execute(
+        select(GroupMember.group_id).where(GroupMember.user_id == current_user.id)
+    )
+    gids = [r[0] for r in memberships.all()]
+    if gids:
+        seen_rows = await db.execute(
+            select(GroupLastSeen).where(
+                GroupLastSeen.user_id == current_user.id,
+                GroupLastSeen.group_id.in_(gids),
+            )
+        )
+        last_seen = {r.group_id: r.last_seen_at for r in seen_rows.scalars()}
+        for gid in gids:
+            cutoff = last_seen.get(gid, datetime.min)
+            cnt = await db.scalar(
+                select(func.count(Message.id)).where(
+                    Message.group_id == gid,
+                    Message.created_at > cutoff,
+                    Message.user_id != current_user.id,
+                )
+            )
+            unread_counts[str(gid)] = cnt or 0
+
+    return {
+        "success":      True,
+        "recent":       recent,
+        "members":      members,
+        "assigned":     assigned,
+        "unread_counts": unread_counts,
+    }
+
+
 @app.get("/api/messages/recent")
 async def get_recent_messages(
     limit: int = 100,
@@ -2199,13 +2357,6 @@ async def get_recent_messages(
             "sender_id":             msg.user_id,
         })
 
-    # Debug: log todo items and their due_dates so we can trace iOS classification
-    todo_msgs = [(m["id"], m["content"][:30], m["due_date"], isinstance(m["tags"], dict)) for m in messages if m["category"] == "To-Do"]
-    if todo_msgs:
-        print(f"[recent] {len(messages)} messages total, {len(todo_msgs)} To-Do items:")
-        for mid, content, due, has_dict_tags in todo_msgs:
-            print(f"  id={mid} due_date={due!r} tags_is_dict={has_dict_tags} content='{content}'")
-
     return {"success": True, "results": messages, "total": len(messages)}
 
 
@@ -2271,6 +2422,53 @@ async def mark_group_seen(
     return {"success": True}
 
 
+@app.websocket("/ws/group/{group_id}")
+async def group_websocket(
+    websocket: WebSocket,
+    group_id: int,
+    token: str = Query(...),
+):
+    """WebSocket endpoint for live group chat. Eliminates HTTP polling."""
+    from jose import jwt as jose_jwt, JWTError
+    SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-key")
+
+    # Verify JWT token from query param
+    try:
+        payload  = jose_jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        user_id  = int(payload.get("sub", 0))
+    except (JWTError, ValueError, TypeError):
+        await websocket.close(code=1008, reason="Unauthorized")
+        return
+
+    async with async_session_maker() as db:
+        user  = await db.get(User, user_id)
+        if not user:
+            await websocket.close(code=1008, reason="User not found")
+            return
+        group = await grp_svc.get_group_by_id(group_id, user_id, db)
+        if not group:
+            await websocket.close(code=1008, reason="Not a member")
+            return
+
+    await ws_manager.connect(websocket, group_id, user_id)
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=25)
+                if msg == "ping":
+                    await websocket.send_text("pong")
+            except asyncio.TimeoutError:
+                # Send server-initiated keepalive; if send fails the socket is dead
+                try:
+                    await websocket.send_text("ping")
+                except Exception:
+                    break
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ws_manager.disconnect(websocket, group_id, user_id)
+
+
 @app.delete("/api/messages/{message_id}")
 async def delete_message(
     message_id: int,
@@ -2313,11 +2511,6 @@ async def capture_message(
         message_type=message.message_type, media_url=message.media_url, db=db,
     )
 
-    # Debug: log what was saved so we can correlate with iOS TodoView logs
-    print(f"[capture] category={result.get('category')} due_date={result.get('due_date')!r} "
-          f"remind_at={result.get('remind_at')!r} msg_id={result.get('message_id')} "
-          f"content='{content[:50]}'")
-
     # ── Tag message with group_id / assigned_to ───────────────────────
     if group_id and result.get("message_id"):
         await db.execute(
@@ -2329,6 +2522,26 @@ async def capture_message(
         result["group_id"]       = group_id
         result["assigned_to"]    = assigned_name
         result["assigned_to_id"] = assigned_uid
+
+        # ── Broadcast to connected group members via WebSocket ───────
+        asyncio.create_task(ws_manager.broadcast(group_id, {
+            "type":                "new_message",
+            "id":                  result.get("message_id"),
+            "content":             content,
+            "essence":             result.get("essence", content[:80]),
+            "message_type":        "text",
+            "media_url":           message.media_url,
+            "category":            result.get("category", "Random"),
+            "all_buckets":         [result.get("category", "Random")],
+            "tags":                {},
+            "created_at":          datetime.utcnow().isoformat(),
+            "due_date":            result.get("due_date"),
+            "group_id":            group_id,
+            "sender_id":           current_user.id,
+            "sender_name":         current_user.name,
+            "assigned_to_user_id": assigned_uid,
+            "starred":             False,
+        }, exclude_user_id=current_user.id))
 
         # ── Mirror a To-Do in the assigned user's personal feed ──────
         if assigned_uid and assigned_uid != current_user.id:
@@ -2401,7 +2614,6 @@ async def upload_image(
     else:
         url = f"/api/images/{img.id}"
 
-    print(f"[upload] user={current_user.id} stored_image={img.id} size={len(data)} → {url}")
     return {"url": url}
 
 
