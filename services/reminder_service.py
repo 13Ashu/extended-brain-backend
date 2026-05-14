@@ -31,6 +31,28 @@ from cerebras_client import CerebrasClient
 _apns_jwt_cache: dict = {}   # {"token": str, "exp": float}
 
 
+def _normalize_apns_key(raw: str) -> str:
+    """
+    Normalize a .p8 APNs private key for reliable PEM loading on all platforms.
+    Handles: missing PEM headers (raw base64 only), escaped \\n sequences from
+    Railway/Heroku dashboards, Windows line endings, and improperly wrapped base64.
+    """
+    # Unescape literal \n / \r sequences (Railway env var UI encoding)
+    key = raw.replace("\\n", "\n").replace("\\r", "")
+    key = key.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    if "-----BEGIN PRIVATE KEY-----" in key:
+        # Has headers — extract body lines, strip whitespace, re-wrap at 64 chars
+        lines = [l.strip() for l in key.splitlines() if l.strip()]
+        body = "".join(l for l in lines if not l.startswith("-----"))
+    else:
+        # Raw base64 only (no headers) — treat entire content as the body
+        body = "".join(key.split())
+
+    wrapped = "\n".join(body[i:i + 64] for i in range(0, len(body), 64))
+    return f"-----BEGIN PRIVATE KEY-----\n{wrapped}\n-----END PRIVATE KEY-----\n"
+
+
 def _build_apns_jwt() -> str:
     """Build (or return cached) APNs provider JWT — valid 1 h, refresh at 55 min."""
     global _apns_jwt_cache
@@ -40,7 +62,7 @@ def _build_apns_jwt() -> str:
 
     key_id   = os.getenv("APNS_KEY_ID", "")
     team_id  = os.getenv("APNS_TEAM_ID", "")
-    auth_key = os.getenv("APNS_AUTH_KEY", "").replace("\\n", "\n")
+    auth_key = _normalize_apns_key(os.getenv("APNS_AUTH_KEY", ""))
 
     token = jose_jwt.encode(
         {"iss": team_id, "iat": int(now)},
