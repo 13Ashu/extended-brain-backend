@@ -18,7 +18,7 @@ import os
 import re
 import asyncio
 import httpx
-from sqlalchemy import and_, or_, select, update, func, text
+from sqlalchemy import and_, or_, select, update, func, text, delete as sql_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import Config, MessagingPlatform
@@ -34,7 +34,7 @@ from services.message_processor import MessageProcessor
 from services.search_service import SearchService
 from services.category_manager import CategoryManager
 from services.auth_service import AuthService, get_current_user
-from services.reminder_service import ReminderService, send_apns_notification
+from services.reminder_service import ReminderService, send_apns_notification, Reminder
 from services.briefing_service import briefing_service
 from services.nudge_service import nudge_service
 from services.context_service import context_service
@@ -220,6 +220,10 @@ class SearchQuery(BaseModel):
     category_filter: Optional[List[str]] = None
     group_id:        Optional[int] = None
     fast:            bool = False  # skip LLM; return embedding+keyword results instantly
+
+
+class DoneRequest(BaseModel):
+    done: bool = True
 
 
 class CategoryOperation(BaseModel):
@@ -2167,6 +2171,7 @@ async def get_assigned_messages(
             "tags":           tags,
             "created_at":     msg.created_at.isoformat(),
             "due_date":       tags.get("due_date"),
+            "is_done":        bool(tags.get("done", False)),
             "group_id":       msg.group_id,
             "sender_name":    sender.name,
             "assigned_to_user_id": msg.assigned_to_user_id,
@@ -2222,6 +2227,7 @@ async def bootstrap(
             "tags":                tags,
             "created_at":          msg.created_at.isoformat(),
             "due_date":            tags.get("due_date"),
+            "is_done":             bool(tags.get("done", False)),
             "event_time":          tags.get("event_time"),
             "events":              tags.get("events", []),
             "starred":             tags.get("starred", False),
@@ -2263,6 +2269,7 @@ async def bootstrap(
             "tags":                tags,
             "created_at":          msg.created_at.isoformat(),
             "due_date":            tags.get("due_date"),
+            "is_done":             bool(tags.get("done", False)),
             "group_id":            msg.group_id,
             "sender_name":         sender.name,
             "assigned_to_user_id": msg.assigned_to_user_id,
@@ -2499,6 +2506,7 @@ async def delete_message(
         raise HTTPException(status_code=404, detail="Message not found")
     if msg.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not your message")
+    await db.execute(sql_delete(Reminder).where(Reminder.message_id == message_id))
     await db.delete(msg)
     await db.commit()
     return {"success": True}
@@ -2684,16 +2692,17 @@ async def search_messages(
 @app.patch("/api/messages/{message_id}/done")
 async def mark_message_done(
     message_id: int,
+    body: Optional[DoneRequest] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     from sqlalchemy import update as sa_update
+    done_val = body.done if body is not None else True
+    jsonb_expr = f"jsonb_set(COALESCE(tags, '{{}}'), '{{done}}', '{str(done_val).lower()}'::jsonb)"
     result = await db.execute(
         sa_update(Message)
         .where(and_(Message.id == message_id, Message.user_id == current_user.id))
-        .values(tags=text(
-            "jsonb_set(COALESCE(tags, '{}'), '{done}', 'true'::jsonb)"
-        ))
+        .values(tags=text(jsonb_expr))
     )
     await db.commit()
     if result.rowcount == 0:
@@ -3229,6 +3238,56 @@ async def leave_group(
     # Clear active group if it was this one
     if current_user.active_group_id == group_id:
         await grp_svc.set_active_group(current_user.id, None, db)
+    return {"success": True}
+
+
+@app.delete("/api/groups/{group_id}")
+async def delete_group(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a group entirely. Only the group admin (creator) can do this."""
+    member = await db.scalar(
+        select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == current_user.id,
+            GroupMember.role == "admin",
+        )
+    )
+    if not member:
+        raise HTTPException(status_code=403, detail="Only the group admin can delete this group")
+
+    # Delete members, messages, then the group
+    await db.execute(sql_delete(GroupMember).where(GroupMember.group_id == group_id))
+    await db.execute(sql_delete(Message).where(Message.group_id == group_id))
+    group = await db.get(Group, group_id)
+    if group:
+        await db.delete(group)
+    await db.commit()
+    return {"success": True}
+
+
+@app.delete("/api/pro/members/{phone_number}")
+async def remove_pro_member(
+    phone_number: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove a member from the owner's Pro account."""
+    acct = await grp_svc.get_pro_account_for_user(current_user.id, db)
+    if not acct:
+        raise HTTPException(status_code=403, detail="Pro account not found")
+    member = await db.scalar(
+        select(ProAccountMember).where(
+            ProAccountMember.account_id == acct.id,
+            ProAccountMember.phone_number == phone_number,
+        )
+    )
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    await db.delete(member)
+    await db.commit()
     return {"success": True}
 
 
