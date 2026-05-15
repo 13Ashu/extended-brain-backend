@@ -124,25 +124,9 @@ class GroupService:
         member_row.user_id = user.id
         member_row.status = "active"
         member_row.joined_at = datetime.utcnow()
-        await db.flush()
-
-        # Auto-add to all existing groups in this Pro account
-        # Fetch all groups eagerly before iterating to avoid open-cursor conflicts in async SQLAlchemy
-        all_groups = (
-            await db.execute(select(Group).where(Group.account_id == member_row.account_id))
-        ).scalars().all()
-        for group in all_groups:
-            already = await db.scalar(
-                select(GroupMember).where(
-                    GroupMember.group_id == group.id,
-                    GroupMember.user_id == user.id,
-                )
-            )
-            if not already:
-                db.add(GroupMember(group_id=group.id, user_id=user.id, role="member"))
 
         await db.commit()
-        return {"success": True, "message": "✅ You've joined the Pro account!\n\nSend /mygroups to see your shared groups, then /setgroup GroupName to start posting."}
+        return {"success": True, "message": "You've joined the Pro account. The owner will add you to groups."}
 
     async def cancel_invite(
         self, owner: User, phone_number: str, db: AsyncSession

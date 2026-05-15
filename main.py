@@ -3086,6 +3086,30 @@ async def invite_member(
     return result
 
 
+@app.get("/api/pro/my-invites")
+async def my_pending_invites(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    rows = (await db.execute(
+        select(ProAccountMember).where(
+            ProAccountMember.phone_number == current_user.phone_number,
+            ProAccountMember.status == "pending",
+        )
+    )).scalars().all()
+
+    result = []
+    for row in rows:
+        inviter = await db.get(User, row.invited_by)
+        result.append({
+            "token": row.invite_token,
+            "invited_by_name": inviter.name if inviter else "Someone",
+            "invited_at": row.invited_at.isoformat() if row.invited_at else None,
+        })
+
+    return {"success": True, "invites": result}
+
+
 @app.post("/api/pro/accept-invite")
 async def accept_invite(
     req: AcceptInviteRequest,
