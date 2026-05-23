@@ -24,6 +24,18 @@ from cerebras_client import CerebrasClient
 from models import MessageType as MT
 
 
+async def _save_list_embedding(message_id: int, list_name: str, items: List[str], db: AsyncSession):
+    """Generate and store embedding for a list message so it's findable via semantic search."""
+    try:
+        from services.embedding_service import embedding_service
+        enriched = list_name + " " + " ".join(items)
+        embedding = await embedding_service.aembed(enriched.strip(), task_type="RETRIEVAL_DOCUMENT")
+        await db.execute(update(Message).where(Message.id == message_id).values(embedding=embedding))
+        await db.commit()
+    except Exception as e:
+        print(f"⚠ List embedding failed (non-critical): {e}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # List type classification (for grouping, not identity)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -595,6 +607,10 @@ class ListService:
         await db.commit()
         await db.refresh(msg)
 
+        # Refresh embedding to include new items
+        all_items = [s["task"] for s in existing]
+        await _save_list_embedding(msg.id, tags.get("list_name", msg.content), all_items, db)
+
         return msg, added, False
 
     async def _create_list(
@@ -636,6 +652,7 @@ class ListService:
         db.add(msg)
         await db.commit()
         await db.refresh(msg)
+        await _save_list_embedding(msg.id, list_name, items, db)
         return msg
 
     async def complete_item(self, message_id: int, item_index: int) -> bool:

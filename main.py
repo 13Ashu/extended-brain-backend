@@ -2179,6 +2179,119 @@ async def get_assigned_messages(
     return {"success": True, "results": messages, "total": len(messages)}
 
 
+@app.get("/api/messages/assigned-to-others")
+async def get_assigned_to_others(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return group messages where the current user is the assigner (sender) and
+    tags.assignments is non-empty — i.e. tasks they assigned to other group members."""
+    import json as _json
+
+    rows = await db.execute(
+        select(Message)
+        .where(
+            Message.user_id == current_user.id,
+            Message.group_id.isnot(None),
+            text("messages.tags ? 'assignments'"),
+            text("jsonb_array_length(messages.tags->'assignments') > 0"),
+        )
+        .order_by(Message.created_at.desc())
+        .limit(200)
+    )
+    messages = []
+    for (msg,) in rows.all():
+        tags = msg.tags if isinstance(msg.tags, dict) else {}
+        bucket = tags.get("primary_bucket") or tags.get("intent_bucket") or "To-Do"
+        messages.append({
+            "id":           msg.id,
+            "content":      msg.content,
+            "essence":      msg.summary or msg.content[:80],
+            "message_type": msg.message_type.value if msg.message_type else "text",
+            "category":     bucket,
+            "tags":         tags,
+            "due_date":     tags.get("due_date"),
+            "created_at":   msg.created_at.isoformat(),
+            "group_id":     msg.group_id,
+            "assignments":  tags.get("assignments", []),
+        })
+    return {"success": True, "results": messages, "total": len(messages)}
+
+
+@app.patch("/api/messages/{message_id}/assignments/{assignment_idx}/complete")
+async def complete_assignment(
+    message_id: int,
+    assignment_idx: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Mark a specific assignee's slot as done.
+    Callable by the assignee themselves. Notifies the assigner (message owner) via APNs."""
+    import json as _json
+
+    msg = await db.get(Message, message_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    tags = msg.tags if isinstance(msg.tags, dict) else {}
+    assignments: list[dict] = tags.get("assignments", [])
+
+    if assignment_idx < 0 or assignment_idx >= len(assignments):
+        raise HTTPException(status_code=400, detail="Invalid assignment index")
+
+    slot = assignments[assignment_idx]
+    if slot.get("user_id") != current_user.id:
+        raise HTTPException(status_code=403, detail="You are not the assignee for this slot")
+
+    slot["done"]    = True
+    slot["done_at"] = datetime.utcnow().isoformat()
+    assignments[assignment_idx] = slot
+
+    await db.execute(
+        text(
+            "UPDATE messages SET tags = tags || :extra WHERE id = :mid"
+        ).bindparams(
+            extra=_json.dumps({"assignments": assignments}),
+            mid=message_id,
+        )
+    )
+    await db.commit()
+
+    # ── Broadcast to group so other clients refresh ───────────────────
+    if msg.group_id:
+        asyncio.create_task(ws_manager.broadcast(msg.group_id, {
+            "type":           "assignment_complete",
+            "message_id":     message_id,
+            "assignment_idx": assignment_idx,
+            "completed_by":   current_user.name,
+        }))
+
+    # ── Notify the assigner (message owner) ──────────────────────────
+    if msg.user_id != current_user.id:
+        try:
+            tokens_rows = await db.execute(
+                select(DeviceToken.token).where(DeviceToken.user_id == msg.user_id)
+            )
+            task_preview = (msg.summary or msg.content)[:60]
+            for (token,) in tokens_rows.all():
+                await send_apns_notification(
+                    device_token=token,
+                    title=f"✅ {current_user.name} completed a task",
+                    body=task_preview,
+                    data={"type": "assignment_complete", "message_id": message_id,
+                          "group_id": msg.group_id},
+                )
+        except Exception as e:
+            print(f"[push] assigner completion notify failed: {e}")
+
+    return {
+        "success":     True,
+        "message_id":  message_id,
+        "assignment":  slot,
+        "assignments": assignments,
+    }
+
+
 @app.get("/api/bootstrap")
 async def bootstrap(
     group_id: Optional[int] = None,
@@ -2518,43 +2631,62 @@ async def capture_message(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    group_id      = message.group_id
-    content       = message.content
-    assigned_uid  = None
-    assigned_name = None
+    group_id = message.group_id
+    content  = message.content
 
-    # ── Group context: parse @mention before processing ──────────────
+    # ── Group context: parse ALL @mentions before AI processing ─────
+    assignments: list[dict] = []
+    members: list[dict] = []
     if group_id:
         members = await grp_svc.get_group_members(group_id, db)
-        uid, _ = grp_svc.parse_mention(content, members)
-        if uid:
-            assigned_uid  = uid
-            assigned_name = next((m["name"] for m in members if m["id"] == uid), None)
-            # content unchanged — @mention preserved so other members see who was tagged
+        assignments = grp_svc.parse_all_mentions(content, members)
 
     result = await message_processor.process(
         user_phone=current_user.phone_number, content=content,
         message_type=message.message_type, media_url=message.media_url, db=db,
-        skip_query=True,  # iOS capture endpoint always saves — queries go through /api/messages/search
+        skip_query=True,
     )
 
-    # ── Tag message with group_id / assigned_to ───────────────────────
+    # ── Tag message with group_id / assignments ───────────────────────
     if group_id and result.get("message_id"):
+        # Single-assignee field kept for backwards compatibility
+        primary_uid = assignments[0]["user_id"] if assignments else None
+
+        # Detect group-wide reminder: no specific @mention but a due time was extracted
+        is_group_reminder = (not assignments) and bool(result.get("due_date") or result.get("remind_at"))
+
+        import json as _json
+
+        extra_tags: dict = {}
+        if assignments:
+            extra_tags["assignments"] = assignments
+        if is_group_reminder:
+            extra_tags["group_reminder"] = True
+
+        # Single UPDATE: set group_id, assigned_to_user_id, and merge extra tags atomically
         await db.execute(
-            update(Message)
-            .where(Message.id == result["message_id"])
-            .values(group_id=group_id, assigned_to_user_id=assigned_uid)
+            text(
+                "UPDATE messages SET group_id = :gid, assigned_to_user_id = :auid,"
+                " tags = tags || :extra WHERE id = :mid"
+            ).bindparams(
+                gid=group_id,
+                auid=primary_uid,
+                extra=_json.dumps(extra_tags),
+                mid=result["message_id"],
+            )
         )
         await db.commit()
-        result["group_id"]       = group_id
-        result["assigned_to"]    = assigned_name
-        result["assigned_to_id"] = assigned_uid
 
-        # ── Bust bootstrap cache so next open reflects new message ──────
+        result["group_id"]       = group_id
+        result["assigned_to"]    = assignments[0]["name"] if assignments else None
+        result["assigned_to_id"] = primary_uid
+        result["assignments"]    = assignments
+
+        # ── Bust bootstrap cache ──────────────────────────────────────
         from services import redis_cache as _rc
         asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(current_user.id, group_id)))
 
-        # ── Broadcast to connected group members via WebSocket ───────
+        # ── Broadcast new message to group WebSocket ──────────────────
         asyncio.create_task(ws_manager.broadcast(group_id, {
             "type":                "new_message",
             "id":                  result.get("message_id"),
@@ -2564,52 +2696,78 @@ async def capture_message(
             "media_url":           message.media_url,
             "category":            result.get("category", "Random"),
             "all_buckets":         [result.get("category", "Random")],
-            "tags":                {},
+            "tags":                extra_tags,
             "created_at":          datetime.utcnow().isoformat(),
             "due_date":            result.get("due_date"),
             "group_id":            group_id,
             "sender_id":           current_user.id,
             "sender_name":         current_user.name,
-            "assigned_to_user_id": assigned_uid,
+            "assigned_to_user_id": primary_uid,
+            "assignments":         assignments,
             "starred":             False,
         }, exclude_user_id=current_user.id))
 
-        # ── Mirror a To-Do in the assigned user's personal feed ──────
-        if assigned_uid and assigned_uid != current_user.id:
+        # ── Mirror To-Do in each assignee's personal feed + push ──────
+        for assignment in assignments:
+            auid = assignment["user_id"]
+            if auid == current_user.id:
+                continue
             todo_tags = {
-                "primary_bucket": "To-Do",
-                "intent_bucket":  "To-Do",
-                "due_date":       result.get("due_date"),
-                "assigned_by":    current_user.name,
-                "group_id":       group_id,
+                "primary_bucket":   "To-Do",
+                "intent_bucket":    "To-Do",
+                "due_date":         result.get("due_date"),
+                "assigned_by":      current_user.name,
+                "assigned_by_id":   current_user.id,
+                "group_id":         group_id,
+                "source_message_id": result["message_id"],
             }
             mirror = Message(
-                user_id=assigned_uid,
+                user_id=auid,
                 content=content,
                 message_type=MessageType.TEXT,
                 summary=result.get("essence") or content[:80],
                 tags=todo_tags,
-                # no group_id — this is a personal To-Do for the assigned user only,
-                # it should not appear in the group's shared feed
-                assigned_to_user_id=assigned_uid,
+                assigned_to_user_id=auid,
             )
             db.add(mirror)
-            await db.commit()
-
-            # ── Push notification to assigned user ───────────────────
             try:
+                await db.flush()
                 tokens_rows = await db.execute(
-                    select(DeviceToken.token).where(DeviceToken.user_id == assigned_uid)
+                    select(DeviceToken.token).where(DeviceToken.user_id == auid)
                 )
                 for (token,) in tokens_rows.all():
                     await send_apns_notification(
                         device_token=token,
                         title=f"{current_user.name} assigned you a task",
                         body=content[:80],
-                        data={"type": "assignment", "group_id": group_id},
+                        data={"type": "assignment", "group_id": group_id,
+                              "message_id": result["message_id"]},
                     )
             except Exception as e:
-                print(f"[push] assignment notify failed: {e}")
+                print(f"[push] assignment notify failed for uid={auid}: {e}")
+
+        await db.commit()
+
+        # ── Group-wide reminder push to all members ───────────────────
+        if is_group_reminder:
+            for member in members:
+                muid = member["id"]
+                if muid == current_user.id:
+                    continue
+                try:
+                    tokens_rows = await db.execute(
+                        select(DeviceToken.token).where(DeviceToken.user_id == muid)
+                    )
+                    for (token,) in tokens_rows.all():
+                        await send_apns_notification(
+                            device_token=token,
+                            title=f"Reminder · {current_user.name}",
+                            body=content[:80],
+                            data={"type": "group_reminder", "group_id": group_id,
+                                  "message_id": result["message_id"]},
+                        )
+                except Exception as e:
+                    print(f"[push] group reminder notify failed for uid={muid}: {e}")
 
     return {"success": True, "message": "Content captured successfully", "data": result}
 

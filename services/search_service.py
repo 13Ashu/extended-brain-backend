@@ -216,6 +216,7 @@ class SearchService:
             print(f"[search] list_fetch hit → {_time.monotonic()-_t0:.2f}s total")
             return list_result
 
+
         # ── 2a. FAST PATH — skip all LLM, pure embedding + keyword ──────
         if fast:
             from services.embedding_service import embedding_service
@@ -754,6 +755,30 @@ Return ONLY this JSON:
                 )
 
         kw_conds  = []
+        # Raw query words always searched first — zero LLM dependency, instant match
+        raw_query_words = [w for w in query.lower().split() if len(w) > 2]
+        for i, w in enumerate(raw_query_words):
+            pattern = f"%{w}%"
+            kw_conds.append(func.lower(Message.content).contains(w))
+            kw_conds.append(func.lower(Message.summary).contains(w))
+            # Search list item text (tags.subtasks[].task) — "handcream" finds its list
+            kw_conds.append(
+                text(
+                    "EXISTS (SELECT 1 FROM jsonb_array_elements(messages.tags->'subtasks') sub"
+                    f" WHERE lower(sub->>'task') LIKE :rw_sub_{i})"
+                ).bindparams(**{f"rw_sub_{i}": pattern})
+            )
+            # Search original multi-task dump text (tags.split_from)
+            kw_conds.append(
+                text(f"lower(messages.tags->>'split_from') LIKE :rw_sf_{i}")
+                .bindparams(**{f"rw_sf_{i}": pattern})
+            )
+            # Search original single-task dump text (tags.original_dump)
+            kw_conds.append(
+                text(f"lower(messages.tags->>'original_dump') LIKE :rw_od_{i}")
+                .bindparams(**{f"rw_od_{i}": pattern})
+            )
+        # Then LLM-expanded terms (may overlap, OR logic handles dedup)
         all_terms = (
             expansion.get("keywords", [])[:8]
             + expansion.get("core_concepts", [])[:4]
@@ -857,8 +882,30 @@ Return ONLY this JSON:
         tags    = message.tags if isinstance(message.tags, dict) else {}
         q_lower = query.lower()
 
-        score += getattr(message, "_semantic_score", 0.0) * 20.0
-        if q_lower in content:  score += 12.0
+        # Semantic is secondary — keyword matches always rank first
+        score += getattr(message, "_semantic_score", 0.0) * 15.0
+
+        # Tier 1: exact full query in content/summary
+        if q_lower in content:  score += 60.0
+        elif q_lower in summary: score += 40.0
+
+        # Tier 2: raw query word matches (before LLM expansion)
+        raw_words = [w for w in q_lower.split() if len(w) > 2]
+        tags_str         = str(tags).lower()
+        subtasks_str     = " ".join(
+            s.get("task", "").lower() for s in tags.get("subtasks", []) if isinstance(s, dict)
+        )
+        split_from_str   = str(tags.get("split_from", "")).lower()
+        original_dump    = str(tags.get("original_dump", "")).lower()
+        for w in raw_words:
+            if w in content: score += 12.0
+            if w in summary: score += 8.0
+            # List item match — finding the list by its contents
+            if subtasks_str and w in subtasks_str: score += 10.0
+            # Multi-task original context match
+            if split_from_str and w in split_from_str: score += 8.0
+            # Single-task original dump match
+            if original_dump and w in original_dump: score += 8.0
 
         for c in expansion.get("core_concepts", []):
             if c.lower() in content: score += 6.0
@@ -1020,13 +1067,14 @@ Reply:"""
 
         # Build keyword conditions across content, summary, and extracted_text tag
         kw_conditions = []
-        for term in terms[:6]:
+        for idx, term in enumerate(terms[:6]):
+            pat = f"%{term}%"
             kw_conditions.extend([
                 func.lower(Message.content).contains(term),
                 func.lower(Message.summary).contains(term),
-                text(f"lower(messages.tags->>'extracted_text') LIKE '%{term}%'"),
-                text(f"lower(messages.tags->>'caption') LIKE '%{term}%'"),
-                text(f"lower(messages.tags->>'image_title') LIKE '%{term}%'"),
+                text(f"lower(messages.tags->>'extracted_text') LIKE :img_et_{idx}").bindparams(**{f"img_et_{idx}": pat}),
+                text(f"lower(messages.tags->>'caption') LIKE :img_cap_{idx}").bindparams(**{f"img_cap_{idx}": pat}),
+                text(f"lower(messages.tags->>'image_title') LIKE :img_title_{idx}").bindparams(**{f"img_title_{idx}": pat}),
             ])
 
         result = await db.execute(

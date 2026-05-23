@@ -341,18 +341,40 @@ class GroupService:
     # ── @mention parsing ──────────────────────────────────────────────
 
     def parse_mention(self, content: str, members: List[Dict]) -> tuple[Optional[int], str]:
-        """
-        Detect @name prefix and return (assigned_user_id, original_content).
-        @mention is preserved in content so group members can see who was tagged.
-        """
+        """Single @mention at message start — kept for backward compatibility."""
         m = re.match(r"^@(\w+)[:\s]+(.+)$", content, re.DOTALL | re.IGNORECASE)
         if not m:
             return None, content
         mention_name = m.group(1).lower()
         for member in members:
             if member["name"].split()[0].lower() == mention_name:
-                return member["id"], content   # keep @name in the stored text
+                return member["id"], content
         return None, content
+
+    def parse_all_mentions(self, content: str, members: List[Dict]) -> List[Dict]:
+        """
+        Find ALL @name occurrences in the message body.
+        Returns a list of {user_id, name, phone, done, done_at} dicts — one per matched member.
+        Unrecognised @handles are ignored.
+        """
+        found_handles = re.findall(r"@(\w+)", content, re.IGNORECASE)
+        seen_ids: set[int] = set()
+        assignments: List[Dict] = []
+        for handle in found_handles:
+            handle_lower = handle.lower()
+            for member in members:
+                first_name = member["name"].split()[0].lower()
+                if first_name == handle_lower and member["id"] not in seen_ids:
+                    seen_ids.add(member["id"])
+                    assignments.append({
+                        "user_id":  member["id"],
+                        "name":     member["name"],
+                        "phone":    member.get("phone", ""),
+                        "done":     False,
+                        "done_at":  None,
+                    })
+                    break
+        return assignments
 
     # ── Bot response helpers ──────────────────────────────────────────
 

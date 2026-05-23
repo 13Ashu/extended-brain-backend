@@ -253,6 +253,16 @@ class MessageProcessor:
 
         ref = _ist_now()
 
+        # ── FAST PATH: Regex list detection — no LLM, no latency ──
+        # Runs before the LLM so explicit "Name:\n- items" formats
+        # are never misclassified as To-Do tasks by smaller models.
+        regex_list = self.list_service._regex_detect(content)
+        if regex_list and regex_list.get("intent") == "create_or_add" and regex_list.get("items"):
+            print(f"[processor] regex_list hit: {regex_list['list_name']!r} ({len(regex_list['items'])} items)")
+            return await self._handle_list_save_direct(
+                user, regex_list["list_name"], regex_list["list_type"], regex_list["items"], db
+            )
+
         # ── Single LLM call: multi-action intent parse ────────────
         from services.intent_service import get_intent_service
         intent_svc = get_intent_service(self.cerebras)
@@ -531,6 +541,8 @@ class MessageProcessor:
                 [{"date": due_date, "time": evt_time, "label": task_text[:40]}]
                 if evt_time else []
             ),
+            # Preserve original dump text so retrieval works even if task was paraphrased
+            "original_dump":  content[:300] if content != task_text else "",
         }
 
         msg = Message(

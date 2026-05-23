@@ -148,8 +148,8 @@ class IntentService:
 
     def __init__(self, cerebras_client: CerebrasClient):
         self.cerebras = cerebras_client
-        # Fast model for intent — llama3.1-8b is ~10x faster than qwen-3-235b
-        self.fast = CerebrasClient(model="llama3.1-8b")
+        # qwen-3-235b for intent — accuracy on list/todo/event classification is critical
+        self.fast = CerebrasClient(model="qwen-3-235b-a22b-instruct-2507")
 
     async def parse(
         self,
