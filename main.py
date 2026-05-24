@@ -1657,6 +1657,7 @@ async def process_webhook_message(webhook_data: Dict):
                                 list_intent["list_type"],
                                 list_intent["items"],
                                 db,
+                                group_id=active_gid,
                             )
                             action    = "Created" if was_created else "Updated"
                             list_name = list_intent["list_name"]
@@ -2726,6 +2727,7 @@ async def capture_message(
         user_phone=current_user.phone_number, content=content,
         message_type=message.message_type, media_url=message.media_url, db=db,
         skip_query=True,
+        group_id=group_id,
     )
 
     # ── Tag message with group_id / assignments ───────────────────────

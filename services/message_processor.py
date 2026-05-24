@@ -246,6 +246,7 @@ class MessageProcessor:
         db: AsyncSession,
         media_url: Optional[str] = None,
         skip_query: bool = False,
+        group_id: Optional[int] = None,
     ) -> Dict:
         user = await self._get_user(user_phone, db)
         if not user:
@@ -260,7 +261,8 @@ class MessageProcessor:
         if regex_list and regex_list.get("intent") == "create_or_add" and regex_list.get("items"):
             print(f"[processor] regex_list hit: {regex_list['list_name']!r} ({len(regex_list['items'])} items)")
             return await self._handle_list_save_direct(
-                user, regex_list["list_name"], regex_list["list_type"], regex_list["items"], db
+                user, regex_list["list_name"], regex_list["list_type"], regex_list["items"], db,
+                group_id=group_id,
             )
 
         # ── Single LLM call: multi-action intent parse ────────────
@@ -278,7 +280,8 @@ class MessageProcessor:
         if actions.get("save_as_list") and parsed.get("list"):
             lst = parsed["list"]
             return await self._handle_list_save_direct(
-                user, lst["list_name"], lst["list_type"], lst["items"], db
+                user, lst["list_name"], lst["list_type"], lst["items"], db,
+                group_id=group_id,
             )
 
         # ── Query — user wants to retrieve something ──────────────
@@ -346,6 +349,7 @@ class MessageProcessor:
                         list_result["list_type"],
                         list_result["items"],
                         db,
+                        group_id=group_id,
                     )
                 elif list_result["intent"] == "show":
                     return {
@@ -368,10 +372,11 @@ class MessageProcessor:
     # ──────────────────────────────────────────────────────────────
 
     async def _handle_list_save_direct(
-        self, user, list_name: str, list_type: str, items: List[str], db: AsyncSession
+        self, user, list_name: str, list_type: str, items: List[str], db: AsyncSession,
+        group_id: Optional[int] = None,
     ) -> Dict:
         msg, added, was_created = await self.list_service.create_or_add(
-            user.id, list_name, list_type, items, db
+            user.id, list_name, list_type, items, db, group_id=group_id
         )
         tags  = msg.tags if isinstance(msg.tags, dict) else {}
         total = len(tags.get("subtasks", []))
