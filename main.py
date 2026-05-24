@@ -3464,6 +3464,38 @@ async def invite_group_member_by_phone(
     return {"success": True, "added": True, "name": target_user.name}
 
 
+@app.delete("/api/groups/{group_id}/members/{user_id}")
+async def remove_group_member(
+    group_id: int,
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove a member from a group. Only the group admin can do this. Admin cannot remove themselves."""
+    admin = await db.scalar(
+        select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == current_user.id,
+            GroupMember.role == "admin",
+        )
+    )
+    if not admin:
+        raise HTTPException(status_code=403, detail="Only the group admin can remove members")
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Admin cannot remove themselves. Delete the group instead.")
+    row = await db.scalar(
+        select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == user_id,
+        )
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Member not found in this group")
+    await db.delete(row)
+    await db.commit()
+    return {"success": True}
+
+
 @app.delete("/api/groups/{group_id}/leave")
 async def leave_group(
     group_id: int,
