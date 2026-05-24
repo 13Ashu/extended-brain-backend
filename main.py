@@ -201,6 +201,15 @@ class ForgotPasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=6)
 
 
+class FirebaseVerifyPhoneRequest(BaseModel):
+    id_token: str = Field(..., min_length=1)
+
+
+class FirebaseResetPasswordRequest(BaseModel):
+    id_token:     str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=6)
+
+
 class TelegramLinkRequest(BaseModel):
     phone_number:     str
     telegram_chat_id: str
@@ -272,6 +281,57 @@ async def send_otp(request: OTPSendRequest, db: AsyncSession = Depends(get_db)):
 async def verify_otp(request: OTPVerifyRequest, db: AsyncSession = Depends(get_db)):
     result = await auth_service.verify_otp(request.phone_number, request.otp, db)
     if not result["verified"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@app.post("/api/auth/firebase-verify-phone")
+async def firebase_verify_phone(request: FirebaseVerifyPhoneRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Verify a Firebase phone auth ID token (issued by the iOS app after SMS verification).
+    Stores a verified OTPVerification record so the subsequent /api/users/register call
+    sees the phone as confirmed (when ENABLE_OTP=true).
+    """
+    from services.firebase_service import verify_phone_token
+    from database import OTPVerification
+    try:
+        phone_number = verify_phone_token(request.id_token)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Remove any existing OTP records for this phone and insert a pre-verified one.
+    existing = await db.execute(select(OTPVerification).where(OTPVerification.phone_number == phone_number))
+    for row in existing.scalars():
+        await db.delete(row)
+
+    otp_record = OTPVerification(
+        phone_number=phone_number,
+        otp_code="firebase",
+        is_verified=True,
+        expires_at=datetime.utcnow() + timedelta(minutes=10),
+    )
+    db.add(otp_record)
+    await db.commit()
+
+    return {"success": True, "verified": True, "phone_number": phone_number}
+
+
+@app.post("/api/auth/firebase-reset-password")
+async def firebase_reset_password(request: FirebaseResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Verify Firebase phone token then reset the password for that phone number atomically.
+    Replaces the unauthenticated /api/auth/forgot-password flow with a Firebase-gated one.
+    """
+    from services.firebase_service import verify_phone_token
+    try:
+        phone_number = verify_phone_token(request.id_token)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    result = await auth_service.reset_password(
+        phone_number=phone_number, new_password=request.new_password, db=db
+    )
+    if not result["success"]:
         raise HTTPException(status_code=400, detail=result["message"])
     return result
 

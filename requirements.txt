@@ -37,4 +37,7 @@ pytz
 # Embeddings (Gemini API via httpx — no local model needed)
 pgvector
 
+# Firebase Admin (phone auth token verification)
+firebase-admin
+
 

@@ -23,6 +23,7 @@ class Config:
     MESSAGING_PLATFORM = os.getenv("MESSAGING_PLATFORM", "telegram").lower()
 
     ENABLE_OTP = os.getenv("ENABLE_OTP", "false").lower() == "true"
+    FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS")  # JSON string of service account key
     
     # WhatsApp Configuration
     WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
