@@ -458,13 +458,14 @@ async def reset_personal_data(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete all personal messages and reminders. Preserves account, pro status, groups."""
+    # Reminders first — they hold a FK to messages.id
+    await db.execute(
+        sql_delete(Reminder).where(Reminder.user_id == current_user.id)
+    )
     await db.execute(
         sql_delete(Message).where(
             and_(Message.user_id == current_user.id, Message.group_id.is_(None))
         )
-    )
-    await db.execute(
-        sql_delete(Reminder).where(Reminder.user_id == current_user.id)
     )
     await db.commit()
     return {"success": True, "message": "Personal data cleared."}
