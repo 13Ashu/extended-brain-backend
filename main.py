@@ -452,6 +452,24 @@ async def register_device_token(
     return {"success": True}
 
 
+@app.delete("/api/users/me/data")
+async def reset_personal_data(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete all personal messages and reminders. Preserves account, pro status, groups."""
+    await db.execute(
+        sql_delete(Message).where(
+            and_(Message.user_id == current_user.id, Message.group_id.is_(None))
+        )
+    )
+    await db.execute(
+        sql_delete(Reminder).where(Reminder.user_id == current_user.id)
+    )
+    await db.commit()
+    return {"success": True, "message": "Personal data cleared."}
+
+
 @app.post("/api/users/register")
 async def register_user(user_data: UserRegistrationRequest, db: AsyncSession = Depends(get_db)):
     result = await auth_service.register_user(
