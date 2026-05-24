@@ -202,13 +202,18 @@ class IntentService:
     ) -> Dict:
 
         header = (
-            f"You are parsing a message from {user_name} for their personal knowledge base.\n\n"
+            f"You are parsing a message from {user_name} for their personal second brain — an app where people dump fragments of thought so they can find them later.\n\n"
             f"NOW: {now_str}\n"
             f"TODAY: {today}\n"
             f"TOMORROW: {tomorrow}\n"
             f"NEXT 7 DAYS: {day_map}\n\n"
             f"MESSAGE:\n\"\"\"\n{content}\n\"\"\"\n\n"
             "TASK: Determine ALL save actions this message should trigger.\n\n"
+            "BEFORE CLASSIFYING — ask one question: what does the user want to do with this later?\n"
+            "  → Look it up / recall it        = save_as_note\n"
+            "  → Act on it / check it off      = save_as_todo\n"
+            "  → Track it over time            = save_as_track\n"
+            "Users often dump bare words, document names, or facts with zero elaboration. That is deliberate — they are filing a reference, not creating a task. Default to save_as_note for anything that lacks a clear action signal.\n\n"
         )
 
         if check_query:
@@ -245,14 +250,15 @@ class IntentService:
         else:
             # Save-only mode: no is_query, shorter prompt, faster
             action_flags = (
-                "ACTION FLAGS (this message will always be saved — classify HOW to save it):\n"
-                "  save_as_todo  — contains one or more tasks/things to do\n"
+                "ACTION FLAGS (classify by what the user intends to do with this later):\n"
+                "  save_as_todo  — user intends to PERFORM an action (something to check off)\n"
                 "  save_as_event — scheduled appointment/meeting with a specific time\n"
-                "  save_as_note  — a fact/info to remember (credential, location, info)\n"
+                "  save_as_note  — user intends to RECALL information (something to look up)\n"
                 "  save_as_idea  — creative thought/insight/concept\n"
                 "  save_as_track — logs health/habit data (weight, steps, mood, sleep)\n"
                 "  save_as_list  — named list (shopping, bag, packing) with items\n"
-                "  set_reminder  — has a specific time → create a reminder\n\n"
+                "  set_reminder  — has a specific time → create a reminder\n"
+                "Bare nouns, document names, and facts with no action signal → save_as_note.\n\n"
             )
             json_schema = (
                 "Return ONLY this JSON (no markdown):\n"
@@ -272,6 +278,13 @@ class IntentService:
 
         rules = (
             "KEY RULES:\n"
+            "  TODO vs NOTE — the only question that matters is intent:\n"
+            "    save_as_todo  = user intends to PERFORM an action (there is something to check off)\n"
+            "    save_as_note  = user intends to RECALL information (there is something to look up)\n"
+            "  A bare noun, document name, place, person detail, or fact → save_as_note.\n"
+            "  Require a genuine action signal for save_as_todo: an explicit or strongly implied verb\n"
+            "  ('call', 'buy', 'submit', 'book', 'pay', 'fix', 'check', 'need to', 'have to') OR\n"
+            "  time pressure ('by Friday', 'urgent', 'before 5pm'). Without one → save_as_note.\n\n"
             "  - A reminder IS ALWAYS also a todo → save_as_todo AND set_reminder = true\n"
             "  - An event with time IS ALWAYS also a todo → save_as_event AND save_as_todo = true\n"
             "  - set_reminder = true ONLY when a specific time is mentioned\n"
@@ -294,8 +307,14 @@ class IntentService:
             f'M: "dentist appointment Friday 3pm" → save_as_todo=true, save_as_event=true, set_reminder=true\n'
             f'  tasks:[{{"task":"dentist","due_date":"{day_map.get("friday", tomorrow)}","time":"15:00","priority":"normal"}}]\n\n'
 
-            f'M: "See the study table" → save_as_todo=true\n'
-            f'  tasks:[{{"task":"See the study table","due_date":"{today}","time":null,"priority":"normal"}}]\n\n'
+            f'M: "marriage certificate" → save_as_note=true (user is filing a reference, not creating a task)\n'
+            f'  note:{{"content":"marriage certificate","keywords":["marriage","certificate","document"]}}\n\n'
+
+            f'M: "passport" → save_as_note=true\n'
+            f'  note:{{"content":"passport","keywords":["passport","document"]}}\n\n'
+
+            f'M: "submit passport application" → save_as_todo=true (explicit action verb)\n'
+            f'  tasks:[{{"task":"submit passport application","due_date":"{today}","time":null,"priority":"normal"}}]\n\n'
 
             f'M: "Todo for today:\\n- Check apple dev\\n- Pack for trip" → save_as_todo=true (NOT save_as_list)\n'
             f'  tasks:[{{"task":"Check apple dev","due_date":"{today}","time":null,"priority":"normal"}},{{"task":"Pack for trip","due_date":"{today}","time":null,"priority":"normal"}}]\n\n'
