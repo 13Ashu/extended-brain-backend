@@ -2330,7 +2330,7 @@ async def complete_assignment(
 
     await db.execute(
         text(
-            "UPDATE messages SET tags = tags || :extra WHERE id = :mid"
+            "UPDATE messages SET tags = tags || :extra::jsonb WHERE id = :mid"
         ).bindparams(
             extra=_json.dumps({"assignments": assignments}),
             mid=message_id,
@@ -2748,7 +2748,7 @@ async def capture_message(
         await db.execute(
             text(
                 "UPDATE messages SET group_id = :gid, assigned_to_user_id = :auid,"
-                " tags = tags || :extra WHERE id = :mid"
+                " tags = tags || :extra::jsonb WHERE id = :mid"
             ).bindparams(
                 gid=group_id,
                 auid=primary_uid,
