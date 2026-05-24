@@ -109,6 +109,8 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:8080",
         "https://your-digital-mind.vercel.app",
+        "https://extendedmindsai.com",
+        "https://www.extendedmindsai.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
