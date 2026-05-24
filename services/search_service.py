@@ -850,6 +850,16 @@ Return ONLY this JSON:
             score = self._score(message, category, query, expansion, use_due_filter)
             tags  = message.tags if isinstance(message.tags, dict) else {}
 
+            # For list messages, always surface items as a top-level field so the
+            # iOS itemsDirect field is populated regardless of which search path was hit.
+            list_items = None
+            if "List" in tags.get("all_buckets", []):
+                subtasks   = tags.get("subtasks", [])
+                list_items = [
+                    {"task": s["task"], "done": s.get("done", False)}
+                    for s in subtasks if isinstance(s, dict) and "task" in s
+                ]
+
             scored.append({
                 "id":           message.id,
                 "content":      message.content,
@@ -867,6 +877,7 @@ Return ONLY this JSON:
                 "relevance":    score,
                 "preview":      self._preview(message.content, expansion.get("keywords", [])),
                 "_saved_date":  message.created_at.strftime("%Y-%m-%d"),
+                **({"items": list_items} if list_items is not None else {}),
             })
 
         scored.sort(key=lambda x: (x["relevance"], x["priority"] == "high"), reverse=True)
