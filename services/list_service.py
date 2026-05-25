@@ -573,6 +573,7 @@ class ListService:
         items: List[str],
         db: AsyncSession,
         group_id: Optional[int] = None,
+        due_date: Optional[str] = None,
     ) -> Tuple[Message, int, bool]:
         """
         Create if not exists, add items if exists.
@@ -582,7 +583,8 @@ class ListService:
         msg = await self.find_best_matching_list(user_id, list_name, db, group_id=group_id)
 
         if not msg:
-            msg = await self._create_list(user_id, list_name, list_type, items, db, group_id=group_id)
+            msg = await self._create_list(user_id, list_name, list_type, items, db,
+                                          group_id=group_id, due_date=due_date)
             return msg, len(items), True
 
         # Add to existing
@@ -600,6 +602,9 @@ class ListService:
 
         tags["subtasks"]   = existing
         tags["item_count"] = len(existing)
+        # Update due_date only if a new one is supplied and none exists yet
+        if due_date and not tags.get("due_date"):
+            tags["due_date"] = due_date
 
         await db.execute(
             update(Message).where(Message.id == msg.id).values(tags=tags)
@@ -617,6 +622,7 @@ class ListService:
         self, user_id: int, list_name: str, list_type: str,
         items: List[str], db: AsyncSession,
         group_id: Optional[int] = None,
+        due_date: Optional[str] = None,
     ) -> Message:
         cat = await db.scalar(
             select(Category).where(
@@ -631,6 +637,18 @@ class ListService:
         now      = datetime.utcnow()
         subtasks = [{"task": item, "done": False, "added_at": now.isoformat()} for item in items]
 
+        tags: dict = {
+            "list_type":      list_type,
+            "list_name":      list_name,
+            "subtasks":       subtasks,
+            "all_buckets":    ["List"],
+            "primary_bucket": "List",
+            "is_active":      True,
+            "item_count":     len(items),
+        }
+        if due_date:
+            tags["due_date"] = due_date
+
         msg = Message(
             user_id=user_id,
             group_id=group_id,
@@ -638,15 +656,7 @@ class ListService:
             content=list_name,
             message_type=MT("text"),
             summary=f"{list_name} — {len(items)} items",
-            tags={
-                "list_type":      list_type,
-                "list_name":      list_name,
-                "subtasks":       subtasks,
-                "all_buckets":    ["List"],
-                "primary_bucket": "List",
-                "is_active":      True,
-                "item_count":     len(items),
-            },
+            tags=tags,
             created_at=now,
         )
         db.add(msg)

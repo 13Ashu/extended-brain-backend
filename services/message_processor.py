@@ -15,6 +15,12 @@ import re
 from datetime import datetime, timedelta
 import pytz
 
+# Date indicator words — if present, skip regex fast path so LLM can extract due_date for lists
+_LIST_DATE_RE = re.compile(
+    r'\b(today|tomorrow|tonight|this week|next week|monday|tuesday|wednesday|thursday|friday|saturday|sunday|by \w+|in \d+ days?)\b',
+    re.IGNORECASE,
+)
+
 _IST = pytz.timezone("Asia/Kolkata")
 from typing import Dict, List, Optional, Tuple
 
@@ -257,13 +263,15 @@ class MessageProcessor:
         # ── FAST PATH: Regex list detection — no LLM, no latency ──
         # Runs before the LLM so explicit "Name:\n- items" formats
         # are never misclassified as To-Do tasks by smaller models.
+        # Skip fast path when content has date words so the LLM can extract due_date.
         regex_list = self.list_service._regex_detect(content)
         if regex_list and regex_list.get("intent") == "create_or_add" and regex_list.get("items"):
-            print(f"[processor] regex_list hit: {regex_list['list_name']!r} ({len(regex_list['items'])} items)")
-            return await self._handle_list_save_direct(
-                user, regex_list["list_name"], regex_list["list_type"], regex_list["items"], db,
-                group_id=group_id,
-            )
+            if not _LIST_DATE_RE.search(content):
+                print(f"[processor] regex_list hit: {regex_list['list_name']!r} ({len(regex_list['items'])} items)")
+                return await self._handle_list_save_direct(
+                    user, regex_list["list_name"], regex_list["list_type"], regex_list["items"], db,
+                    group_id=group_id,
+                )
 
         # ── Single LLM call: multi-action intent parse ────────────
         from services.intent_service import get_intent_service
@@ -282,6 +290,7 @@ class MessageProcessor:
             return await self._handle_list_save_direct(
                 user, lst["list_name"], lst["list_type"], lst["items"], db,
                 group_id=group_id,
+                due_date=lst.get("due_date"),
             )
 
         # ── Query — user wants to retrieve something ──────────────
@@ -374,12 +383,14 @@ class MessageProcessor:
     async def _handle_list_save_direct(
         self, user, list_name: str, list_type: str, items: List[str], db: AsyncSession,
         group_id: Optional[int] = None,
+        due_date: Optional[str] = None,
     ) -> Dict:
         msg, added, was_created = await self.list_service.create_or_add(
-            user.id, list_name, list_type, items, db, group_id=group_id
+            user.id, list_name, list_type, items, db, group_id=group_id, due_date=due_date
         )
         tags  = msg.tags if isinstance(msg.tags, dict) else {}
         total = len(tags.get("subtasks", []))
+        stored_due = tags.get("due_date") or due_date
         return {
             "message_id":  msg.id,
             "category":    "List",
@@ -388,10 +399,11 @@ class MessageProcessor:
             "list_name":   list_name,
             "items_added": added,
             "total_items": total,
+            "was_created": was_created,
             "tags":        [],
             "essence":     f"{list_name} — {added} item(s) added ({total} total)",
             "connections": [],
-            "due_date":    None,
+            "due_date":    stored_due,
             "events":      [],
             "priority":    "normal",
         }

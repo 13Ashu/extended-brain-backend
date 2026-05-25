@@ -80,6 +80,7 @@ async def send_apns_notification(
     body: str,
     badge: int = 1,
     data: dict | None = None,
+    category: str | None = None,
 ) -> bool:
     """Send a push notification to one iOS device via APNs HTTP/2."""
     key_id    = os.getenv("APNS_KEY_ID", "")
@@ -101,13 +102,14 @@ async def send_apns_notification(
         "apns-push-type": "alert",
         "apns-priority":  "10",
     }
-    payload: dict = {
-        "aps": {
-            "alert": {"title": title, "body": body},
-            "badge": badge,
-            "sound": "default",
-        }
+    aps: dict = {
+        "alert": {"title": title, "body": body},
+        "badge": badge,
+        "sound": "default",
     }
+    if category:
+        aps["category"] = category
+    payload: dict = {"aps": aps}
     if data:
         payload.update(data)
 
@@ -270,6 +272,9 @@ class ReminderService:
                     device_token=dt.token,
                     title="⏰ Reminder",
                     body=reminder.task,
+                    data={"type": "reminder", "reminder_id": reminder.id,
+                          "message_id": reminder.message_id},
+                    category="REMINDER_ACTION",
                 )
         except Exception as e:
             print(f"[apns] Failed for reminder #{reminder.id}: {e}")

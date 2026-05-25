@@ -2232,7 +2232,12 @@ async def get_assigned_messages(
         select(Message, Category, User)
         .outerjoin(Category, Message.category_id == Category.id)
         .join(User, User.id == Message.user_id)
-        .where(Message.assigned_to_user_id == current_user.id)
+        .where(
+            Message.assigned_to_user_id == current_user.id,
+            # Exclude mirror messages: those are created in the assignee's own feed (user_id == assignee).
+            # The original group message (user_id == assigner) is the authoritative record to show.
+            Message.user_id != current_user.id,
+        )
         .order_by(Message.created_at.desc())
         .limit(100)
     )
@@ -2707,6 +2712,52 @@ async def delete_message(
     return {"success": True}
 
 
+@app.get("/api/reminders")
+async def list_reminders(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return all non-cancelled reminders for the current user (past and upcoming)."""
+    result = await db.execute(
+        select(Reminder)
+        .where(Reminder.user_id == current_user.id, Reminder.is_cancelled == False)
+        .order_by(Reminder.remind_at.desc())
+        .limit(200)
+    )
+    reminders = result.scalars().all()
+    now = datetime.utcnow()
+    items = []
+    for r in reminders:
+        items.append({
+            "id":           r.id,
+            "task":         r.task,
+            "content":      r.content,
+            "remind_at":    r.remind_at.isoformat(),
+            "is_sent":      r.is_sent,
+            "is_past":      r.remind_at < now,
+            "snooze_count": r.snooze_count,
+            "message_id":   r.message_id,
+        })
+    return {"success": True, "reminders": items}
+
+
+@app.patch("/api/reminders/{reminder_id}/snooze")
+async def snooze_reminder(
+    reminder_id: int,
+    minutes: int = 60,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Snooze a reminder by the given number of minutes (default 60)."""
+    reminder = await db.get(Reminder, reminder_id)
+    if not reminder or reminder.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Reminder not found")
+    snoozed = await reminder_service.snooze(reminder_id, minutes, db)
+    if not snoozed:
+        raise HTTPException(status_code=500, detail="Snooze failed")
+    return {"success": True, "remind_at": snoozed.remind_at.isoformat()}
+
+
 @app.post("/api/messages/capture")
 async def capture_message(
     message: MessageCreate,
@@ -2765,9 +2816,11 @@ async def capture_message(
         result["assigned_to_id"] = primary_uid
         result["assignments"]    = assignments
 
-        # ── Bust bootstrap cache ──────────────────────────────────────
+        # ── Bust bootstrap cache for sender + each assignee ──────────
         from services import redis_cache as _rc
         asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(current_user.id, group_id)))
+        for _a in assignments:
+            asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(_a["user_id"], None)))
 
         # ── Broadcast new message to group WebSocket ──────────────────
         asyncio.create_task(ws_manager.broadcast(group_id, {

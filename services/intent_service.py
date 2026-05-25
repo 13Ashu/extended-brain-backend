@@ -57,7 +57,8 @@ Output schema — always returns all action flags:
   "list": {                  # present when save_as_list=true
     "list_name": "Dmart Shopping List",
     "list_type": "shopping|bag|packing|reading|watching|custom",
-    "items": ["item1", "item2"]
+    "items": ["item1", "item2"],
+    "due_date": "YYYY-MM-DD or null"
   },
   "track": {                 # present when save_as_track=true
     "logs": [{"metric": "weight", "value": "74", "unit": "kg"}]
@@ -239,7 +240,7 @@ class IntentService:
                 '  "tasks": [{"task":"...","due_date":"YYYY-MM-DD","time":"HH:MM|null","priority":"normal|high|urgent"}],\n'
                 '  "reminder": {"due_date":"YYYY-MM-DD","time":"HH:MM","priority":"normal"} | null,\n'
                 '  "event": {"title":"...","due_date":"YYYY-MM-DD","time":"HH:MM|null","people":[]} | null,\n'
-                '  "list": {"list_name":"...","list_type":"shopping|bag|packing|reading|watching|custom","items":[]} | null,\n'
+                '  "list": {"list_name":"...","list_type":"shopping|bag|packing|reading|watching|custom","items":[],"due_date":"YYYY-MM-DD|null"} | null,\n'
                 '  "track": {"logs":[{"metric":"...","value":"...","unit":"..."}]} | null,\n'
                 '  "note": {"content":"...","keywords":[]} | null,\n'
                 '  "idea": {"content":"...","keywords":[]} | null,\n'
@@ -268,7 +269,7 @@ class IntentService:
                 '  "tasks": [{"task":"...","due_date":"YYYY-MM-DD","time":"HH:MM|null","priority":"normal|high|urgent"}],\n'
                 '  "reminder": {"due_date":"YYYY-MM-DD","time":"HH:MM","priority":"normal"} | null,\n'
                 '  "event": {"title":"...","due_date":"YYYY-MM-DD","time":"HH:MM|null","people":[]} | null,\n'
-                '  "list": {"list_name":"...","list_type":"shopping|bag|packing|reading|watching|custom","items":[]} | null,\n'
+                '  "list": {"list_name":"...","list_type":"shopping|bag|packing|reading|watching|custom","items":[],"due_date":"YYYY-MM-DD|null"} | null,\n'
                 '  "track": {"logs":[{"metric":"...","value":"...","unit":"..."}]} | null,\n'
                 '  "note": {"content":"...","keywords":[]} | null,\n'
                 '  "idea": {"content":"...","keywords":[]} | null,\n'
@@ -294,8 +295,10 @@ class IntentService:
             "  - Priority: urgent/asap/critical/important → high, else normal\n\n"
             "  NAMED HEADER RULE:\n"
             "  Named header (project/brand/place/person) + bullet items → save_as_list=true\n"
-            "  Neutral header (Todo, Tasks, Today, Tomorrow, This week) + bullet items → save_as_todo=true (NOT list)\n\n"
-            "  NAMED: 'Extended minds changes', 'Japan trip', 'Grocery', 'Dmart', 'Client ABC'\n"
+            "  Named qualifier + 'tasks/todos' + items → save_as_list=true (the qualifier makes it named)\n"
+            "  Neutral header (ONLY generic words: Todo, Tasks, Today, Tomorrow, This week) + bullet items → save_as_todo=true (NOT list)\n"
+            "  When a list has a date (e.g. 'for tomorrow', 'by Friday'), extract it as due_date on the list object.\n\n"
+            "  NAMED: 'Extended minds changes', 'Japan trip', 'Grocery', 'Dmart', 'Client ABC', 'Office tasks', 'Office tasks for tomorrow'\n"
             "  NEUTRAL: 'Todo', 'Tasks', 'Today', 'Todo for today', 'Tomorrow', 'This week'\n\n"
         )
 
@@ -316,11 +319,17 @@ class IntentService:
             f'M: "submit passport application" → save_as_todo=true (explicit action verb)\n'
             f'  tasks:[{{"task":"submit passport application","due_date":"{today}","time":null,"priority":"normal"}}]\n\n'
 
-            f'M: "Todo for today:\\n- Check apple dev\\n- Pack for trip" → save_as_todo=true (NOT save_as_list)\n'
+            f'M: "Todo for today:\\n- Check apple dev\\n- Pack for trip" → save_as_todo=true (NOT save_as_list, purely generic header)\n'
             f'  tasks:[{{"task":"Check apple dev","due_date":"{today}","time":null,"priority":"normal"}},{{"task":"Pack for trip","due_date":"{today}","time":null,"priority":"normal"}}]\n\n'
 
-            f'M: "New todo list for tomorrow:\\n- Work on meraki\\n- Follow up with Aditi" → save_as_todo=true (NOT save_as_list)\n'
+            f'M: "New todo list for tomorrow:\\n- Work on meraki\\n- Follow up with Aditi" → save_as_todo=true (NOT save_as_list, purely generic header)\n'
             f'  tasks:[{{"task":"Work on meraki","due_date":"{tomorrow}","time":null,"priority":"normal"}},{{"task":"Follow up with Aditi","due_date":"{tomorrow}","time":null,"priority":"normal"}}]\n\n'
+
+            f'M: "Office tasks for tomorrow:\\n- Check apple dev\\n- Email Aditi" → save_as_list=true (\'Office\' is a named qualifier)\n'
+            f'  list:{{"list_name":"Office Tasks","list_type":"custom","items":["Check apple dev","Email Aditi"],"due_date":"{tomorrow}"}}\n\n'
+
+            f'M: "Client XYZ todos:\\n- Send proposal\\n- Follow up on call" → save_as_list=true (\'Client XYZ\' is a named qualifier)\n'
+            f'  list:{{"list_name":"Client XYZ Tasks","list_type":"custom","items":["Send proposal","Follow up on call"],"due_date":null}}\n\n'
 
             f'M: "dmart shopping:\\n- milk\\n- eggs" → save_as_list=true\n'
             f'  list:{{"list_name":"Dmart Shopping List","list_type":"shopping","items":["milk","eggs"]}}\n\n'
@@ -419,12 +428,16 @@ class IntentService:
         if isinstance(lst, dict) and result["actions"]["save_as_list"]:
             items = lst.get("items", [])
             if isinstance(items, list) and items:
+                list_due = lst.get("due_date")
+                if list_due and not _DATE_RE.match(str(list_due)):
+                    list_due = None
                 result["list"] = {
                     "list_name": str(lst.get("list_name", "My List")),
                     "list_type": lst.get("list_type", "custom")
                     if lst.get("list_type") in ("shopping","bag","packing","reading","watching","custom")
                     else "custom",
-                    "items": [str(i).strip() for i in items if str(i).strip()],
+                    "items":    [str(i).strip() for i in items if str(i).strip()],
+                    "due_date": list_due,
                 }
 
         # Track
