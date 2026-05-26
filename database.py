@@ -146,7 +146,7 @@ class OTPVerification(Base):
     
     id: Mapped[int] = mapped_column(primary_key=True)
     phone_number: Mapped[str] = mapped_column(String(20), index=True)
-    otp_code: Mapped[str] = mapped_column(String(6))
+    otp_code: Mapped[str] = mapped_column(String(20))
     is_verified: Mapped[bool] = mapped_column(default=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     expires_at: Mapped[datetime] = mapped_column(DateTime)
@@ -365,6 +365,7 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_messages_group_created ON messages(group_id, created_at DESC) WHERE group_id IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_messages_assigned ON messages(assigned_to_user_id) WHERE assigned_to_user_id IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_group_last_seen_lookup ON group_last_seen(user_id, group_id)",
+            "ALTER TABLE otp_verifications ALTER COLUMN otp_code TYPE VARCHAR(20)",
         ]
         for stmt in migrations:
             try:
