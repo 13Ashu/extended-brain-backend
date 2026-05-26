@@ -1,6 +1,5 @@
 """
-Database models using SQLAlchemy with PostgreSQL
-Updated with full user registration fields
+Database models using SQLAlchemy with PostgreSQL (Railway)
 """
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -14,47 +13,30 @@ import enum
 import os
 
 
-# Database URL from environment (Neon PostgreSQL)
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+asyncpg://user:password@localhost/extendedbrain"
-)
-
-# Clean up the URL - remove sslmode and convert to asyncpg
+# Database URL from environment (Railway PostgreSQL)
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
 # Normalize URL for asyncpg
-if DATABASE_URL:
-    # Strip any query params (ssl handled via connect_args instead)
-    if "?" in DATABASE_URL:
-        DATABASE_URL = DATABASE_URL.split("?")[0]
-    
-    # Ensure asyncpg driver prefix
-    if DATABASE_URL.startswith("postgresql://"):
-        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-    elif DATABASE_URL.startswith("postgres://"):   # Neon sometimes emits this form
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+if "?" in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.split("?")[0]
 
-# Create async engine
-import ssl as _ssl
-
-# Build an SSL context asyncpg actually understands
-_ssl_ctx = _ssl.create_default_context()
-_ssl_ctx.check_hostname = False          # Neon's hostname is fine, but this avoids cert issues
-_ssl_ctx.verify_mode   = _ssl.CERT_NONE # Neon uses self-signed intermediates on some regions
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+elif DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     future=True,
     pool_pre_ping=True,
-    pool_size=5,          # Neon free tier has a connection limit — don't go above 10
-    max_overflow=2,
+    pool_size=10,
+    max_overflow=5,
     connect_args={
-        "ssl":     _ssl_ctx,
-        "timeout": 30,    # asyncpg connection timeout in seconds
+        "ssl": False,     # Railway internal networking — no SSL needed
+        "timeout": 30,
         "server_settings": {
             "application_name": "extended_brain",
         },
