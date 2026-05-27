@@ -73,7 +73,7 @@ class User(Base):
     telegram_chat_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, unique=True)
     
     # Contact Information
-    phone_number: Mapped[str] = mapped_column(String(20), unique=True, index=True)
+    phone_number: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     
     # Personal Information
@@ -366,6 +366,7 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_messages_assigned ON messages(assigned_to_user_id) WHERE assigned_to_user_id IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_group_last_seen_lookup ON group_last_seen(user_id, group_id)",
             "ALTER TABLE otp_verifications ALTER COLUMN otp_code TYPE VARCHAR(20)",
+            "ALTER TABLE users ALTER COLUMN phone_number TYPE VARCHAR(50)",
         ]
         for stmt in migrations:
             try:
