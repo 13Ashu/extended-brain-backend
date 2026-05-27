@@ -428,6 +428,7 @@ async def get_me(
             "phone_number": current_user.phone_number,
             "timezone": current_user.timezone,
             "is_pro": current_user.is_pro,
+            "briefing_time": current_user.briefing_time,
         }
     }
 
@@ -450,6 +451,36 @@ async def register_device_token(
         db.add(DeviceToken(user_id=current_user.id, token=token, platform="ios"))
     await db.commit()
     return {"success": True}
+
+
+@app.patch("/api/users/briefing")
+async def update_briefing_settings(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Update morning briefing preferences from iOS.
+    Body: {"enabled": bool, "time": "HH:MM"}
+    Setting enabled=false stores null briefing_time (scheduler skips nulls).
+    """
+    enabled = body.get("enabled", True)
+    time_str = body.get("time", "08:00")
+
+    if not enabled:
+        new_time = None
+    else:
+        # Validate HH:MM format
+        import re
+        if not re.match(r"^\d{2}:\d{2}$", str(time_str)):
+            raise HTTPException(status_code=400, detail="time must be HH:MM format")
+        new_time = time_str
+
+    await db.execute(
+        update(User).where(User.id == current_user.id).values(briefing_time=new_time)
+    )
+    await db.commit()
+    return {"success": True, "briefing_time": new_time}
 
 
 @app.delete("/api/users/me/data")

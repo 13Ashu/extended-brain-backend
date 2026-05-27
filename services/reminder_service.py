@@ -106,6 +106,7 @@ async def send_apns_notification(
         "alert": {"title": title, "body": body},
         "badge": badge,
         "sound": "default",
+        "interruption-level": "time-sensitive",  # bypasses Focus modes, guaranteed sound+vibration
     }
     if category:
         aps["category"] = category

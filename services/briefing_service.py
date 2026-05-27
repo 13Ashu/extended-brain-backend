@@ -17,7 +17,8 @@ import httpx
 from sqlalchemy import and_, select, update, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import async_session_maker, Message, User, Category
+from database import async_session_maker, Message, User, Category, DeviceToken
+from services.reminder_service import send_apns_notification
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -54,12 +55,11 @@ class BriefingService:
         current_hhmm = now_ist.strftime("%H:%M")
 
         async with async_session_maker() as session:
-            # Find all active users whose briefing_time matches now
+            # Find all active users whose briefing_time matches now (regardless of Telegram)
             users = await session.execute(
                 select(User).where(
                     and_(
                         User.is_active == True,
-                        User.telegram_chat_id.isnot(None),
                         User.briefing_time == current_hhmm,
                     )
                 )
@@ -136,6 +136,46 @@ class BriefingService:
                 {"text": "⏰ Change briefing time", "callback_data": "set_briefing_time"}
             ]]
         }
+
+        # ── APNs delivery (iOS primary surface) ───────────────────
+        try:
+            async with async_session_maker() as apns_db:
+                result = await apns_db.execute(
+                    select(DeviceToken).where(DeviceToken.user_id == user.id)
+                )
+                device_tokens = result.scalars().all()
+
+            task_count = len(todos)
+            event_count = len(events)
+            first_name = user.name.split()[0] if user.name else "there"
+
+            if task_count == 0 and event_count == 0:
+                apns_body = "No tasks due today. Have a great day!"
+            elif task_count > 0 and event_count > 0:
+                apns_body = f"{task_count} task{'s' if task_count != 1 else ''} • {event_count} event{'s' if event_count != 1 else ''} today. Tap to see your plan."
+            elif task_count > 0:
+                apns_body = f"{task_count} task{'s' if task_count != 1 else ''} due today. Tap to see your plan."
+            else:
+                apns_body = f"{event_count} event{'s' if event_count != 1 else ''} on your schedule today."
+
+            if carried:
+                apns_body = f"⏪ {len(carried)} carried over. " + apns_body
+
+            for dt in device_tokens:
+                await send_apns_notification(
+                    device_token=dt.token,
+                    title=f"Good morning, {first_name}! ☀️",
+                    body=apns_body,
+                    badge=task_count,
+                    data={"type": "briefing"},
+                    category="BRIEFING_TAP",
+                )
+        except Exception as e:
+            print(f"[briefing] APNs delivery failed for user {user.id}: {e}")
+
+        # ── Telegram delivery (legacy) ─────────────────────────────
+        if not user.telegram_chat_id:
+            return
 
         await _send_telegram(user.telegram_chat_id, text, reply_markup)
         print(f"[briefing] Sent to {user.name} ({user.telegram_chat_id})")
