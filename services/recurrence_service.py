@@ -21,8 +21,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import String, Boolean, Integer, DateTime, ForeignKey, Text
 
-from database import async_session_maker, Base, User, Message, Category
+from database import async_session_maker, Base, User, Message, Category, DeviceToken
 from cerebras_client import CerebrasClient
+from services.reminder_service import send_apns_notification
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -167,7 +168,6 @@ Examples:
                     and_(
                         Recurrence.is_active == True,
                         Recurrence.next_fire <= now_utc,
-                        User.telegram_chat_id.isnot(None),
                     )
                 )
             )
@@ -234,26 +234,47 @@ Examples:
 
         # Notify user
         rule_str = self._rule_display(rec)
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id":    user.telegram_chat_id,
-                    "text":       (
-                        f"🔁 *Recurring task*\n\n"
-                        f"{rec.template_content}\n\n"
-                        f"_{rule_str}_"
-                    ),
-                    "parse_mode": "Markdown",
-                    "reply_markup": {
-                        "inline_keyboard": [[
-                            {"text": "✅ Done",   "callback_data": f"done:{msg.id}"},
-                            {"text": "⏸ Pause",  "callback_data": f"pause_rec:{rec.id}"},
-                        ]]
-                    }
-                },
-            )
+
+        # ── APNs (iOS primary path) ────────────────────────────────
+        try:
+            async with async_session_maker() as apns_db:
+                token_result = await apns_db.execute(
+                    select(DeviceToken).where(DeviceToken.user_id == user.id)
+                )
+                device_tokens = token_result.scalars().all()
+            for dt in device_tokens:
+                await send_apns_notification(
+                    device_token=dt.token,
+                    title="🔁 Recurring reminder",
+                    body=rec.template_content,
+                    data={"type": "reminder", "reminder_id": rec.id, "message_id": msg.id},
+                    category="REMINDER_ACTION",
+                )
+        except Exception as e:
+            print(f"[recurrence] APNs failed for rec {rec.id}: {e}")
+
+        # ── Telegram (legacy path) ─────────────────────────────────
+        if user.telegram_chat_id:
+            token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={
+                        "chat_id":    user.telegram_chat_id,
+                        "text":       (
+                            f"🔁 *Recurring task*\n\n"
+                            f"{rec.template_content}\n\n"
+                            f"_{rule_str}_"
+                        ),
+                        "parse_mode": "Markdown",
+                        "reply_markup": {
+                            "inline_keyboard": [[
+                                {"text": "✅ Done",   "callback_data": f"done:{msg.id}"},
+                                {"text": "⏸ Pause",  "callback_data": f"pause_rec:{rec.id}"},
+                            ]]
+                        }
+                    },
+                )
 
         print(f"[recurrence] Fired rec {rec.id} for user {user.id}")
 

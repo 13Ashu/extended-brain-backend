@@ -212,6 +212,11 @@ class FirebaseResetPasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=6)
 
 
+class AppleSignInRequest(BaseModel):
+    id_token:  str = Field(..., min_length=1)
+    full_name: Optional[str] = None
+
+
 class TelegramLinkRequest(BaseModel):
     phone_number:     str
     telegram_chat_id: str
@@ -316,6 +321,45 @@ async def firebase_verify_phone(request: FirebaseVerifyPhoneRequest, db: AsyncSe
     await db.commit()
 
     return {"success": True, "verified": True, "phone_number": phone_number}
+
+
+@app.post("/api/auth/apple")
+async def apple_sign_in(request: AppleSignInRequest, db: AsyncSession = Depends(get_db)):
+    """Sign in or register via Apple ID (Firebase-verified)."""
+    from services.firebase_service import verify_apple_token
+    try:
+        uid, email, firebase_name = verify_apple_token(request.id_token)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Apple users are stored with a synthetic phone placeholder so the unique
+    # constraint is preserved without requiring a real phone number.
+    phone_placeholder = f"apple|{uid}"
+    display_name = request.full_name or firebase_name or (email.split("@")[0] if email else "Apple User")
+
+    user = await db.scalar(select(User).where(User.phone_number == phone_placeholder))
+    if not user and email:
+        # Check if an existing account already has this email (e.g., registered via phone first)
+        user = await db.scalar(select(User).where(User.email == email))
+        if user and not user.phone_number.startswith("apple|"):
+            # Link Apple UID to the existing phone-registered account — don't create a duplicate
+            pass
+
+    if not user:
+        user = User(
+            phone_number=phone_placeholder,
+            email=email or f"{uid}@apple.extendedminds",
+            name=display_name,
+            password_hash="apple_oauth_no_password",
+        )
+        db.add(user)
+        await db.flush()
+
+    user.last_login = datetime.utcnow()
+    await db.commit()
+
+    token = auth_service.create_access_token(user.id)
+    return {"success": True, "token": token, "user_id": user.id}
 
 
 @app.post("/api/auth/firebase-reset-password")
@@ -2936,6 +2980,24 @@ async def capture_message(
                 except Exception as e:
                     print(f"[push] group reminder notify failed for uid={muid}: {e}")
 
+    # ── Recurring task detection (personal captures only) ────────────
+    # Group context uses @mention/assignment flow instead.
+    if not group_id and recurrence_service.is_recurring(content):
+        try:
+            parsed = await recurrence_service.parse_recurrence(content)
+            if parsed:
+                rec = await recurrence_service.create(current_user.id, parsed, content, db)
+                if rec:
+                    rule_str = recurrence_service._rule_display(rec)
+                    result["recurring"]        = True
+                    result["recurrence_rule"]  = rule_str
+                    result["recurrence_id"]    = rec.id
+                    # Append rule to essence so the iOS capture bubble shows it
+                    if result.get("essence"):
+                        result["essence"] = f"{result['essence']} · {rule_str}"
+        except Exception as e:
+            print(f"[capture] Recurrence detection failed: {e}")
+
     return {"success": True, "message": "Content captured successfully", "data": result}
 
 
@@ -3024,6 +3086,34 @@ async def mark_message_done(
     from sqlalchemy import update as sa_update
     done_val = body.done if body is not None else True
     jsonb_expr = f"jsonb_set(COALESCE(tags, '{{}}'), '{{done}}', '{str(done_val).lower()}'::jsonb)"
+    result = await db.execute(
+        sa_update(Message)
+        .where(and_(Message.id == message_id, Message.user_id == current_user.id))
+        .values(tags=text(jsonb_expr))
+    )
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return {"success": True}
+
+
+@app.patch("/api/messages/{message_id}/bucket")
+async def update_message_bucket(
+    message_id: int,
+    body: dict,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import update as sa_update
+    VALID_BUCKETS = {"Remember", "To-Do", "Ideas", "Track", "Events", "List", "Random"}
+    bucket = body.get("bucket", "")
+    if bucket not in VALID_BUCKETS:
+        raise HTTPException(status_code=400, detail=f"Invalid bucket. Must be one of: {', '.join(sorted(VALID_BUCKETS))}")
+    # Update primary_bucket and all_buckets in tags JSONB
+    jsonb_expr = (
+        f"jsonb_set(jsonb_set(COALESCE(tags, '{{}}'), '{{primary_bucket}}', '\"{bucket}\"'::jsonb), "
+        f"'{{all_buckets}}', '[\"{bucket}\"]'::jsonb)"
+    )
     result = await db.execute(
         sa_update(Message)
         .where(and_(Message.id == message_id, Message.user_id == current_user.id))
