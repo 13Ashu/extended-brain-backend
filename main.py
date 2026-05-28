@@ -3216,6 +3216,24 @@ async def complete_list_item(
     return {"success": True}
 
 
+@app.post("/api/messages/{message_id}/items")
+async def add_list_item(
+    message_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    body = await request.json()
+    task = (body.get("task") or "").strip()
+    if not task:
+        raise HTTPException(status_code=422, detail="task is required")
+    from services.list_service import ListService
+    ls    = ListService(cerebras_client)
+    index = await ls.add_item(message_id, task)
+    if index is None:
+        raise HTTPException(status_code=404, detail="List not found")
+    return {"success": True, "item_index": index}
+
+
 @app.post("/api/categories/manage")
 async def manage_categories(
     operation: CategoryOperation,

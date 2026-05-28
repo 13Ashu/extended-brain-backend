@@ -687,6 +687,23 @@ class ListService:
             await session.commit()
         return True
 
+    async def add_item(self, message_id: int, task: str) -> Optional[int]:
+        """Append a new item to the list. Returns the new item's index, or None on failure."""
+        async with async_session_maker() as session:
+            msg = await session.scalar(select(Message).where(Message.id == message_id))
+            if not msg:
+                return None
+            tags     = dict(msg.tags or {})
+            subtasks = list(tags.get("subtasks", []))
+            subtasks.append({"task": task, "done": False, "added_at": datetime.utcnow().isoformat()})
+            tags["subtasks"]   = subtasks
+            tags["item_count"] = len(subtasks)
+            await session.execute(
+                update(Message).where(Message.id == message_id).values(tags=tags)
+            )
+            await session.commit()
+        return len(subtasks) - 1
+
     async def clear_done_items(self, message_id: int) -> int:
         async with async_session_maker() as session:
             msg = await session.scalar(select(Message).where(Message.id == message_id))
