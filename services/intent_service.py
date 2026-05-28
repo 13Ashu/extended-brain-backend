@@ -210,6 +210,65 @@ class IntentService:
             print(f"[intent] LLM parse failed: {e}")
             return _default_result()
 
+    # ── Word-form number helpers (shared by fast path) ────────────
+    _WORD_TO_NUM = {
+        "one": "1", "two": "2", "three": "3", "four": "4",
+        "five": "5", "six": "6", "seven": "7", "eight": "8",
+        "nine": "9", "ten": "10", "eleven": "11", "twelve": "12",
+    }
+    # Meal/time-of-day context → PM preference
+    _PM_CONTEXT  = {"lunch", "afternoon", "evening", "dinner", "night", "tonight", "supper"}
+    _AM_CONTEXT  = {"breakfast", "morning", "dawn"}
+
+    @classmethod
+    def _normalize_time_words(cls, text: str) -> str:
+        """Convert spoken number words to digits inside time expressions.
+
+        "at two" → "at 2", "three pm" → "3 pm", "at five thirty" → "at 5:30"
+        """
+        import re
+        t = text
+        half_past = re.search(
+            r'\b(?:at\s+)?half\s+past\s+(' + '|'.join(cls._WORD_TO_NUM) + r')\b', t, re.IGNORECASE
+        )
+        if half_past:
+            word = half_past.group(1).lower()
+            t = t[:half_past.start()] + f"at {cls._WORD_TO_NUM[word]}:30" + t[half_past.end():]
+
+        quarter_to = re.search(
+            r'\b(?:at\s+)?quarter\s+to\s+(' + '|'.join(cls._WORD_TO_NUM) + r')\b', t, re.IGNORECASE
+        )
+        if quarter_to:
+            word  = quarter_to.group(1).lower()
+            h     = int(cls._WORD_TO_NUM[word])
+            prev  = h - 1 if h > 1 else 12
+            t = t[:quarter_to.start()] + f"at {prev}:45" + t[quarter_to.end():]
+
+        for word, digit in cls._WORD_TO_NUM.items():
+            # "at/by/around <word> [thirty]" → "at/by/around <digit>[:30]"
+            t = re.sub(
+                rf'(?<!\w)(?:at|by|around)\s+{word}\s+thirty\b',
+                f'at {digit}:30', t, flags=re.IGNORECASE
+            )
+            t = re.sub(
+                rf'(?<!\w)(?:at|by|around)\s+{word}\b',
+                f'at {digit}', t, flags=re.IGNORECASE
+            )
+            # "<word> am/pm" standalone
+            t = re.sub(rf'\b{word}\s+(am|pm)\b', f'{digit} \\1', t, flags=re.IGNORECASE)
+        return t
+
+    @classmethod
+    def _infer_meridiem(cls, text: str, hour: int) -> bool:
+        """Return True (PM) or False (AM) when no am/pm marker is present."""
+        lc = text.lower()
+        if any(s in lc for s in cls._PM_CONTEXT):
+            return True
+        if any(s in lc for s in cls._AM_CONTEXT):
+            return False
+        # Heuristic: unspecified hours 1–6 are almost always PM in everyday speech
+        return 1 <= hour <= 6
+
     def _build_from_bucket(
         self,
         content: str,
@@ -228,7 +287,7 @@ class IntentService:
 
         result  = _default_result()
         actions = result["actions"]
-        lc      = content.lower()
+        lc      = self._normalize_time_words(content.lower())
 
         # ── Query detection (rule-based, only when check_query=True) ─
         if check_query and "?" in content:
@@ -261,7 +320,7 @@ class IntentService:
         time_str: Optional[str] = None
         date_str: Optional[str] = None
 
-        # Specific time: "10pm", "10:30", "noon"
+        # Specific time with explicit am/pm: "10pm", "10:30 am"
         m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", lc)
         if m:
             h    = int(m.group(1))
@@ -275,6 +334,15 @@ class IntentService:
             time_str = "12:00"
         elif "midnight" in lc:
             time_str = "00:00"
+        else:
+            # "at N" or "at N:MM" without explicit am/pm — infer meridiem from context
+            m_bare = re.search(r"\bat\s+(\d{1,2})(?::(\d{2}))?\b", lc)
+            if m_bare:
+                h    = int(m_bare.group(1))
+                mins = int(m_bare.group(2) or 0)
+                if self._infer_meridiem(lc, h) and h != 12:
+                    h += 12
+                time_str = f"{h:02d}:{mins:02d}"
 
         # Date: "today", "tomorrow", day-of-week
         if "today" in lc or "tonight" in lc:

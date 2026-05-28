@@ -109,6 +109,56 @@ PRIORITY_URGENT_SIGNALS = {
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+_WORD_TO_NUM = {
+    "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8",
+    "nine": "9", "ten": "10", "eleven": "11", "twelve": "12",
+}
+_PM_CONTEXT = {"lunch", "afternoon", "evening", "dinner", "night", "tonight", "supper"}
+_AM_CONTEXT = {"breakfast", "morning", "dawn"}
+
+
+def _normalize_time_words(text: str) -> str:
+    """Convert spoken number words to digits inside time expressions."""
+    t = text
+    half_past = re.search(
+        r'\b(?:at\s+)?half\s+past\s+(' + '|'.join(_WORD_TO_NUM) + r')\b', t, re.IGNORECASE
+    )
+    if half_past:
+        word = half_past.group(1).lower()
+        t = t[:half_past.start()] + f"at {_WORD_TO_NUM[word]}:30" + t[half_past.end():]
+
+    quarter_to = re.search(
+        r'\b(?:at\s+)?quarter\s+to\s+(' + '|'.join(_WORD_TO_NUM) + r')\b', t, re.IGNORECASE
+    )
+    if quarter_to:
+        word = quarter_to.group(1).lower()
+        h    = int(_WORD_TO_NUM[word])
+        prev = h - 1 if h > 1 else 12
+        t = t[:quarter_to.start()] + f"at {prev}:45" + t[quarter_to.end():]
+
+    for word, digit in _WORD_TO_NUM.items():
+        t = re.sub(
+            rf'(?<!\w)(?:at|by|around)\s+{word}\s+thirty\b',
+            f'at {digit}:30', t, flags=re.IGNORECASE
+        )
+        t = re.sub(
+            rf'(?<!\w)(?:at|by|around)\s+{word}\b',
+            f'at {digit}', t, flags=re.IGNORECASE
+        )
+        t = re.sub(rf'\b{word}\s+(am|pm)\b', f'{digit} \\1', t, flags=re.IGNORECASE)
+    return t
+
+
+def _infer_meridiem(text: str, hour: int) -> bool:
+    """Return True (PM) when no am/pm marker is present, based on context."""
+    lc = text.lower()
+    if any(s in lc for s in _PM_CONTEXT):
+        return True
+    if any(s in lc for s in _AM_CONTEXT):
+        return False
+    return 1 <= hour <= 6
+
 
 def _today_str() -> str:
     return datetime.now(_IST).strftime("%Y-%m-%d")
@@ -128,7 +178,7 @@ def _detect_priority(content: str) -> str:
 
 
 def _sniff_buckets_fast(content: str) -> List[str]:
-    lc = content.lower()
+    lc = _normalize_time_words(content.lower())
 
     # Reminder override — explicit reminder request always saves as To-Do + Events if timed
     if any(kw in lc for kw in REMINDER_KEYWORDS):
@@ -186,7 +236,7 @@ def _sniff_buckets_fast(content: str) -> List[str]:
 
 
 def _extract_time_mention(content: str, ref: datetime) -> Tuple[Optional[str], Optional[str]]:
-    lc = content.lower()
+    lc = _normalize_time_words(content.lower())
     date_str: Optional[str] = None
     time_str: Optional[str] = None
 
@@ -214,28 +264,30 @@ def _extract_time_mention(content: str, ref: datetime) -> Tuple[Optional[str], O
         time_str = "12:00"
     elif "midnight" in lc:
         time_str = "00:00"
-    elif re.search(r"\baround\s+(\d{1,2})\s*(pm|am)\b", lc):
-        m2 = re.search(r"\baround\s+(\d{1,2})\s*(pm|am)\b", lc)
-        if m2:
-            h = int(m2.group(1))
-            if m2.group(2) == "pm" and h != 12:
-                h += 12
-            time_str = f"{h:02d}:00"
     else:
-        # Relative time: "in 30 minutes" / "in 2 hours"
-        rel = re.search(r"\bin\s+(\d+)\s*(min|mins|minute|minutes)\b", lc)
-        if rel:
-            target = ref + timedelta(minutes=int(rel.group(1)))
-            time_str = target.strftime("%H:%M")
-            if not date_str:
-                date_str = target.strftime("%Y-%m-%d")
+        # "at N" or "at N:MM" without am/pm — infer meridiem from context
+        m_bare = re.search(r"\bat\s+(\d{1,2})(?::(\d{2}))?\b", lc)
+        if m_bare:
+            h    = int(m_bare.group(1))
+            mins = int(m_bare.group(2) or 0)
+            if _infer_meridiem(lc, h) and h != 12:
+                h += 12
+            time_str = f"{h:02d}:{mins:02d}"
         else:
-            rel = re.search(r"\bin\s+(\d+)\s*(hour|hours)\b", lc)
+            # Relative time: "in 30 minutes" / "in 2 hours"
+            rel = re.search(r"\bin\s+(\d+)\s*(min|mins|minute|minutes)\b", lc)
             if rel:
-                target = ref + timedelta(hours=int(rel.group(1)))
+                target = ref + timedelta(minutes=int(rel.group(1)))
                 time_str = target.strftime("%H:%M")
                 if not date_str:
                     date_str = target.strftime("%Y-%m-%d")
+            else:
+                rel = re.search(r"\bin\s+(\d+)\s*(hour|hours)\b", lc)
+                if rel:
+                    target = ref + timedelta(hours=int(rel.group(1)))
+                    time_str = target.strftime("%H:%M")
+                    if not date_str:
+                        date_str = target.strftime("%Y-%m-%d")
 
     return date_str, time_str
 
@@ -844,7 +896,7 @@ class MessageProcessor:
             f'  "{name}": {desc}' for name, desc in INTENT_BUCKETS.items()
         )
 
-        prompt = f"""You are analyzing a personal note saved by {user.name} ({user.occupation}).
+        prompt = f"""You are analyzing a personal note saved by {user.name}.
 TODAY: {ref_str}
 TOMORROW: {tomorrow}
 RECENT TOPICS: {", ".join(recent_topics[:10])}

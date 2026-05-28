@@ -79,7 +79,7 @@ class User(Base):
     # Personal Information
     name: Mapped[str] = mapped_column(String(100))
     age: Mapped[int] = mapped_column(Integer)
-    occupation: Mapped[str] = mapped_column(String(100))
+    occupation: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, default="")
     
     # Authentication
     password_hash: Mapped[str] = mapped_column(String(255))  # Store hashed password
@@ -395,6 +395,7 @@ async def init_db():
             "ALTER TABLE users ALTER COLUMN phone_number TYPE VARCHAR(50)",
             "CREATE TABLE IF NOT EXISTS label_annotations (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), message_id INTEGER REFERENCES messages(id), text TEXT NOT NULL, label VARCHAR(50) NOT NULL, source VARCHAR(30) DEFAULT 'user_correction', created_at TIMESTAMP DEFAULT NOW())",
             "CREATE INDEX IF NOT EXISTS idx_label_annotations_user ON label_annotations(user_id)",
+            "ALTER TABLE users ALTER COLUMN occupation DROP NOT NULL",
         ]
         for stmt in migrations:
             try:

@@ -258,7 +258,6 @@ class AuthService:
         name: str,
         email: str,
         age: int,
-        occupation: str,
         password: str,
         timezone: str = "UTC",
         db: AsyncSession = None
@@ -295,7 +294,6 @@ class AuthService:
             name=name,
             email=email,
             age=age,
-            occupation=occupation,
             phone_number=phone_number,
             password_hash=password_hash,
             timezone=timezone,

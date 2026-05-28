@@ -183,7 +183,6 @@ class UserRegistrationRequest(BaseModel):
     name:         str      = Field(..., min_length=2, max_length=100)
     email:        EmailStr
     age:          int      = Field(..., ge=13, le=120)
-    occupation:   str      = Field(..., min_length=2, max_length=100)
     phone_number: str      = Field(..., min_length=10, max_length=20)
     password:     str      = Field(..., min_length=6)
     timezone:     Optional[str] = "Asia/Kolkata"
@@ -334,8 +333,11 @@ async def apple_sign_in(request: AppleSignInRequest, db: AsyncSession = Depends(
     from services.firebase_service import verify_apple_token
     try:
         uid, email, firebase_name = verify_apple_token(request.id_token)
-    except ValueError as e:
+    except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Apple sign-in Firebase error: {e}")
+        raise HTTPException(status_code=500, detail="Apple sign-in verification failed")
 
     # Apple users are stored with a synthetic phone placeholder so the unique
     # constraint is preserved without requiring a real phone number.
@@ -355,6 +357,7 @@ async def apple_sign_in(request: AppleSignInRequest, db: AsyncSession = Depends(
             phone_number=phone_placeholder,
             email=email or f"{uid}@apple.extendedminds",
             name=display_name,
+            age=0,
             password_hash="apple_oauth_no_password",
         )
         db.add(user)
@@ -364,7 +367,19 @@ async def apple_sign_in(request: AppleSignInRequest, db: AsyncSession = Depends(
     await db.commit()
 
     token = auth_service.create_access_token(user.id)
-    return {"success": True, "token": token, "user_id": user.id}
+    return {
+        "success": True,
+        "data": {
+            "access_token": token,
+            "user": {
+                "id": user.id,
+                "phone_number": user.phone_number,
+                "name": user.name,
+                "email": user.email,
+                "timezone": user.timezone,
+            },
+        },
+    }
 
 
 @app.post("/api/auth/firebase-reset-password")
@@ -538,9 +553,12 @@ async def reset_personal_data(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete all personal messages and reminders. Preserves account, pro status, groups."""
-    # Reminders first — they hold a FK to messages.id
+    # Reminders first — they hold a FK to messages.id; unlink annotations (preserve training data)
     await db.execute(
         sql_delete(Reminder).where(Reminder.user_id == current_user.id)
+    )
+    await db.execute(
+        update(LabelAnnotation).where(LabelAnnotation.user_id == current_user.id).values(message_id=None)
     )
     await db.execute(
         sql_delete(Message).where(
@@ -555,7 +573,7 @@ async def reset_personal_data(
 async def register_user(user_data: UserRegistrationRequest, db: AsyncSession = Depends(get_db)):
     result = await auth_service.register_user(
         phone_number=user_data.phone_number, name=user_data.name,
-        email=user_data.email, age=user_data.age, occupation=user_data.occupation,
+        email=user_data.email, age=user_data.age,
         password=user_data.password, timezone=user_data.timezone, db=db,
     )
     if not result["success"]:
@@ -2529,7 +2547,10 @@ async def bootstrap(
         select(Message, Category, User)
         .outerjoin(Category, Message.category_id == Category.id)
         .join(User, User.id == Message.user_id)
-        .where(Message.assigned_to_user_id == current_user.id)
+        .where(
+            Message.assigned_to_user_id == current_user.id,
+            Message.user_id != current_user.id,  # exclude mirror messages
+        )
         .order_by(Message.created_at.desc())
         .limit(100)
     )
@@ -2787,6 +2808,7 @@ async def delete_message(
     if msg.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not your message")
     await db.execute(sql_delete(Reminder).where(Reminder.message_id == message_id))
+    await db.execute(update(LabelAnnotation).where(LabelAnnotation.message_id == message_id).values(message_id=None))
     await db.delete(msg)
     await db.commit()
     return {"success": True}
@@ -3247,7 +3269,7 @@ async def admin_stats(
     user_rows = await db.execute(
         select(
             User.id, User.name, User.phone_number, User.email,
-            User.occupation, User.created_at, User.last_login,
+            User.created_at, User.last_login,
             User.telegram_chat_id,
             func.count(Message.id).label("msg_count"),
             func.max(Message.created_at).label("last_active"),
@@ -3263,7 +3285,6 @@ async def admin_stats(
             "name":         row.name,
             "phone":        row.phone_number,
             "email":        row.email,
-            "occupation":   row.occupation,
             "joined":       row.created_at.isoformat() if row.created_at else None,
             "last_login":   row.last_login.isoformat() if row.last_login else None,
             "last_active":  row.last_active.isoformat() if row.last_active else None,
@@ -3780,8 +3801,13 @@ async def delete_group(
     if not member:
         raise HTTPException(status_code=403, detail="Only the group admin can delete this group")
 
-    # Delete members, messages, then the group
+    # Delete members, messages, then the group; preserve annotations (just unlink message_id)
     await db.execute(sql_delete(GroupMember).where(GroupMember.group_id == group_id))
+    group_msg_ids = (
+        await db.execute(select(Message.id).where(Message.group_id == group_id))
+    ).scalars().all()
+    if group_msg_ids:
+        await db.execute(update(LabelAnnotation).where(LabelAnnotation.message_id.in_(group_msg_ids)).values(message_id=None))
     await db.execute(sql_delete(Message).where(Message.group_id == group_id))
     group = await db.get(Group, group_id)
     if group:
