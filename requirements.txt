@@ -40,4 +40,8 @@ pgvector
 # Firebase Admin (phone auth token verification)
 firebase-admin
 
+# Intent classifier (ONNX inference — no PyTorch needed at runtime)
+onnxruntime
+transformers
+
 

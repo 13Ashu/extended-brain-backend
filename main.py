@@ -25,7 +25,7 @@ from config import Config, MessagingPlatform
 from messaging_factory import create_messaging_client, get_platform_name
 from messaging_interface import MessagingClient
 
-from database import get_db, init_db, engine, Base, async_session_maker, DeviceToken, StoredImage, GroupLastSeen
+from database import get_db, init_db, engine, Base, async_session_maker, DeviceToken, StoredImage, GroupLastSeen, LabelAnnotation
 from models import User, Message, Category, MessageType, ProAccount, ProAccountMember, Group, GroupMember, CouponCode, CouponRedemption
 from services.group_service import group_service as grp_svc
 from services.coupon_service import coupon_service as cpn_svc
@@ -50,6 +50,11 @@ async def lifespan(app: FastAPI):
     print("🚀 Starting Extended Brain API...")
     await init_db()
     print("✓ Database initialized")
+
+    # Load ONNX intent classifier (non-blocking — falls back to Gemini if missing)
+    from services.classifier_service import classifier_service
+    ok = classifier_service.load()
+    print(f"{'✓ Intent classifier loaded (ONNX)' if ok else '⚠ Intent classifier not loaded — using Gemini'}")
 
     from services.reminder_service import Reminder
     async with engine.begin() as conn:
@@ -3109,20 +3114,66 @@ async def update_message_bucket(
     bucket = body.get("bucket", "")
     if bucket not in VALID_BUCKETS:
         raise HTTPException(status_code=400, detail=f"Invalid bucket. Must be one of: {', '.join(sorted(VALID_BUCKETS))}")
+
+    # Fetch message content before updating (needed for annotation)
+    msg_result = await db.execute(
+        select(Message).where(and_(Message.id == message_id, Message.user_id == current_user.id))
+    )
+    msg = msg_result.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
     # Update primary_bucket and all_buckets in tags JSONB
     jsonb_expr = (
         f"jsonb_set(jsonb_set(COALESCE(tags, '{{}}'), '{{primary_bucket}}', '\"{bucket}\"'::jsonb), "
         f"'{{all_buckets}}', '[\"{bucket}\"]'::jsonb)"
     )
-    result = await db.execute(
+    await db.execute(
         sa_update(Message)
         .where(and_(Message.id == message_id, Message.user_id == current_user.id))
         .values(tags=text(jsonb_expr))
     )
+
+    # Store as training annotation — user corrections are ground truth
+    annotation = LabelAnnotation(
+        user_id=current_user.id,
+        message_id=message_id,
+        text=msg.content,
+        label=bucket,
+        source="user_correction",
+    )
+    db.add(annotation)
     await db.commit()
-    if result.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Message not found")
+
     return {"success": True}
+
+
+@app.get("/api/annotations/export")
+async def export_annotations(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    limit: int = 5000,
+):
+    """
+    Export label annotations for retraining the ONNX intent classifier.
+    Returns all user-correction annotations (deduplicated, most recent label wins).
+    Used by retrain.py in the intent-classifier-poc repo.
+    """
+    result = await db.execute(
+        select(LabelAnnotation)
+        .order_by(LabelAnnotation.created_at.desc())
+        .limit(limit)
+    )
+    rows = result.scalars().all()
+
+    # Deduplicate by text — most recent annotation wins (already ordered desc)
+    seen:    dict[str, dict] = {}
+    for row in rows:
+        key = row.text.strip().lower()
+        if key not in seen:
+            seen[key] = {"text": row.text, "label": row.label, "source": row.source}
+
+    return list(seen.values())
 
 
 @app.patch("/api/messages/{message_id}/items/{item_index}/complete")

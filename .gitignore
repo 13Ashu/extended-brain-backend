@@ -100,3 +100,6 @@ uploads/
 # Windows
 Thumbs.db
 ehthumbs.db
+
+# ONNX model weights (large binary — deploy separately, not via git)
+models/intent_classifier/backbone.onnx

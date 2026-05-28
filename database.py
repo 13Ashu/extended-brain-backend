@@ -334,6 +334,32 @@ class GroupLastSeen(Base):
     last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class LabelAnnotation(Base):
+    """
+    User-confirmed intent labels — ground truth for retraining the ONNX classifier.
+
+    Populated two ways:
+      1. user_correction: user moves a message to a different bucket in the iOS app
+         (PATCH /api/messages/{id}/relabel)
+      2. manual: bulk-imported from the seed training data
+
+    These are exported via GET /api/annotations/export and fed into retrain.py
+    in the intent-classifier-poc repo to produce updated ONNX weights.
+    """
+    __tablename__ = "label_annotations"
+
+    id:         Mapped[int]      = mapped_column(primary_key=True)
+    user_id:    Mapped[int]      = mapped_column(ForeignKey("users.id"), index=True)
+    message_id: Mapped[Optional[int]] = mapped_column(ForeignKey("messages.id"), nullable=True, index=True)
+    text:       Mapped[str]      = mapped_column(Text, nullable=False)
+    label:      Mapped[str]      = mapped_column(String(50), nullable=False)
+    # "user_correction" | "manual"
+    source:     Mapped[str]      = mapped_column(String(30), default="user_correction")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    user: Mapped["User"] = relationship("User")
+
+
 class StoredImage(Base):
     """Binary image storage — no external CDN needed."""
     __tablename__ = "stored_images"
@@ -367,6 +393,8 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_group_last_seen_lookup ON group_last_seen(user_id, group_id)",
             "ALTER TABLE otp_verifications ALTER COLUMN otp_code TYPE VARCHAR(20)",
             "ALTER TABLE users ALTER COLUMN phone_number TYPE VARCHAR(50)",
+            "CREATE TABLE IF NOT EXISTS label_annotations (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), message_id INTEGER REFERENCES messages(id), text TEXT NOT NULL, label VARCHAR(50) NOT NULL, source VARCHAR(30) DEFAULT 'user_correction', created_at TIMESTAMP DEFAULT NOW())",
+            "CREATE INDEX IF NOT EXISTS idx_label_annotations_user ON label_annotations(user_id)",
         ]
         for stmt in migrations:
             try:

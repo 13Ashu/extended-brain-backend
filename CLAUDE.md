@@ -9,12 +9,15 @@
 ## What This Service Does
 
 FastAPI backend powering the Extended Minds iOS app and web dashboard. It:
-- Accepts message captures and runs them through an AI pipeline (intent detection, categorization, embedding)
+- Accepts message captures and classifies them via a two-path AI pipeline:
+  - **Fast path**: on-server ONNX classifier (~10ms, no network) for bucket classification
+  - **Slow path**: Gemini Flash Lite LLM (~500ms) when classifier is absent or low-confidence
 - Stores all knowledge in Neon PostgreSQL with pgvector for semantic search
 - Handles authentication (phone + OTP + password → JWT)
 - Delivers reminders via APNs (primary) and Telegram (legacy, to be retired)
 - Manages Pro accounts, collaborative groups, and live WebSocket feeds
 - Runs a background scheduler for reminders, briefings, and nudges
+- Stores user bucket-correction annotations to a `label_annotations` table for model retraining
 
 **Runtime:** Python 3.11+, FastAPI, SQLAlchemy (async), uvicorn  
 **Deployed on:** Railway  
@@ -31,17 +34,24 @@ extended-brain-backend/
 ├── database.py               ← SQLAlchemy ORM models + async engine setup
 ├── models.py                 ← Re-exports from database.py (thin wrapper)
 ├── config.py                 ← Config class reading all env vars
-├── cerebras_client.py        ← Unified LLM client: Gemini / Cerebras / OpenRouter
+├── cerebras_client.py        ← Unified LLM client: Gemini primary / Cerebras legacy
 ├── requirements.txt          ← Python dependencies
 ├── Procfile                  ← Railway/Heroku start command
 ├── railway.json              ← Railway build + deploy config
 ├── README.md                 ← User-facing setup guide
 ├── SETUP_INSTRUCTIONS.md     ← Developer setup steps
 │
-├── services/                 ← 22 focused service modules
+├── models/                   ← ML model weights (not fully in git)
+│   └── intent_classifier/    ← ONNX intent classifier (loaded at startup)
+│       ├── backbone.onnx     ← fine-tuned all-MiniLM-L6-v2 (90 MB, .gitignored)
+│       ├── head_weights.npz  ← logistic regression weights (12 KB, in git)
+│       └── tokenizer_*.json  ← tokenizer files (in git)
+│
+├── services/                 ← 23 focused service modules
+│   ├── classifier_service.py ← ★ ONNX intent classifier (fast path, ~10ms, no network)
+│   ├── intent_service.py     ← ★ Two-path parse: ONNX fast → Gemini slow
+│   ├── message_processor.py  ← Rule-based bucket pre-filter + time/entity extraction
 │   ├── auth_service.py       ← OTP, JWT creation/verify, password hashing
-│   ├── message_processor.py  ← Fast intent bucket detection (signal-based)
-│   ├── intent_service.py     ← Deep multi-action parse via LLM
 │   ├── search_service.py     ← Semantic search: embed → pgvector → LLM rank
 │   ├── embedding_service.py  ← Gemini embedding generation (1536 dims)
 │   ├── redis_cache.py        ← Upstash Redis wrapper (async, graceful)
@@ -83,14 +93,18 @@ extended-brain-backend/
 | JWT issuance + verification | `services/auth_service.py` |
 | Password hashing | `services/auth_service.py` (`hash_password`, `verify_password`) |
 | Current user dependency | `services/auth_service.py` (`get_current_user`) |
-| AI intent parsing | `services/intent_service.py` |
-| Quick bucket detection | `services/message_processor.py` |
+| **Intent classifier (ONNX fast path)** | **`services/classifier_service.py`** |
+| **Intent parse orchestrator** | **`services/intent_service.py`** — routes to ONNX or Gemini |
+| Rule-based time/entity extraction | `services/message_processor.py` |
 | Semantic search | `services/search_service.py` |
 | Embeddings | `services/embedding_service.py` |
 | Redis caching | `services/redis_cache.py` |
 | Pro accounts / groups | `services/group_service.py` |
 | Reminder scheduling | `services/reminder_service.py` |
 | APNs push delivery | `services/reminder_service.py` |
+| **Annotation storage (retraining data)** | **`database.py` → `LabelAnnotation`** |
+| **Write annotation on bucket move** | **`main.py` → `PATCH /api/messages/{id}/bucket`** |
+| **Export annotations for retraining** | **`main.py` → `GET /api/annotations/export`** |
 | Telegram delivery | `telegram.py` |
 | WhatsApp delivery | `whatsapp.py` |
 | Platform selection | `config.py` + `messaging_factory.py` |
@@ -259,6 +273,12 @@ All models in `database.py`. Uses SQLAlchemy 2.0 async with `asyncpg`.
 
 **`stored_images`** — `user_id`, `data` (LargeBinary), `mime_type` — fallback for images without CDN URL
 
+### Annotation Table (Classifier Flywheel)
+
+**`label_annotations`** — `id`, `user_id` (FK→users), `message_id` (FK→messages, nullable), `text` (TEXT), `label` (e.g. `"To-Do"`), `source` (default `"user_correction"`), `created_at`
+
+Written every time a user moves a message to a different bucket via `PATCH /api/messages/{id}/bucket`. Exported via `GET /api/annotations/export` and consumed by `retrain.py` in the POC repo to improve the ONNX classifier over time. Annotations always win over base training data on exact-text matches.
+
 ---
 
 ## Environment Variables
@@ -363,18 +383,49 @@ Daily at user's briefing_time:
 
 ## AI Pipeline
 
-**Primary:** Gemini 2.0 Flash Lite (`gemini-2.0-flash-lite`)  
-**Fallback:** Gemini 2.0 Flash → Cerebras (`qwen-3-235b-a22b-instruct-2507`) → Llama 3.1 8B
+### Intent Classification — Two-Path Architecture
 
-**LLM use cases:**
-1. Multi-action intent parse (`intent_service`) — one LLM call determines all actions for a message
-2. Search result re-ranking (`search_service`)
-3. Morning briefing generation (`briefing_service`)
-4. Category suggestions (`category_manager`)
+Every captured message goes through `intent_service.parse()`:
 
-**Embeddings:** Gemini text-embedding via REST, 1536 dims, stored in pgvector column.
+```
+Incoming message text
+       │
+       ▼
+classifier_service.classify(text)        ← ONNX, ~10ms, no network
+       │
+  confidence ≥ 0.50?
+  ├── YES → _build_from_bucket(text, bucket)   ← regex for time/date/reminder
+  │             return result + _classifier_confidence
+  │
+  └── NO  → _llm_parse(text)                  ← Gemini Flash Lite, ~500ms
+                return full LLM result
+```
 
-**Retry:** 3 attempts, exponential backoff on 429/500/503.
+**Fast path** (`services/classifier_service.py`):
+- Loads `models/intent_classifier/backbone.onnx` + `head_weights.npz` at startup via `lifespan()`
+- Tokenizes with `AutoTokenizer` (all-MiniLM-L6-v2), runs ONNX inference, applies sklearn LogisticRegression head
+- Returns `(bucket: str, confidence: float)`; threshold `CONF_THRESHOLD = 0.50`
+- If model files are absent, `is_ready` stays `False` → falls through to Gemini silently
+
+**`_build_from_bucket()`** in `intent_service.py`:
+- Constructs the full actions dict from the classifier bucket + regex-extracted time/date/reminder flags
+- Bypasses LLM entirely for routine captures; still runs rule-based extraction for `event_time`, `due_date`, `is_reminder`
+
+**Slow path** (Gemini):
+- `CerebrasClient(provider="gemini", model="gemini-2.0-flash-lite")`
+- Full structured prompt → JSON response with bucket, summary, entities, time, reminder flag
+- Retry: 3 attempts, exponential backoff on 429/500/503
+
+### Other LLM Use Cases
+1. Search result re-ranking (`search_service`) — Gemini Flash
+2. Morning briefing generation (`briefing_service`) — Gemini Flash
+3. Category suggestions (`category_manager`) — Gemini Flash Lite
+
+### Embeddings
+Gemini `text-embedding-004` via REST, 1536 dims, stored in pgvector column on `messages`.
+
+### Rule-Based Fallback (LLM completely down)
+`message_processor._sniff_buckets_fast()` + `_extract_time_mention()` extract time/date/reminder signals from regex even when both paths fail. `_full_analysis()` promotes `fast_time`/`fast_date` into the response when the LLM returns nothing.
 
 ---
 

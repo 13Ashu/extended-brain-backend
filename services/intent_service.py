@@ -149,7 +149,7 @@ class IntentService:
 
     def __init__(self, cerebras_client: CerebrasClient):
         self.cerebras = cerebras_client
-        # Gemini Flash Lite — reliable JSON output, low latency, replaces deprecated Cerebras model
+        # Gemini Flash Lite — used for enrichment (essence, entities) and low-confidence fallback
         self.fast = CerebrasClient(provider="gemini", model="gemini-2.0-flash-lite")
 
     async def parse(
@@ -161,8 +161,14 @@ class IntentService:
     ) -> Dict:
         """
         Parse a message into multi-action structured output.
-        check_query=False for iOS dump (always saving — no query detection needed).
-        Never raises — returns safe default on failure.
+
+        Fast path  (classifier ready, confidence ≥ threshold):
+            ONNX classifier → bucket  (~10ms, no network)
+            Rule-based       → time, date, reminder flag
+            Gemini           → essence only (optional, non-blocking)
+
+        Slow path  (classifier not ready, or confidence < threshold):
+            Gemini full parse → all fields
         """
         if _is_command(content):
             result = _default_result()
@@ -182,6 +188,19 @@ class IntentService:
             for i in range(7)
         }
 
+        # ── Fast path: local ONNX classifier ─────────────────────
+        from services.classifier_service import classifier_service, CONF_THRESHOLD
+        if classifier_service.is_ready:
+            bucket, confidence = classifier_service.classify(content)
+            if confidence >= CONF_THRESHOLD and bucket:
+                print(f"[intent] classifier → {bucket} ({confidence:.2f}) for: {content[:60]}")
+                result = self._build_from_bucket(
+                    content, bucket, today, tomorrow, day_map, check_query,
+                )
+                result["_classifier_confidence"] = confidence
+                return result
+
+        # ── Slow path: Gemini full parse ──────────────────────────
         try:
             return await self._llm_parse(
                 content, user_name, now_str, today, tomorrow, day_map,
@@ -190,6 +209,124 @@ class IntentService:
         except Exception as e:
             print(f"[intent] LLM parse failed: {e}")
             return _default_result()
+
+    def _build_from_bucket(
+        self,
+        content: str,
+        bucket: str,
+        today: str,
+        tomorrow: str,
+        day_map: Dict,
+        check_query: bool,
+    ) -> Dict:
+        """
+        Build the full actions dict from a classifier bucket + rule-based signals.
+        This replaces the LLM for the common case.
+        """
+        import re
+        from datetime import datetime
+
+        result  = _default_result()
+        actions = result["actions"]
+        lc      = content.lower()
+
+        # ── Query detection (rule-based, only when check_query=True) ─
+        if check_query and "?" in content:
+            query_signals = {"find", "search", "show", "what did", "where is",
+                             "recall", "do i have", "show me"}
+            if any(sig in lc for sig in query_signals):
+                actions["is_query"] = True
+                result["query"] = {"query_text": content, "date_hint": None, "list_name": None}
+                result["essence"] = content[:100]
+                return result
+
+        # ── Map bucket → primary action ───────────────────────────
+        bucket_to_action = {
+            "To-Do":    "save_as_todo",
+            "Events":   "save_as_event",
+            "Remember": "save_as_note",
+            "Ideas":    "save_as_idea",
+            "Track":    "save_as_track",
+            "List":     "save_as_list",
+            "Random":   "save_as_note",
+        }
+        primary_action = bucket_to_action.get(bucket, "save_as_note")
+        actions[primary_action] = True
+
+        # Events always also a todo
+        if bucket == "Events":
+            actions["save_as_todo"] = True
+
+        # ── Time / date extraction (rule-based) ───────────────────
+        time_str: Optional[str] = None
+        date_str: Optional[str] = None
+
+        # Specific time: "10pm", "10:30", "noon"
+        m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", lc)
+        if m:
+            h    = int(m.group(1))
+            mins = int(m.group(2) or 0)
+            if m.group(3) == "pm" and h != 12:
+                h += 12
+            elif m.group(3) == "am" and h == 12:
+                h = 0
+            time_str = f"{h:02d}:{mins:02d}"
+        elif "noon" in lc:
+            time_str = "12:00"
+        elif "midnight" in lc:
+            time_str = "00:00"
+
+        # Date: "today", "tomorrow", day-of-week
+        if "today" in lc or "tonight" in lc:
+            date_str = today
+        elif "tomorrow" in lc:
+            date_str = tomorrow
+        else:
+            for day_name, day_date in day_map.items():
+                if day_name in lc:
+                    date_str = day_date
+                    break
+
+        if not date_str:
+            date_str = today
+
+        # ── Reminder flag ─────────────────────────────────────────
+        reminder_kw = {"remind", "reminder", "don't forget", "alert", "notify", "ping"}
+        if any(kw in lc for kw in reminder_kw) and time_str:
+            actions["set_reminder"] = True
+            actions["save_as_todo"] = True
+            result["reminder"] = {"due_date": date_str, "time": time_str, "priority": "normal"}
+
+        # Also set reminder when time is explicitly mentioned with a todo
+        if time_str and (bucket in ("To-Do", "Events")):
+            actions["set_reminder"] = True
+            result["reminder"] = {"due_date": date_str, "time": time_str, "priority": "normal"}
+
+        # ── Priority ──────────────────────────────────────────────
+        priority = "normal"
+        if any(w in lc for w in {"urgent", "asap", "critical", "emergency"}):
+            priority = "urgent"
+        elif any(w in lc for w in {"important", "must", "definitely", "high priority"}):
+            priority = "high"
+
+        # ── Build task / note / etc. ──────────────────────────────
+        if actions["save_as_todo"]:
+            result["tasks"] = [{
+                "task":     content,
+                "due_date": date_str,
+                "time":     time_str,
+                "priority": priority,
+            }]
+
+        if actions["save_as_note"]:
+            result["note"] = {"content": content, "keywords": []}
+
+        if actions["save_as_idea"]:
+            result["idea"] = {"content": content, "keywords": []}
+
+        result["priority"] = priority
+        result["essence"]  = content[:100]
+        return result
 
     async def _llm_parse(
         self,
