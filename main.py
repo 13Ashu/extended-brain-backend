@@ -1820,7 +1820,7 @@ async def process_webhook_message(webhook_data: Dict):
                                     all_buckets = result.get("all_buckets", [])
 
                                     # ── List save → show full updated checklist immediately ───
-                                    if "List" in all_buckets and result.get("message_id"):
+                                    if result.get("is_list") and result.get("message_id"):
                                         async with async_session_maker() as session:
                                             from sqlalchemy import select as sel
                                             list_msg = await session.scalar(
@@ -1854,8 +1854,8 @@ async def process_webhook_message(webhook_data: Dict):
 
                                     # ── All other saves ───────────────────────────────────────
                                     response = _build_save_response(result)
-                                    skip_buckets = {"Track", "List", "Random"}
-                                    if not set(all_buckets) <= skip_buckets:
+                                    skip_buckets = {"Track", "Random"}
+                                    if not result.get("is_list") and not set(all_buckets) <= skip_buckets:
                                         asyncio.create_task(
                                             _check_project(user, result, content, chat_id)
                                         )
@@ -2116,8 +2116,8 @@ async def _handle_nl_subtask(
             parent_tags    = parent_msg.tags if isinstance(parent_msg.tags, dict) else {}
             parent_buckets = parent_tags.get("all_buckets", [])
 
-            if "List" in parent_buckets:
-                # This is a shopping/named list — use list_add_confirm
+            if parent_tags.get("is_list"):
+                # This is a named list — use list_add_confirm
                 list_name = parent_tags.get("list_name", parent_msg.content)
                 list_type = parent_tags.get("list_type", "custom")
                 await context_service.set_pending_confirmation(user.id, "list_add_confirm", {
@@ -2618,11 +2618,13 @@ async def get_recent_messages(
     limit: int = 100,
     group_id: Optional[int] = None,
     after: Optional[str] = None,   # ISO timestamp — only return messages newer than this
+    is_list: Optional[bool] = None,  # when true, return only messages with is_list=true in tags
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Return recent messages — personal if no group_id, group feed if group_id provided.
-    Pass ?after=<iso_ts> to get only messages newer than that timestamp (for polling)."""
+    Pass ?after=<iso_ts> to get only messages newer than that timestamp (for polling).
+    Pass ?is_list=true to return only named-list messages regardless of bucket."""
     if group_id:
         group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
         if not group:
@@ -2647,6 +2649,8 @@ async def get_recent_messages(
     )
     if after_dt:
         query = query.where(Message.created_at > after_dt)
+    if is_list:
+        query = query.where(text("(messages.tags->>'is_list')::boolean = true"))
 
     result = await db.execute(
         query.order_by(Message.created_at.desc()).limit(min(limit, 200))
@@ -3132,7 +3136,7 @@ async def update_message_bucket(
     db: AsyncSession = Depends(get_db),
 ):
     from sqlalchemy import update as sa_update
-    VALID_BUCKETS = {"Remember", "To-Do", "Ideas", "Track", "Events", "List", "Random"}
+    VALID_BUCKETS = {"Remember", "To-Do", "Ideas", "Track", "Events", "Random"}
     bucket = body.get("bucket", "")
     if bucket not in VALID_BUCKETS:
         raise HTTPException(status_code=400, detail=f"Invalid bucket. Must be one of: {', '.join(sorted(VALID_BUCKETS))}")

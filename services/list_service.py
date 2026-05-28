@@ -464,7 +464,7 @@ class ListService:
                 and_(
                     Message.user_id == user_id,
                     text("messages.tags->>'list_name' ILIKE :name"),
-                    text("messages.tags->'all_buckets' @> '\"List\"'::jsonb"),
+                    text("(messages.tags->>'is_list')::boolean = true"),
                     text("(messages.tags->>'is_active')::boolean IS NOT FALSE"),
                 )
             )
@@ -493,7 +493,7 @@ class ListService:
             .where(and_(
                 scope_filter,
                 text("messages.tags->>'list_name' ILIKE :name"),
-                text("messages.tags->'all_buckets' @> '\"List\"'::jsonb"),
+                text("(messages.tags->>'is_list')::boolean = true"),
                 text("(messages.tags->>'is_active')::boolean IS NOT FALSE"),
             ))
             .params(name=list_name)
@@ -521,7 +521,7 @@ class ListService:
                         and_(
                             scope_filter,
                             text("messages.tags->>'list_type' = :lt"),
-                            text("messages.tags->'all_buckets' @> '\"List\"'::jsonb"),
+                            text("(messages.tags->>'is_list')::boolean = true"),
                             text("(messages.tags->>'is_active')::boolean IS NOT FALSE"),
                         )
                     )
@@ -544,7 +544,7 @@ class ListService:
             .where(
                 and_(
                     scope_filter,
-                    text("messages.tags->'all_buckets' @> '\"List\"'::jsonb"),
+                    text("(messages.tags->>'is_list')::boolean = true"),
                     text("(messages.tags->>'is_active')::boolean IS NOT FALSE"),
                     or_(*conditions),
                 )
@@ -574,6 +574,7 @@ class ListService:
         db: AsyncSession,
         group_id: Optional[int] = None,
         due_date: Optional[str] = None,
+        bucket: str = "Remember",
     ) -> Tuple[Message, int, bool]:
         """
         Create if not exists, add items if exists.
@@ -584,7 +585,7 @@ class ListService:
 
         if not msg:
             msg = await self._create_list(user_id, list_name, list_type, items, db,
-                                          group_id=group_id, due_date=due_date)
+                                          group_id=group_id, due_date=due_date, bucket=bucket)
             return msg, len(items), True
 
         # Add to existing
@@ -623,14 +624,15 @@ class ListService:
         items: List[str], db: AsyncSession,
         group_id: Optional[int] = None,
         due_date: Optional[str] = None,
+        bucket: str = "Remember",
     ) -> Message:
         cat = await db.scalar(
             select(Category).where(
-                and_(Category.user_id == user_id, Category.name == "List")
+                and_(Category.user_id == user_id, Category.name == bucket)
             )
         )
         if not cat:
-            cat = Category(user_id=user_id, name="List", description="Named lists")
+            cat = Category(user_id=user_id, name=bucket, description="Named lists")
             db.add(cat)
             await db.flush()
 
@@ -641,8 +643,9 @@ class ListService:
             "list_type":      list_type,
             "list_name":      list_name,
             "subtasks":       subtasks,
-            "all_buckets":    ["List"],
-            "primary_bucket": "List",
+            "all_buckets":    [bucket],
+            "primary_bucket": bucket,
+            "is_list":        True,
             "is_active":      True,
             "item_count":     len(items),
         }
@@ -706,7 +709,7 @@ class ListService:
             .where(
                 and_(
                     Message.user_id == user_id,
-                    text("messages.tags->'all_buckets' @> '\"List\"'::jsonb"),
+                    text("(messages.tags->>'is_list')::boolean = true"),
                     text("(messages.tags->>'is_active')::boolean IS NOT FALSE"),
                 )
             )

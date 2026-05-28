@@ -23,7 +23,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-LABELS   = ["Remember", "To-Do", "Ideas", "Track", "Events", "List", "Random"]
+LABELS   = ["Remember", "To-Do", "Ideas", "Track", "Events", "Random"]
 # Low-confidence threshold — below this, fall back to Gemini
 CONF_THRESHOLD = 0.50
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models", "intent_classifier")

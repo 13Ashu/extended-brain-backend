@@ -190,15 +190,34 @@ class IntentService:
 
         # ── Fast path: local ONNX classifier ─────────────────────
         from services.classifier_service import classifier_service, CONF_THRESHOLD
+        bucket, confidence = "", 0.0
         if classifier_service.is_ready:
             bucket, confidence = classifier_service.classify(content)
+
+        # ── List format pre-check (~microseconds, no network) ────
+        # Run regex list detection regardless of classifier confidence.
+        # If a list structure is detected, use the classifier bucket to
+        # determine semantics (To-Do task group vs Remember collection).
+        from services.list_service import ListService as _LS
+        _ls_tmp = _LS(None)
+        list_result = _ls_tmp._regex_detect(content)
+        if list_result and list_result.get("intent") == "create_or_add" and list_result.get("items"):
             if confidence >= CONF_THRESHOLD and bucket:
-                print(f"[intent] classifier → {bucket} ({confidence:.2f}) for: {content[:60]}")
-                result = self._build_from_bucket(
-                    content, bucket, today, tomorrow, day_map, check_query,
+                print(f"[intent] list+classifier → {bucket} ({confidence:.2f}) for: {content[:60]}")
+                result = self._build_list_result(
+                    content, list_result, bucket, today, tomorrow, day_map, check_query,
                 )
                 result["_classifier_confidence"] = confidence
                 return result
+            # Low confidence — fall through to LLM (handles save_as_list with bucket already)
+
+        if confidence >= CONF_THRESHOLD and bucket:
+            print(f"[intent] classifier → {bucket} ({confidence:.2f}) for: {content[:60]}")
+            result = self._build_from_bucket(
+                content, bucket, today, tomorrow, day_map, check_query,
+            )
+            result["_classifier_confidence"] = confidence
+            return result
 
         # ── Slow path: Gemini full parse ──────────────────────────
         try:
@@ -306,7 +325,6 @@ class IntentService:
             "Remember": "save_as_note",
             "Ideas":    "save_as_idea",
             "Track":    "save_as_track",
-            "List":     "save_as_list",
             "Random":   "save_as_note",
         }
         primary_action = bucket_to_action.get(bucket, "save_as_note")
@@ -394,6 +412,55 @@ class IntentService:
 
         result["priority"] = priority
         result["essence"]  = content[:100]
+        return result
+
+    def _build_list_result(
+        self,
+        content: str,
+        list_result: Dict,
+        bucket: str,
+        today: str,
+        tomorrow: str,
+        day_map: Dict,
+        check_query: bool,
+    ) -> Dict:
+        """
+        Build an actions dict for a list-formatted capture.
+        The classifier bucket determines list semantics:
+          To-Do   → task group (parent with sub-todos, mutable via "add X to Y")
+          Remember → named collection (mutable via "add X to Y")
+          Track   → each item is a separate log entry (no persistent list)
+          Others  → stored as is_list=True with the appropriate bucket action
+        """
+        result  = _default_result()
+        actions = result["actions"]
+
+        if bucket == "To-Do":
+            actions["save_as_todo"] = True
+            actions["save_as_list"] = True
+        elif bucket == "Remember":
+            actions["save_as_note"] = True
+            actions["save_as_list"] = True
+        elif bucket == "Track":
+            actions["save_as_track"] = True
+            # Track items are individual log entries — no persistent named list
+        else:
+            primary = {
+                "Events": "save_as_event",
+                "Ideas":  "save_as_idea",
+                "Random": "save_as_note",
+            }.get(bucket, "save_as_note")
+            actions[primary] = True
+            actions["save_as_list"] = True
+
+        result["list"] = {
+            "list_name": list_result["list_name"],
+            "list_type": list_result["list_type"],
+            "items":     list_result["items"],
+            "due_date":  None,
+            "bucket":    bucket,
+        }
+        result["essence"] = content[:100]
         return result
 
     async def _llm_parse(

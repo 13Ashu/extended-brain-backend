@@ -337,10 +337,18 @@ class MessageProcessor:
         regex_list = self.list_service._regex_detect(content)
         if regex_list and regex_list.get("intent") == "create_or_add" and regex_list.get("items"):
             if not _LIST_DATE_RE.search(content):
-                print(f"[processor] regex_list hit: {regex_list['list_name']!r} ({len(regex_list['items'])} items)")
+                # Determine bucket via ONNX so we store the real bucket (To-Do or Remember)
+                # instead of the legacy "List" bucket.
+                list_bucket = "Remember"
+                from services.classifier_service import classifier_service, CONF_THRESHOLD
+                if classifier_service.is_ready:
+                    _b, _conf = classifier_service.classify(content)
+                    if _conf >= CONF_THRESHOLD and _b in ("To-Do", "Remember", "Track"):
+                        list_bucket = _b
+                print(f"[processor] regex_list hit: {regex_list['list_name']!r} ({len(regex_list['items'])} items), bucket={list_bucket}")
                 return await self._handle_list_save_direct(
                     user, regex_list["list_name"], regex_list["list_type"], regex_list["items"], db,
-                    group_id=group_id,
+                    group_id=group_id, bucket=list_bucket,
                 )
 
         # ── Single LLM call: multi-action intent parse ────────────
@@ -361,6 +369,7 @@ class MessageProcessor:
                 user, lst["list_name"], lst["list_type"], lst["items"], db,
                 group_id=group_id,
                 due_date=lst.get("due_date"),
+                bucket=lst.get("bucket", "Remember"),
             )
 
         # ── Query — user wants to retrieve something ──────────────
@@ -429,6 +438,7 @@ class MessageProcessor:
                         list_result["items"],
                         db,
                         group_id=group_id,
+                        bucket="Remember",
                     )
                 elif list_result["intent"] == "show":
                     return {
@@ -454,17 +464,21 @@ class MessageProcessor:
         self, user, list_name: str, list_type: str, items: List[str], db: AsyncSession,
         group_id: Optional[int] = None,
         due_date: Optional[str] = None,
+        bucket: str = "Remember",
     ) -> Dict:
         msg, added, was_created = await self.list_service.create_or_add(
-            user.id, list_name, list_type, items, db, group_id=group_id, due_date=due_date
+            user.id, list_name, list_type, items, db,
+            group_id=group_id, due_date=due_date, bucket=bucket,
         )
         tags  = msg.tags if isinstance(msg.tags, dict) else {}
         total = len(tags.get("subtasks", []))
         stored_due = tags.get("due_date") or due_date
+        actual_bucket = tags.get("primary_bucket", bucket)
         return {
             "message_id":  msg.id,
-            "category":    "List",
-            "all_buckets": ["List"],
+            "category":    actual_bucket,
+            "all_buckets": [actual_bucket],
+            "is_list":     True,
             "list_type":   list_type,
             "list_name":   list_name,
             "items_added": added,
