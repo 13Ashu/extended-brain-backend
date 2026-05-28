@@ -679,6 +679,9 @@ Return ONLY this JSON:
         precomputed_embedding: Optional[List[float]] = None,
     ) -> List[tuple]:
         semantic_hits: Dict[int, float] = {}
+        # Only include messages with cosine similarity above this floor.
+        # Prevents truly unrelated messages from polluting results when the corpus is small.
+        MIN_SEMANTIC_SIMILARITY = 0.30
         try:
             from services.embedding_service import embedding_service
             query_embedding = precomputed_embedding or await embedding_service.aembed_query(query)
@@ -688,19 +691,21 @@ Return ONLY this JSON:
                     SELECT m.id, 1 - (m.embedding <=> :emb ::vector) AS similarity
                     FROM messages m
                     WHERE m.group_id = :gid AND m.embedding IS NOT NULL
+                      AND (1 - (m.embedding <=> :emb ::vector)) > :min_sim
                     ORDER BY m.embedding <=> :emb ::vector
                     LIMIT :lim
                 """)
-                sem_result = await db.execute(sem_sql, {"emb": embedding_str, "gid": group_id, "lim": limit})
+                sem_result = await db.execute(sem_sql, {"emb": embedding_str, "gid": group_id, "lim": limit, "min_sim": MIN_SEMANTIC_SIMILARITY})
             else:
                 sem_sql = text("""
                     SELECT m.id, 1 - (m.embedding <=> :emb ::vector) AS similarity
                     FROM messages m
                     WHERE m.user_id = :uid AND m.group_id IS NULL AND m.embedding IS NOT NULL
+                      AND (1 - (m.embedding <=> :emb ::vector)) > :min_sim
                     ORDER BY m.embedding <=> :emb ::vector
                     LIMIT :lim
                 """)
-                sem_result = await db.execute(sem_sql, {"emb": embedding_str, "uid": user.id, "lim": limit})
+                sem_result = await db.execute(sem_sql, {"emb": embedding_str, "uid": user.id, "lim": limit, "min_sim": MIN_SEMANTIC_SIMILARITY})
             semantic_hits = {row.id: float(row.similarity) for row in sem_result}
         except Exception as e:
             print(f"⚠ Semantic search failed: {e}")
@@ -881,6 +886,14 @@ Return ONLY this JSON:
             })
 
         scored.sort(key=lambda x: (x["relevance"], x["priority"] == "high"), reverse=True)
+
+        # Drop results with negligible relevance — pure semantic noise with no keyword overlap.
+        # A result that matched only via weak vector similarity scores ≤ ~6; any keyword hit
+        # adds at minimum 8–12 points. This threshold removes semantic stragglers.
+        MIN_RELEVANCE = 8.0
+        if any(s["relevance"] >= MIN_RELEVANCE for s in scored):
+            scored = [s for s in scored if s["relevance"] >= MIN_RELEVANCE]
+
         return scored
 
     def _score(
