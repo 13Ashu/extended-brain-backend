@@ -149,8 +149,8 @@ class IntentService:
 
     def __init__(self, cerebras_client: CerebrasClient):
         self.cerebras = cerebras_client
-        # qwen-3-235b for intent — accuracy on list/todo/event classification is critical
-        self.fast = CerebrasClient(model="qwen-3-235b-a22b-instruct-2507")
+        # Gemini Flash Lite — reliable JSON output, low latency, replaces deprecated Cerebras model
+        self.fast = CerebrasClient(provider="gemini", model="gemini-2.0-flash-lite")
 
     async def parse(
         self,

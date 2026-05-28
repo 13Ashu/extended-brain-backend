@@ -130,12 +130,15 @@ def _detect_priority(content: str) -> str:
 def _sniff_buckets_fast(content: str) -> List[str]:
     lc = content.lower()
 
-    # Reminder override
+    # Reminder override — explicit reminder request always saves as To-Do + Events if timed
     if any(kw in lc for kw in REMINDER_KEYWORDS):
         buckets = ["To-Do"]
         if re.search(
-            r"\b(today|tomorrow|tonight|morning|afternoon|evening|noon"
-            r"|\d{1,2}(am|pm)|\d{1,2}:\d{2}|after\s+\d+\s*(min|hour))\b", lc
+            r"\b(today|tomorrow|tonight|morning|afternoon|evening|noon|midnight"
+            r"|\d{1,2}(am|pm)|\d{1,2}:\d{2}"
+            r"|in\s+\d+\s*(min|mins|minute|minutes|hour|hours)"
+            r"|after\s+\d+\s*(min|mins|minute|minutes|hour|hours)"
+            r"|at\s+\d{1,2})\b", lc
         ):
             buckets.append("Events")
         return buckets
@@ -218,6 +221,21 @@ def _extract_time_mention(content: str, ref: datetime) -> Tuple[Optional[str], O
             if m2.group(2) == "pm" and h != 12:
                 h += 12
             time_str = f"{h:02d}:00"
+    else:
+        # Relative time: "in 30 minutes" / "in 2 hours"
+        rel = re.search(r"\bin\s+(\d+)\s*(min|mins|minute|minutes)\b", lc)
+        if rel:
+            target = ref + timedelta(minutes=int(rel.group(1)))
+            time_str = target.strftime("%H:%M")
+            if not date_str:
+                date_str = target.strftime("%Y-%m-%d")
+        else:
+            rel = re.search(r"\bin\s+(\d+)\s*(hour|hours)\b", lc)
+            if rel:
+                target = ref + timedelta(hours=int(rel.group(1)))
+                time_str = target.strftime("%H:%M")
+                if not date_str:
+                    date_str = target.strftime("%Y-%m-%d")
 
     return date_str, time_str
 
@@ -894,6 +912,13 @@ Return ONLY this JSON:
         response.setdefault("events", [])
         response.setdefault("todo_items", [])
         response.setdefault("related_concepts", [])
+
+        # When LLM didn't extract time/date, promote the regex-derived values.
+        # This ensures reminders fire correctly even when the LLM is unavailable.
+        if not response["event_time"] and fast_time:
+            response["event_time"] = fast_time
+        if not response["due_date"] and fast_date:
+            response["due_date"] = fast_date
 
         ent = response["entities"]
         if not isinstance(ent, dict):
