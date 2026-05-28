@@ -680,8 +680,9 @@ Return ONLY this JSON:
     ) -> List[tuple]:
         semantic_hits: Dict[int, float] = {}
         # Only include messages with cosine similarity above this floor.
-        # Prevents truly unrelated messages from polluting results when the corpus is small.
-        MIN_SEMANTIC_SIMILARITY = 0.30
+        # Gemini text-embedding-004 (1536-dim): short unrelated texts still score 0.30–0.38.
+        # 0.40 is the practical cutoff for "genuinely related" in this embedding space.
+        MIN_SEMANTIC_SIMILARITY = 0.40
         try:
             from services.embedding_service import embedding_service
             query_embedding = precomputed_embedding or await embedding_service.aembed_query(query)
@@ -707,6 +708,9 @@ Return ONLY this JSON:
                 """)
                 sem_result = await db.execute(sem_sql, {"emb": embedding_str, "uid": user.id, "lim": limit, "min_sim": MIN_SEMANTIC_SIMILARITY})
             semantic_hits = {row.id: float(row.similarity) for row in sem_result}
+            if semantic_hits:
+                scores = sorted(semantic_hits.values(), reverse=True)
+                print(f"[search] semantic hits={len(scores)} scores={[round(s,3) for s in scores[:5]]} (threshold={MIN_SEMANTIC_SIMILARITY})")
         except Exception as e:
             print(f"⚠ Semantic search failed: {e}")
 
