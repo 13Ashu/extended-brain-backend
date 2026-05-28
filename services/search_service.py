@@ -708,9 +708,17 @@ Return ONLY this JSON:
                 """)
                 sem_result = await db.execute(sem_sql, {"emb": embedding_str, "uid": user.id, "lim": limit, "min_sim": MIN_SEMANTIC_SIMILARITY})
             semantic_hits = {row.id: float(row.similarity) for row in sem_result}
+            # Relative filter: drop candidates more than 0.12 below the best score.
+            # Prevents weak-but-above-floor matches from polluting results when one
+            # result is clearly dominant (e.g. "soup recipe" → 0.663 vs 0.503/0.494).
+            # Topic queries with clustered results (e.g. 0.72/0.68/0.65) all pass.
             if semantic_hits:
+                max_sim = max(semantic_hits.values())
+                RELATIVE_GAP = 0.12
+                semantic_hits = {mid: sim for mid, sim in semantic_hits.items()
+                                 if sim >= max_sim - RELATIVE_GAP}
                 scores = sorted(semantic_hits.values(), reverse=True)
-                print(f"[search] semantic hits={len(scores)} scores={[round(s,3) for s in scores[:5]]} (threshold={MIN_SEMANTIC_SIMILARITY})")
+                print(f"[search] semantic hits={len(scores)} scores={[round(s,3) for s in scores[:5]]} (floor={MIN_SEMANTIC_SIMILARITY} gap={RELATIVE_GAP})")
         except Exception as e:
             print(f"⚠ Semantic search failed: {e}")
 
