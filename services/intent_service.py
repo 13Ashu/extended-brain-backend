@@ -423,6 +423,33 @@ class IntentService:
         elif any(w in lc for w in {"important", "must", "definitely", "high priority"}):
             priority = "high"
 
+        # ── Bullet list for To-Do with 2+ items ──────────────────────
+        # "issues for today:\n- a\n- b" → store as is_list=True so
+        # TodoView renders it as an expandable ListTodoRow instead of
+        # a flat text blob.
+        if bucket == "To-Do":
+            has_bullets = bool(re.search(r'\n\s*[-*•]|\n\s*\d+[.)]', content))
+            if has_bullets:
+                from services.list_service import _extract_items_from_content
+                items = _extract_items_from_content(content)
+                if len(items) >= 2:
+                    header_m = re.match(r'^([^\n]+)', content)
+                    raw_header = (
+                        header_m.group(1).strip().rstrip(':').strip()
+                        if header_m else ""
+                    ) or "Tasks"
+                    actions["save_as_list"] = True
+                    result["list"] = {
+                        "list_name": raw_header,
+                        "list_type": "todo",
+                        "items":     items,
+                        "due_date":  date_str,
+                        "bucket":    "To-Do",
+                    }
+                    result["priority"] = priority
+                    result["essence"]  = content[:100]
+                    return result
+
         # ── Build task / note / etc. ──────────────────────────────
         if actions["save_as_todo"]:
             result["tasks"] = [{

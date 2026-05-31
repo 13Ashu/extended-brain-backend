@@ -3244,15 +3244,19 @@ async def update_message_bucket(
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
 
-    # Update primary_bucket and all_buckets in tags JSONB
-    jsonb_expr = (
-        f"jsonb_set(jsonb_set(COALESCE(tags, '{{}}'), '{{primary_bucket}}', '\"{bucket}\"'::jsonb), "
-        f"'{{all_buckets}}', '[\"{bucket}\"]'::jsonb)"
-    )
+    # Python-side tag manipulation: update bucket and set due_date when
+    # promoting to To-Do so the task surfaces under TODAY/SOMEDAY rather
+    # than being invisible (tags.due_date is None for Remember/Ideas/etc.)
+    updated_tags = dict(msg.tags or {})
+    updated_tags["primary_bucket"] = bucket
+    updated_tags["all_buckets"]    = [bucket]
+    if bucket == "To-Do" and not updated_tags.get("due_date"):
+        updated_tags["due_date"] = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+
     await db.execute(
         sa_update(Message)
         .where(and_(Message.id == message_id, Message.user_id == current_user.id))
-        .values(tags=text(jsonb_expr))
+        .values(tags=updated_tags)
     )
 
     # Store as training annotation — user corrections are ground truth
@@ -3265,6 +3269,12 @@ async def update_message_bucket(
     )
     db.add(annotation)
     await db.commit()
+
+    # Bust bootstrap cache so the next app-load reflects the new bucket
+    from services import redis_cache as _rc
+    asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(current_user.id, None)))
+    if msg.group_id:
+        asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(current_user.id, msg.group_id)))
 
     return {"success": True}
 
