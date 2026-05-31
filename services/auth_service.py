@@ -63,7 +63,7 @@ class AuthService:
         payload = {
             "sub": str(user_id),  # store user ID
             "iat": datetime.utcnow(),
-            "exp": datetime.utcnow() + timedelta(days=7)
+            "exp": datetime.utcnow() + timedelta(days=30)
         }
 
         return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
@@ -202,16 +202,17 @@ class AuthService:
 
     async def login_user(
         self,
-        phone_number: str,
         password: str,
-        db: AsyncSession
+        db: AsyncSession,
+        email: str = None,
+        phone_number: str = None,
     ) -> dict:
         try:
-            result = await db.execute(
-                select(User).where(User.phone_number == phone_number)
-            )
-
-            user = result.scalar_one_or_none()
+            user = None
+            if email:
+                user = await db.scalar(select(User).where(User.email == email))
+            if not user and phone_number:
+                user = await db.scalar(select(User).where(User.phone_number == phone_number))
 
             if not user:
                 return {

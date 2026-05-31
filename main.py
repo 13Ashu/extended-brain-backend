@@ -198,7 +198,8 @@ class OTPVerifyRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    phone_number: str
+    phone_number: Optional[str] = None
+    email:        Optional[str] = None
     password:     str
 
 
@@ -217,6 +218,11 @@ class FirebaseResetPasswordRequest(BaseModel):
 
 
 class AppleSignInRequest(BaseModel):
+    id_token:  str = Field(..., min_length=1)
+    full_name: Optional[str] = None
+
+
+class GoogleSignInRequest(BaseModel):
     id_token:  str = Field(..., min_length=1)
     full_name: Optional[str] = None
 
@@ -382,6 +388,57 @@ async def apple_sign_in(request: AppleSignInRequest, db: AsyncSession = Depends(
     }
 
 
+@app.post("/api/auth/google")
+async def google_sign_in(request: GoogleSignInRequest, db: AsyncSession = Depends(get_db)):
+    """Sign in or register via Google Account (Firebase-verified)."""
+    from services.firebase_service import verify_google_token
+    try:
+        uid, email, firebase_name = verify_google_token(request.id_token)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Google sign-in Firebase error: {e}")
+        raise HTTPException(status_code=500, detail="Google sign-in verification failed")
+
+    phone_placeholder = f"google|{uid}"
+    display_name = request.full_name or firebase_name or (email.split("@")[0] if email else "Google User")
+
+    user = await db.scalar(select(User).where(User.phone_number == phone_placeholder))
+    if not user and email:
+        user = await db.scalar(select(User).where(User.email == email))
+        if user and not user.phone_number.startswith("google|"):
+            pass  # Link Google UID to an existing email-registered account
+
+    if not user:
+        user = User(
+            phone_number=phone_placeholder,
+            email=email or f"{uid}@google.extendedminds",
+            name=display_name,
+            age=0,
+            password_hash="google_oauth_no_password",
+        )
+        db.add(user)
+        await db.flush()
+
+    user.last_login = datetime.utcnow()
+    await db.commit()
+
+    token = auth_service.create_access_token(user.id)
+    return {
+        "success": True,
+        "data": {
+            "access_token": token,
+            "user": {
+                "id":           user.id,
+                "phone_number": user.phone_number,
+                "name":         user.name,
+                "email":        user.email,
+                "timezone":     user.timezone,
+            },
+        },
+    }
+
+
 @app.post("/api/auth/firebase-reset-password")
 async def firebase_reset_password(request: FirebaseResetPasswordRequest, db: AsyncSession = Depends(get_db)):
     """
@@ -404,7 +461,14 @@ async def firebase_reset_password(request: FirebaseResetPasswordRequest, db: Asy
 
 @app.post("/api/auth/login")
 async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
-    result = await auth_service.login_user(request.phone_number, request.password, db)
+    if not request.email and not request.phone_number:
+        raise HTTPException(status_code=422, detail="Provide email or phone_number")
+    result = await auth_service.login_user(
+        password=request.password,
+        db=db,
+        email=request.email,
+        phone_number=request.phone_number,
+    )
     if not result["success"]:
         raise HTTPException(status_code=401, detail=result["message"])
     return result
@@ -492,6 +556,31 @@ async def get_me(
             "phone_number": current_user.phone_number,
             "timezone": current_user.timezone,
             "is_pro": current_user.is_pro,
+            "briefing_time": current_user.briefing_time,
+        }
+    }
+
+
+@app.patch("/api/users/me")
+async def update_profile(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="name cannot be empty")
+    current_user.name = name
+    await db.commit()
+    return {
+        "success": True,
+        "data": {
+            "id":           current_user.id,
+            "name":         current_user.name,
+            "email":        current_user.email,
+            "phone_number": current_user.phone_number,
+            "timezone":     current_user.timezone,
+            "is_pro":       current_user.is_pro,
             "briefing_time": current_user.briefing_time,
         }
     }

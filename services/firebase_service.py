@@ -55,6 +55,30 @@ def verify_phone_token(id_token: str) -> str:
     return phone
 
 
+def verify_google_token(id_token: str):
+    """
+    Verify a Firebase Google Sign-In ID token.
+    Returns (uid, email, display_name) — email and name may be None.
+    """
+    _ensure_initialized()
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+    except firebase_auth.ExpiredIdTokenError:
+        raise ValueError("Firebase token has expired — ask the user to sign in again")
+    except firebase_auth.InvalidIdTokenError as e:
+        raise ValueError(f"Invalid Firebase token: {e}")
+    except Exception as e:
+        raise ValueError(f"Firebase token verification failed: {e}")
+
+    uid = decoded.get("uid") or decoded.get("sub")
+    if not uid:
+        raise ValueError("Firebase token does not contain a UID")
+
+    email = decoded.get("email")
+    name  = decoded.get("displayName") or decoded.get("name")
+    return uid, email, name
+
+
 def verify_apple_token(id_token: str):
     """
     Verify a Firebase Apple Sign-In ID token.
