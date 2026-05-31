@@ -158,17 +158,21 @@ class IntentService:
         user_name: str,
         user_timezone: str = "Asia/Kolkata",
         check_query: bool = True,
+        force_bucket: Optional[str] = None,
+        no_llm_fallback: bool = False,
     ) -> Dict:
         """
         Parse a message into multi-action structured output.
 
+        force_bucket: skip classifier and LLM entirely; build result from this bucket.
+        no_llm_fallback: when True, never call Gemini — use rule-based bucket if classifier fails.
+
         Fast path  (classifier ready, confidence ≥ threshold):
             ONNX classifier → bucket  (~10ms, no network)
             Rule-based       → time, date, reminder flag
-            Gemini           → essence only (optional, non-blocking)
 
         Slow path  (classifier not ready, or confidence < threshold):
-            Gemini full parse → all fields
+            Gemini full parse → all fields  (skipped when no_llm_fallback=True)
         """
         if _is_command(content):
             result = _default_result()
@@ -187,6 +191,15 @@ class IntentService:
             (now_local + timedelta(days=i+1)).strftime("%Y-%m-%d")
             for i in range(7)
         }
+
+        # ── Forced bucket: bypass classifier and LLM entirely ────
+        if force_bucket:
+            print(f"[intent] forced bucket → {force_bucket} for: {content[:60]}")
+            result = self._build_from_bucket(
+                content, force_bucket, today, tomorrow, day_map, check_query=False,
+            )
+            result["_forced_bucket"] = True
+            return result
 
         # ── Fast path: local ONNX classifier ─────────────────────
         from services.classifier_service import classifier_service, CONF_THRESHOLD
@@ -210,6 +223,14 @@ class IntentService:
                 result["_classifier_confidence"] = confidence
                 return result
             # Low confidence — fall through to LLM (handles save_as_list with bucket already)
+            # Unless no_llm_fallback — then use rule-based bucket for the list
+            if no_llm_fallback:
+                fallback_bucket = _infer_bucket_from_rules(content)
+                print(f"[intent] list+no_llm → {fallback_bucket} (rules) for: {content[:60]}")
+                result = self._build_list_result(
+                    content, list_result, fallback_bucket, today, tomorrow, day_map, check_query=False,
+                )
+                return result
 
         if confidence >= CONF_THRESHOLD and bucket:
             print(f"[intent] classifier → {bucket} ({confidence:.2f}) for: {content[:60]}")
@@ -219,7 +240,14 @@ class IntentService:
             result["_classifier_confidence"] = confidence
             return result
 
-        # ── Slow path: Gemini full parse ──────────────────────────
+        # ── Slow path: Gemini full parse (or rule-based if no_llm_fallback) ─
+        if no_llm_fallback:
+            fallback_bucket = _infer_bucket_from_rules(content)
+            print(f"[intent] no_llm_fallback → {fallback_bucket} (rules) for: {content[:60]}")
+            return self._build_from_bucket(
+                content, fallback_bucket, today, tomorrow, day_map, check_query=False,
+            )
+
         try:
             return await self._llm_parse(
                 content, user_name, now_str, today, tomorrow, day_map,
@@ -755,11 +783,45 @@ class IntentService:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers (used in validation)
+# Helpers (used in validation and rule-based fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import re
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+_TRACK_SIGNALS = {"kg", "km", "mile", "steps", "calories", "kcal", "mood", "slept", "weight", "bp", "sugar", "water"}
+_ACTION_VERBS = {
+    "call", "email", "buy", "get", "pick", "order", "send", "submit", "upload",
+    "pay", "fix", "update", "review", "check", "book", "schedule", "remind",
+    "need to", "have to", "must", "should", "write", "draft", "create", "build",
+    "read", "do", "take", "make", "go", "add", "remove", "print", "find",
+}
+
+def _infer_bucket_from_rules(content: str) -> str:
+    """Rule-based bucket when classifier is unavailable and LLM is disabled (group captures)."""
+    # Strip @mentions before analysis
+    clean = re.sub(r'@\w+', '', content).strip().lower()
+
+    # Track: numeric health/habit signals
+    if any(s in clean for s in _TRACK_SIGNALS) and re.search(r"\d", clean):
+        return "Track"
+
+    # Ideas
+    if re.search(r"\b(idea|concept|what if|imagine|startup|feature|suggestion)\b", clean):
+        return "Ideas"
+
+    # Action verbs or reminder keywords → To-Do
+    if (
+        any(re.search(rf'(?<!\w){re.escape(v)}(?!\w)', clean) for v in _ACTION_VERBS)
+        or re.search(r"\b(remind|reminder|don.t forget|notify|alert)\b", clean)
+        or re.search(r"\b(\d{1,2}(am|pm)|\d{1,2}:\d{2}|noon|midnight|today|tomorrow)\b", clean)
+    ):
+        return "To-Do"
+
+    # Substantive content without action → Remember
+    if len(clean) > 15:
+        return "Remember"
+    return "Random"
 
 def _today_str() -> str:
     from datetime import datetime

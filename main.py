@@ -2885,6 +2885,10 @@ async def capture_message(
         message_type=message.message_type, media_url=message.media_url, db=db,
         skip_query=True,
         group_id=group_id,
+        # @mention tasks are always To-Do — skip classifier/LLM entirely
+        force_bucket="To-Do" if assignments else None,
+        # All group captures: use classifier or rule-based fallback, never LLM
+        no_llm_fallback=bool(group_id),
     )
 
     # ── Tag message with group_id / assignments ───────────────────────

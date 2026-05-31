@@ -323,6 +323,8 @@ class MessageProcessor:
         media_url: Optional[str] = None,
         skip_query: bool = False,
         group_id: Optional[int] = None,
+        force_bucket: Optional[str] = None,
+        no_llm_fallback: bool = False,
     ) -> Dict:
         user = await self._get_user(user_phone, db)
         if not user:
@@ -330,26 +332,24 @@ class MessageProcessor:
 
         ref = _ist_now()
 
-        # ── FAST PATH: Regex list detection — no LLM, no latency ──
-        # Runs before the LLM so explicit "Name:\n- items" formats
-        # are never misclassified as To-Do tasks by smaller models.
-        # Skip fast path when content has date words so the LLM can extract due_date.
-        regex_list = self.list_service._regex_detect(content)
-        if regex_list and regex_list.get("intent") == "create_or_add" and regex_list.get("items"):
-            if not _LIST_DATE_RE.search(content):
-                # Determine bucket via ONNX so we store the real bucket (To-Do or Remember)
-                # instead of the legacy "List" bucket.
-                list_bucket = "Remember"
-                from services.classifier_service import classifier_service, CONF_THRESHOLD
-                if classifier_service.is_ready:
-                    _b, _conf = classifier_service.classify(content)
-                    if _conf >= CONF_THRESHOLD and _b in ("To-Do", "Remember", "Track"):
-                        list_bucket = _b
-                print(f"[processor] regex_list hit: {regex_list['list_name']!r} ({len(regex_list['items'])} items), bucket={list_bucket}")
-                return await self._handle_list_save_direct(
-                    user, regex_list["list_name"], regex_list["list_type"], regex_list["items"], db,
-                    group_id=group_id, bucket=list_bucket,
-                )
+        # ── FAST PATH: Regex list detection — skip when force_bucket is set ──
+        # When force_bucket is set (e.g. group @mention → always To-Do) we skip
+        # list detection to honour the caller's intent directly.
+        if not force_bucket:
+            regex_list = self.list_service._regex_detect(content)
+            if regex_list and regex_list.get("intent") == "create_or_add" and regex_list.get("items"):
+                if not _LIST_DATE_RE.search(content):
+                    list_bucket = "Remember"
+                    from services.classifier_service import classifier_service, CONF_THRESHOLD
+                    if classifier_service.is_ready:
+                        _b, _conf = classifier_service.classify(content)
+                        if _conf >= CONF_THRESHOLD and _b in ("To-Do", "Remember", "Track"):
+                            list_bucket = _b
+                    print(f"[processor] regex_list hit: {regex_list['list_name']!r} ({len(regex_list['items'])} items), bucket={list_bucket}")
+                    return await self._handle_list_save_direct(
+                        user, regex_list["list_name"], regex_list["list_type"], regex_list["items"], db,
+                        group_id=group_id, bucket=list_bucket,
+                    )
 
         # ── Single LLM call: multi-action intent parse ────────────
         from services.intent_service import get_intent_service
@@ -357,6 +357,8 @@ class MessageProcessor:
         parsed     = await intent_svc.parse(
             content, user.name, user.timezone or "Asia/Kolkata",
             check_query=not skip_query,
+            force_bucket=force_bucket,
+            no_llm_fallback=no_llm_fallback,
         )
 
         actions = parsed.get("actions", {})
