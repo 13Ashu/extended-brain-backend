@@ -2433,6 +2433,9 @@ async def get_assigned_messages(
     for msg, cat, sender in rows:
         tags = msg.tags if isinstance(msg.tags, dict) else {}
         bucket = tags.get("primary_bucket") or tags.get("intent_bucket") or (cat.name if cat else "To-Do")
+        raw_items = tags.get("subtasks", [])
+        items = [{"task": s["task"], "done": s.get("done", False)}
+                 for s in raw_items if isinstance(s, dict) and "task" in s]
         messages.append({
             "id":             msg.id,
             "content":        msg.content,
@@ -2447,6 +2450,7 @@ async def get_assigned_messages(
             "due_date":       tags.get("due_date"),
             "is_done":        bool(tags.get("done", False)),
             "is_list":        bool(tags.get("is_list", False)),
+            "items":          items,
             "group_id":       msg.group_id,
             "sender_name":    sender.name,
             "assigned_to_user_id": msg.assigned_to_user_id,
@@ -2604,6 +2608,9 @@ async def bootstrap(
     def _serialize(msg, cat, sender):
         tags = msg.tags if isinstance(msg.tags, dict) else {}
         bucket = tags.get("primary_bucket") or tags.get("intent_bucket") or (cat.name if cat else "Random")
+        raw_items = tags.get("subtasks", [])
+        items = [{"task": s["task"], "done": s.get("done", False)}
+                 for s in raw_items if isinstance(s, dict) and "task" in s]
         return {
             "id":                  msg.id,
             "content":             msg.content,
@@ -2618,6 +2625,7 @@ async def bootstrap(
             "due_date":            tags.get("due_date"),
             "is_done":             bool(tags.get("done", False)),
             "is_list":             bool(tags.get("is_list", False)),
+            "items":               items,
             "event_time":          tags.get("event_time"),
             "events":              tags.get("events", []),
             "starred":             tags.get("starred", False),
@@ -2650,6 +2658,9 @@ async def bootstrap(
     for msg, cat, sender in assigned_rows.all():
         tags = msg.tags if isinstance(msg.tags, dict) else {}
         bucket = tags.get("primary_bucket") or tags.get("intent_bucket") or (cat.name if cat else "To-Do")
+        raw_items = tags.get("subtasks", [])
+        items = [{"task": s["task"], "done": s.get("done", False)}
+                 for s in raw_items if isinstance(s, dict) and "task" in s]
         assigned.append({
             "id":                  msg.id,
             "content":             msg.content,
@@ -2664,6 +2675,7 @@ async def bootstrap(
             "due_date":            tags.get("due_date"),
             "is_done":             bool(tags.get("done", False)),
             "is_list":             bool(tags.get("is_list", False)),
+            "items":               items,
             "group_id":            msg.group_id,
             "sender_name":         sender.name,
             "assigned_to_user_id": msg.assigned_to_user_id,
@@ -2760,6 +2772,9 @@ async def get_recent_messages(
             or (cat.name if cat else "Random")
         )
         due_date_val = tags.get("due_date")
+        raw_items = tags.get("subtasks", [])
+        items = [{"task": s["task"], "done": s.get("done", False)}
+                 for s in raw_items if isinstance(s, dict) and "task" in s]
         messages.append({
             "id":                    msg.id,
             "content":               msg.content,
@@ -2774,6 +2789,7 @@ async def get_recent_messages(
             "due_date":              due_date_val,
             "is_done":               bool(tags.get("done", False)),
             "is_list":               bool(tags.get("is_list", False)),
+            "items":                 items,
             "event_time":            tags.get("event_time"),
             "events":                tags.get("events", []),
             "starred":               tags.get("starred", False),
