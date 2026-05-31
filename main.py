@@ -2449,6 +2449,7 @@ async def get_assigned_messages(
             "group_id":       msg.group_id,
             "sender_name":    sender.name,
             "assigned_to_user_id": msg.assigned_to_user_id,
+            "assignments":    tags.get("assignments", []),
         })
     return {"success": True, "results": messages, "total": len(messages)}
 
@@ -2664,6 +2665,7 @@ async def bootstrap(
             "sender_name":         sender.name,
             "assigned_to_user_id": msg.assigned_to_user_id,
             "sender_id":           msg.user_id,
+            "assignments":         tags.get("assignments", []),
         })
 
     # 4. Unread counts ────────────────────────────────────────────────
