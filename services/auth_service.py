@@ -211,6 +211,8 @@ class AuthService:
             user = None
             if email:
                 user = await db.scalar(select(User).where(User.email == email))
+            if not user and email:
+                user = await db.scalar(select(User).where(User.phone_number == email))
             if not user and phone_number:
                 user = await db.scalar(select(User).where(User.phone_number == phone_number))
 
