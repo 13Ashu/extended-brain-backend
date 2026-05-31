@@ -45,8 +45,14 @@ class GroupService:
         return None
 
     async def invite_member(
-        self, inviter: User, phone_number: str, db: AsyncSession
+        self, inviter: User, identifier: str, db: AsyncSession
     ) -> Dict[str, Any]:
+        """
+        identifier: phone number (e.g. +919876543210) or email address.
+        When an email is given we look up the user and store their actual
+        phone_number (which may be google|uid / apple|uid) so that my-invites
+        and accept-invite matching continue to work without schema changes.
+        """
         if not inviter.is_pro:
             return {"success": False, "message": "You need a Pro plan to invite members."}
 
@@ -62,7 +68,18 @@ class GroupService:
         if count >= acct.max_members - 1:  # owner counts as 1
             return {"success": False, "message": f"Your plan allows {acct.max_members} members total. Limit reached."}
 
-        # Check if already invited
+        # Resolve the identifier to the invitee's canonical phone_number (DB key)
+        is_email = "@" in identifier
+        if is_email:
+            invitee_user = await db.scalar(select(User).where(User.email == identifier))
+            if not invitee_user:
+                return {"success": False, "message": "No account found with that email address. Ask them to sign up first."}
+            phone_number = invitee_user.phone_number  # may be google|uid or apple|uid
+        else:
+            phone_number = identifier
+            invitee_user = await db.scalar(select(User).where(User.phone_number == phone_number))
+
+        # Check if already invited (by resolved phone_number)
         existing = await db.scalar(
             select(ProAccountMember).where(
                 ProAccountMember.account_id == acct.id,
@@ -71,11 +88,10 @@ class GroupService:
         )
         if existing:
             if existing.status == "active":
-                return {"success": False, "message": f"{phone_number} is already an active member."}
+                return {"success": False, "message": f"{invitee_user.name if invitee_user else identifier} is already an active member."}
             # Pending — refresh the token so they can re-join
             token = secrets.token_urlsafe(32)
             existing.invite_token = token
-            invitee_user = await db.scalar(select(User).where(User.phone_number == phone_number))
             await db.commit()
             return {
                 "success": True,
@@ -83,12 +99,10 @@ class GroupService:
                 "invitee_exists": invitee_user is not None,
                 "invitee_name": invitee_user.name if invitee_user else None,
                 "resent": True,
-                "message": f"Invite resent to {phone_number}",
+                "message": f"Invite resent to {invitee_user.name if invitee_user else identifier}",
             }
 
         token = secrets.token_urlsafe(32)
-        invitee_user = await db.scalar(select(User).where(User.phone_number == phone_number))
-
         member = ProAccountMember(
             account_id=acct.id,
             user_id=invitee_user.id if invitee_user else None,
@@ -105,7 +119,7 @@ class GroupService:
             "invite_token": token,
             "invitee_exists": invitee_user is not None,
             "invitee_name": invitee_user.name if invitee_user else None,
-            "message": f"Invite sent to {phone_number}",
+            "message": f"Invite sent to {invitee_user.name if invitee_user else identifier}",
         }
 
     async def accept_invite(self, token: str, user: User, db: AsyncSession) -> Dict[str, Any]:

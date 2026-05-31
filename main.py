@@ -3634,7 +3634,8 @@ async def get_webhook_info():
 # ================== Pro Plan Endpoints ==================
 
 class InviteRequest(BaseModel):
-    phone_number: str
+    phone_number: Optional[str] = None
+    email: Optional[str] = None
 
 class AcceptInviteRequest(BaseModel):
     token: str
@@ -3682,7 +3683,10 @@ async def invite_member(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await grp_svc.invite_member(current_user, req.phone_number, db)
+    identifier = req.email or req.phone_number
+    if not identifier:
+        raise HTTPException(status_code=400, detail="Provide a phone number or email address.")
+    result = await grp_svc.invite_member(current_user, identifier, db)
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["message"])
     return result
