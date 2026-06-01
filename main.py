@@ -280,10 +280,15 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    from services.classifier_service import classifier_service
     return {
-        "status":    "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "platform":  get_platform_name(),
+        "status":      "healthy",
+        "timestamp":   datetime.now().isoformat(),
+        "platform":    get_platform_name(),
+        "classifier":  {
+            "ready":   classifier_service.is_ready,
+            "classes": list(classifier_service._classes) if classifier_service.is_ready else [],
+        },
     }
 
 
