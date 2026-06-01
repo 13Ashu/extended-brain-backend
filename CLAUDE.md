@@ -229,11 +229,15 @@ All models in `database.py`. Uses SQLAlchemy 2.0 async with `asyncpg`.
 - `id` (PK), `user_id` (FK), `group_id` (FK, nullable), `category_id` (FK, nullable)
 - `content` (TEXT), `message_type` (enum: text/image/audio/pdf/link)
 - `media_url` (nullable), `summary` (nullable)
-- `tags` (JSONB): `{buckets, primary_bucket, priority, due_date, event_time, done, reminded_at, original_dump, split_from, assignments, group_reminder, ...}`
+- `tags` (JSONB): `{buckets, primary_bucket, priority, due_date, event_time, done, reminded_at, original_dump, split_from, assignments, group_reminder, expense_amount, expense_category, expense_payer_id, expense_payer_name, ...}`
   - `assignments`: `[{user_id, name, phone, done, done_at}]` — per-assignee completion slots for group @mention tasks
   - `group_reminder`: `true` — set when a group message has a due time but no specific @mention (fires APNs to all members)
   - `original_dump`: original capture text (for retrieval when LLM paraphrases single tasks)
   - `split_from`: original multi-task dump text (for retrieval of split tasks)
+  - `expense_amount`: `float` — set by the Spent chip; forces bucket = Track
+  - `expense_category`: `string` — one of the 12 bank-style categories (Food & Dining, Transport, etc.)
+  - `expense_payer_id`: `int` — user ID of who paid; defaults to capturing user when not supplied
+  - `expense_payer_name`: `string` — display name of payer; used in group expense summary and payer chip
 - `entities` (JSONB): `{people, locations, dates, numbers}`
 - `embedding` (pgvector, 1536 dims)
 - `created_at`
