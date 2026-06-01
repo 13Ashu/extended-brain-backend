@@ -504,10 +504,12 @@ class ListService:
         if msg:
             return msg
 
-        # Key words from the query (excluding generic words)
+        # Key words from the query — exclude generic skip words AND neutral category labels
+        # (_BLOCKED_NAME_WORDS contains "tasks", "task", "work", "things", etc. which are too
+        # common to be meaningful fuzzy keys and cause false matches across unrelated lists)
         key_words = [
             w for w in list_name.lower().split()
-            if w not in SKIP_WORDS | {"list", "bag", "checklist", "shopping", "grocery"}
+            if w not in SKIP_WORDS | {"list", "bag", "checklist", "shopping", "grocery"} | _BLOCKED_NAME_WORDS
             and len(w) > 2
         ]
 
@@ -581,7 +583,12 @@ class ListService:
         When group_id is provided, the list is shared across the group.
         Returns (message, items_added, was_created).
         """
-        msg = await self.find_best_matching_list(user_id, list_name, db, group_id=group_id)
+        # Time-bounded captures (due_date provided = "for today", "this week", etc.) are
+        # always fresh — never merge them with a previous list of the same name.
+        if due_date:
+            msg = None
+        else:
+            msg = await self.find_best_matching_list(user_id, list_name, db, group_id=group_id)
 
         if not msg:
             msg = await self._create_list(user_id, list_name, list_type, items, db,
