@@ -236,11 +236,15 @@ class TelegramLinkRequest(BaseModel):
 
 
 class MessageCreate(BaseModel):
-    content:      str
-    message_type: MessageTypeEnum = MessageTypeEnum.TEXT
-    media_url:    Optional[str]   = None
-    metadata:     Optional[Dict[str, Any]] = None
-    group_id:     Optional[int]   = None
+    content:          str
+    message_type:     MessageTypeEnum = MessageTypeEnum.TEXT
+    media_url:        Optional[str]   = None
+    metadata:         Optional[Dict[str, Any]] = None
+    group_id:         Optional[int]   = None
+    expense_amount:   Optional[float] = None
+    expense_category: Optional[str]   = None
+    expense_payer_id:   Optional[int] = None
+    expense_payer_name: Optional[str] = None
 
 
 class SearchQuery(BaseModel):
@@ -3006,7 +3010,7 @@ async def capture_message(
         skip_query=True,
         group_id=group_id,
         # @mention tasks are always To-Do — skip classifier/LLM entirely
-        force_bucket="To-Do" if assignments else None,
+        force_bucket="Track" if message.expense_amount is not None else ("To-Do" if assignments else None),
         # All group captures: use classifier or rule-based fallback, never LLM
         no_llm_fallback=bool(group_id),
     )
@@ -3152,6 +3156,28 @@ async def capture_message(
                         result["essence"] = f"{result['essence']} · {rule_str}"
         except Exception as e:
             print(f"[capture] Recurrence detection failed: {e}")
+
+    # ── Expense metadata ─────────────────────────────────────────────
+    if message.expense_amount is not None and result.get("message_id"):
+        import json as _json_exp
+        # Always record who paid — default to the person capturing the expense
+        payer_id   = message.expense_payer_id   if message.expense_payer_id   is not None else current_user.id
+        payer_name = message.expense_payer_name if message.expense_payer_name else current_user.name
+        expense_tags = {
+            "expense_amount":   message.expense_amount,
+            "expense_category": message.expense_category or "Others",
+            "expense_payer_id":   payer_id,
+            "expense_payer_name": payer_name,
+        }
+        await db.execute(
+            text("UPDATE messages SET tags = tags || CAST(:extra AS jsonb) WHERE id = :mid")
+            .bindparams(extra=_json_exp.dumps(expense_tags), mid=result["message_id"])
+        )
+        await db.commit()
+        result["expense_amount"]   = message.expense_amount
+        result["expense_category"] = message.expense_category or "Others"
+        result["expense_payer_id"]   = payer_id
+        result["expense_payer_name"] = payer_name
 
     return {"success": True, "message": "Content captured successfully", "data": result}
 
