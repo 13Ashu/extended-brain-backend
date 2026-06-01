@@ -402,9 +402,13 @@ class MessageProcessor:
                 )
 
         # ── Track ─────────────────────────────────────────────────
-        if actions.get("save_as_track") and parsed.get("track"):
+        # parsed["track"] may be absent when force_bucket="Track" (e.g. expense
+        # chip) — _build_from_bucket sets save_as_track but doesn't populate
+        # the track dict. Pass an empty dict; _process_track handles it fine
+        # (falls back to content[:80] as summary).
+        if actions.get("save_as_track"):
             return await self._process_track(
-                user=user, track=parsed["track"], content=content,
+                user=user, track=parsed.get("track") or {}, content=content,
                 message_type=message_type, media_url=media_url, db=db, ref=ref
             )
 
