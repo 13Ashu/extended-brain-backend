@@ -51,9 +51,12 @@ async def lifespan(app: FastAPI):
     await init_db()
     print("✓ Database initialized")
 
-    # Load ONNX intent classifier (non-blocking — falls back to Gemini if missing)
+    # Load ONNX intent classifier in a thread so the event loop stays responsive
+    # during the backbone download (can take 10–30s on first deploy).
+    # Falls back to Gemini if the file is unavailable.
     from services.classifier_service import classifier_service
-    ok = classifier_service.load()
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(None, classifier_service.load)
     print(f"{'✓ Intent classifier loaded (ONNX)' if ok else '⚠ Intent classifier not loaded — using Gemini'}")
 
     from services.reminder_service import Reminder

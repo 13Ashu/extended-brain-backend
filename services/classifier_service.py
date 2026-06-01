@@ -53,15 +53,26 @@ class ClassifierService:
         url = os.environ.get("BACKBONE_ONNX_URL", "").strip()
         if not url:
             return
+
         import urllib.request
-        logger.info(f"[classifier] backbone.onnx not found locally — downloading from BACKBONE_ONNX_URL ...")
+        import time
+
+        logger.info(f"[classifier] backbone.onnx absent — downloading from BACKBONE_ONNX_URL (~86 MB, may take 10–30s) ...")
         os.makedirs(self._model_dir, exist_ok=True)
         tmp_path = onnx_path + ".tmp"
+        t0 = time.time()
+
+        def _progress(block_count, block_size, total_size):
+            if total_size > 0 and block_count % 500 == 0:
+                pct = min(100, int(block_count * block_size * 100 / total_size))
+                logger.info(f"[classifier] downloading... {pct}%")
+
         try:
-            urllib.request.urlretrieve(url, tmp_path)
+            urllib.request.urlretrieve(url, tmp_path, reporthook=_progress)
             os.rename(tmp_path, onnx_path)
+            elapsed = time.time() - t0
             size_mb = os.path.getsize(onnx_path) // 1_000_000
-            logger.info(f"[classifier] backbone.onnx downloaded ({size_mb} MB)")
+            logger.info(f"[classifier] backbone.onnx downloaded ({size_mb} MB in {elapsed:.1f}s)")
         except Exception as e:
             logger.error(f"[classifier] backbone.onnx download failed: {e}")
             if os.path.exists(tmp_path):

@@ -468,6 +468,11 @@ class MessageProcessor:
         due_date: Optional[str] = None,
         bucket: str = "Remember",
     ) -> Dict:
+        # To-Do lists with no explicit date default to today so they appear
+        # under TODAY in the iOS TodoView instead of SOMEDAY.
+        if bucket == "To-Do" and not due_date:
+            due_date = _today_str()
+
         msg, added, was_created = await self.list_service.create_or_add(
             user.id, list_name, list_type, items, db,
             group_id=group_id, due_date=due_date, bucket=bucket,

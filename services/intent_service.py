@@ -389,17 +389,38 @@ class IntentService:
                 if self._infer_meridiem(lc, h) and h != 12:
                     h += 12
                 time_str = f"{h:02d}:{mins:02d}"
+            else:
+                # Relative time: "in 30 minutes" / "in 2 hours" / "after 45 mins"
+                # Compute absolute time from now so reminder fires at the right moment.
+                rel_m = re.search(r"\b(?:in|after)\s+(\d+)\s*(?:min|mins|minute|minutes)\b", lc)
+                rel_h = re.search(r"\b(?:in|after)\s+(\d+)\s*(?:hour|hours|hr|hrs)\b", lc)
+                if rel_m or rel_h:
+                    from datetime import datetime as _dt
+                    from zoneinfo import ZoneInfo as _ZI
+                    _now = _dt.now(_ZI("Asia/Kolkata"))
+                    if rel_m:
+                        _target = _now + timedelta(minutes=int(rel_m.group(1)))
+                    else:
+                        _target = _now + timedelta(hours=int(rel_h.group(1)))
+                    time_str = _target.strftime("%H:%M")
+                    date_str = _target.strftime("%Y-%m-%d")  # may cross midnight
 
         # Date: "today", "tomorrow", day-of-week
-        if "today" in lc or "tonight" in lc:
-            date_str = today
-        elif "tomorrow" in lc:
-            date_str = tomorrow
-        else:
-            for day_name, day_date in day_map.items():
-                if day_name in lc:
-                    date_str = day_date
-                    break
+        if not date_str:
+            if "today" in lc:
+                date_str = today
+            elif "tonight" in lc or "this evening" in lc:
+                date_str = today
+                # "tonight" / "this evening" with no explicit time → default 20:00
+                if not time_str:
+                    time_str = "20:00"
+            elif "tomorrow" in lc:
+                date_str = tomorrow
+            else:
+                for day_name, day_date in day_map.items():
+                    if day_name in lc:
+                        date_str = day_date
+                        break
 
         if not date_str:
             date_str = today
@@ -424,13 +445,13 @@ class IntentService:
             priority = "high"
 
         # ── Bullet list for To-Do with 2+ items ──────────────────────
-        # "issues for today:\n- a\n- b" → store as is_list=True so
-        # TodoView renders it as an expandable ListTodoRow instead of
-        # a flat text blob.
+        # Named header + bullets → is_list=True (expandable ListTodoRow).
+        # Neutral headers (todo/tasks/today/tomorrow/this week) → individual To-Do rows,
+        # matching the LLM NEUTRAL HEADER RULE so fast and slow paths behave the same.
         if bucket == "To-Do":
             has_bullets = bool(re.search(r'\n\s*[-*•]|\n\s*\d+[.)]', content))
             if has_bullets:
-                from services.list_service import _extract_items_from_content
+                from services.list_service import _extract_items_from_content, _BLOCKED_NAME_WORDS
                 items = _extract_items_from_content(content)
                 if len(items) >= 2:
                     header_m = re.match(r'^([^\n]+)', content)
@@ -438,6 +459,19 @@ class IntentService:
                         header_m.group(1).strip().rstrip(':').strip()
                         if header_m else ""
                     ) or "Tasks"
+                    # Neutral headers → split as individual tasks (mirrors LLM behaviour)
+                    header_words = set(raw_header.lower().split()) - {"for", "this", "my", "the", "a"}
+                    is_neutral = bool(header_words & _BLOCKED_NAME_WORDS)
+                    if is_neutral:
+                        # Save as separate To-Do tasks, not a named list
+                        result["tasks"] = [
+                            {"task": item, "due_date": date_str, "time": time_str, "priority": priority}
+                            for item in items
+                        ]
+                        result["priority"] = priority
+                        result["essence"]  = content[:100]
+                        return result
+                    # Named header → named list
                     actions["save_as_list"] = True
                     result["list"] = {
                         "list_name": raw_header,
@@ -842,6 +876,7 @@ def _infer_bucket_from_rules(content: str) -> str:
         any(re.search(rf'(?<!\w){re.escape(v)}(?!\w)', clean) for v in _ACTION_VERBS)
         or re.search(r"\b(remind|reminder|don.t forget|notify|alert)\b", clean)
         or re.search(r"\b(\d{1,2}(am|pm)|\d{1,2}:\d{2}|noon|midnight|today|tomorrow)\b", clean)
+        or re.search(r"\b(in|after)\s+\d+\s*(min|mins|minute|minutes|hour|hours|hr|hrs)\b", clean)
     ):
         return "To-Do"
 
