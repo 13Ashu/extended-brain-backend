@@ -459,9 +459,12 @@ class IntentService:
                         header_m.group(1).strip().rstrip(':').strip()
                         if header_m else ""
                     ) or "Tasks"
-                    # Neutral headers → split as individual tasks (mirrors LLM behaviour)
-                    header_words = set(raw_header.lower().split()) - {"for", "this", "my", "the", "a"}
-                    is_neutral = bool(header_words & _BLOCKED_NAME_WORDS)
+                    # Neutral headers → split as individual tasks (mirrors LLM behaviour).
+                    # Neutral = ALL non-stopword words are blocked words (e.g. "todo for today").
+                    # Named qualifier present (e.g. "Em issues for today", "Office work") → named list.
+                    _h_stopwords = {"for", "this", "my", "the", "a", "an", "of", "in", "on"}
+                    header_words = set(raw_header.lower().split()) - _h_stopwords
+                    is_neutral = not bool(header_words - _BLOCKED_NAME_WORDS)
                     if is_neutral:
                         # Save as separate To-Do tasks, not a named list
                         result["tasks"] = [

@@ -900,16 +900,17 @@ INDIVIDUAL_CASES: List[Dict] = [
         "dump": "Breakfast meeting at 8",
         "group_id": None,
         "expected": {
-            "category":         "Remember",   # ⚠ ONNX (0.79) fast mode; LLM returns Events
+            "category":         "To-Do",
             "is_list":          False,
-            "set_reminder":     False,
-            "ios_section_contains": "Not in TodoView",
+            "set_reminder":     True,
+            "has_time":         True,
+            "due_date_label":   "today",
+            "ios_section_contains": "TIMED TODAY",
         },
         "dump_response": "Event saved for today at 8 AM — reminder set",
         "notes": (
-            "⚠ Fast-mode only gap: ONNX (0.79) classifies as Remember. "
-            "With Gemini LLM (production): save_as_event=true + time=08:00 → TIMED TODAY. "
-            "Add more 'meeting at N' Events training examples to fix this."
+            "v4 model correctly classifies as To-Do/Events with time=08:00. "
+            "Previous v3 was classifying as Remember (fast-mode gap). Now fixed."
         ),
     },
 
@@ -1085,25 +1086,115 @@ INDIVIDUAL_CASES: List[Dict] = [
     # ── TC-I-30 ────────────────────────────────────────────────────────────────
     {
         "id": "I-30",
-        "name": "Ambiguous bare hour '4' → infers PM",
+        "name": "Bare meeting with time → To-Do with reminder",
         "dump": "meeting at 4",
         "group_id": None,
         "expected": {
-            "category":         "Random",   # --fast mode: ONNX < 0.50 + no Gemini → Random
+            "category":         "To-Do",
+            "is_list":          False,
+            "set_reminder":     True,
+            "has_time":         True,
+            "due_date_label":   "today",
+            "ios_section_contains": "TIMED TODAY",
+        },
+        "dump_response": "Event saved for today at 4 PM",
+        "notes": (
+            "v4 model correctly classifies 'meeting at 4' as To-Do with 4PM reminder. "
+            "Previous v3 fell through to Random (confidence too low). Now fixed."
+        ),
+    },
+
+    # ── TC-I-31 ────────────────────────────────────────────────────────────────
+    {
+        "id": "I-31",
+        "name": "Project issues + today header — To-Do, named list",
+        "dump": "Em issues for today:\n- Gets saved as remember and list, but retreival not as list\n- Remind me to chip testing",
+        "group_id": None,
+        "expected": {
+            "category":         "To-Do",
+            "is_list":          True,
+            "set_reminder":     False,
+            "due_date_label":   "today",
+            "ios_section_contains": "TODAY",
+        },
+        "dump_response": "Em Issues For Today — 2 tasks saved",
+        "notes": (
+            "Classifier gap (fixed): ONNX was classifying 'em issues for today' as Ideas. "
+            "Added multi-line bullet To-Do examples in v3 training data. "
+            "Code fix: _name_blocked now allows headers with meaningful qualifiers even if "
+            "they contain time words like 'today'."
+        ),
+    },
+
+    # ── TC-I-32 ────────────────────────────────────────────────────────────────
+    {
+        "id": "I-32",
+        "name": "Work for today header — To-Do, named list",
+        "dump": "work for today:\n- Remind me to\n- Remember and List saved, but list format not retreived\n- fix the search bug",
+        "group_id": None,
+        "expected": {
+            "category":         "To-Do",
+            "is_list":          True,
+            "set_reminder":     False,
+            "due_date_label":   "today",
+            "ios_section_contains": "TODAY",
+        },
+        "dump_response": "Work For Today — 3 tasks saved",
+        "notes": (
+            "Classifier gap (fixed): ONNX was returning confidence 0.43 (below threshold). "
+            "With v3 training data 'work for today' bullet lists → To-Do. "
+            "Code fix: _name_blocked now recognises 'work' as a qualifier → named list."
+        ),
+    },
+
+    # ── TC-I-33 ────────────────────────────────────────────────────────────────
+    {
+        "id": "I-33",
+        "name": "Movies to watch — Remember bullet list",
+        "dump": "Movies to watch:\n- Interstellar\n- Dune 2\n- Oppenheimer",
+        "group_id": None,
+        "expected": {
+            "category":         "Remember",
+            "is_list":          True,
+            "set_reminder":     False,
+            "ios_section_contains": "Not in TodoView",
+        },
+        "dump_response": "Movies To Watch List — 3 items saved",
+        "notes": "Watchlist pattern. Classifier → Remember. list_type=watching. Not in TodoView.",
+    },
+
+    # ── TC-I-34 ────────────────────────────────────────────────────────────────
+    {
+        "id": "I-34",
+        "name": "Bucket list — Remember bullet list",
+        "dump": "Bucket list:\n- travel to Japan\n- learn guitar\n- run a marathon",
+        "group_id": None,
+        "expected": {
+            "category":         "Remember",
+            "is_list":          True,
+            "set_reminder":     False,
+            "ios_section_contains": "Not in TodoView",
+        },
+        "dump_response": "Bucket List — 3 items saved",
+        "notes": "Life goals reference list → Remember, not To-Do.",
+    },
+
+    # ── TC-I-35 ────────────────────────────────────────────────────────────────
+    {
+        "id": "I-35",
+        "name": "Daily health log — Track bullet list",
+        "dump": "daily metrics:\n- steps 8500\n- sleep 6.5h\n- water 1.8L\n- weight 74kg",
+        "group_id": None,
+        "expected": {
+            "category":         "Track",
             "is_list":          False,
             "set_reminder":     False,
             "ios_section_contains": "Not in TodoView",
         },
-        "dump_response": "Event saved for today at 4 PM",
-        "notes": (
-            "Very short text. ONNX confidence below 0.50. "
-            "--fast mode (no Gemini): falls back to Random. "
-            "In production with Gemini: save_as_event=true, time=16:00 (infers PM) → TIMED TODAY. "
-            "This is a fast-mode limitation, not a bug."
-        ),
+        "dump_response": "Health log saved: steps, sleep, water, weight",
+        "notes": "Multiple numeric health signals in bullets → Track. Not a persistent list.",
     },
 ]
-
 
 GROUP_CASES: List[Dict] = [
 

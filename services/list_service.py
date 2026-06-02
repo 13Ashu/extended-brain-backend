@@ -96,9 +96,18 @@ LIST_SHOW_PATTERNS = [
 
 
 def _name_blocked(name: str) -> bool:
-    """Return True if name looks like a neutral time/category label, not a named list."""
-    words = set(name.lower().split())
-    return bool(words & _BLOCKED_NAME_WORDS) or "to-do" in name or "to do" in name
+    """Return True if name is purely a neutral time/category label with no meaningful qualifier.
+
+    A name with a real qualifier ('Em issues for today', 'Work for today') is NOT blocked
+    even if it contains a time word like 'today'. Only pure time/category labels with no
+    distinguishing qualifier ('todo', 'tasks', 'today') are blocked.
+    """
+    if "to-do" in name or "to do" in name:
+        return True
+    _stopwords = {"for", "this", "my", "the", "a", "an", "of", "in", "on", "at", "to", "from"}
+    words = set(name.lower().split()) - _stopwords
+    # Blocked only when ALL remaining words are neutral category/time words
+    return not bool(words - _BLOCKED_NAME_WORDS)
 
 
 def _has_list_signal(text: str) -> bool:

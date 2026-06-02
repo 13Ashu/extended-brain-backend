@@ -868,9 +868,10 @@ Return ONLY this JSON:
             tags  = message.tags if isinstance(message.tags, dict) else {}
 
             # For list messages, always surface items as a top-level field so the
-            # iOS itemsDirect field is populated regardless of which search path was hit.
+            # iOS itemsDirect field is populated. Check is_list flag (not legacy "List" bucket).
+            is_list = bool(tags.get("is_list", False))
             list_items = None
-            if "List" in tags.get("all_buckets", []):
+            if is_list:
                 subtasks   = tags.get("subtasks", [])
                 list_items = [
                     {"task": s["task"], "done": s.get("done", False)}
@@ -891,6 +892,8 @@ Return ONLY this JSON:
                 "due_date":     tags.get("due_date"),
                 "event_time":   tags.get("event_time"),
                 "events":       tags.get("events", []),
+                "is_list":      is_list,
+                "is_done":      bool(tags.get("done", False)),
                 "relevance":    score,
                 "preview":      self._preview(message.content, expansion.get("keywords", [])),
                 "_saved_date":  message.created_at.strftime("%Y-%m-%d"),
