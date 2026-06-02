@@ -2467,6 +2467,10 @@ async def get_assigned_messages(
             "sender_name":    sender.name,
             "assigned_to_user_id": msg.assigned_to_user_id,
             "assignments":    tags.get("assignments", []),
+            "expense_amount":   tags.get("expense_amount"),
+            "expense_category": tags.get("expense_category"),
+            "expense_payer_id":   tags.get("expense_payer_id"),
+            "expense_payer_name": tags.get("expense_payer_name"),
         })
     return {"success": True, "results": messages, "total": len(messages)}
 
@@ -2645,6 +2649,10 @@ async def bootstrap(
             "assigned_to_user_id": msg.assigned_to_user_id,
             "sender_name":         sender.name if sender else None,
             "sender_id":           msg.user_id,
+            "expense_amount":      tags.get("expense_amount"),
+            "expense_category":    tags.get("expense_category"),
+            "expense_payer_id":    tags.get("expense_payer_id"),
+            "expense_payer_name":  tags.get("expense_payer_name"),
         }
 
     recent = [_serialize(m, c, s) for m, c, s in recent_rows.all()]
