@@ -246,7 +246,7 @@ class ProAccountMember(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     account_id: Mapped[int] = mapped_column(ForeignKey("pro_accounts.id"), index=True)
     user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    phone_number: Mapped[str] = mapped_column(String(20), index=True)
+    phone_number: Mapped[str] = mapped_column(String(100), index=True)
     invited_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     invite_token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     status: Mapped[str] = mapped_column(String(20), default="pending")
@@ -396,6 +396,7 @@ async def init_db():
             "CREATE TABLE IF NOT EXISTS label_annotations (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), message_id INTEGER REFERENCES messages(id), text TEXT NOT NULL, label VARCHAR(50) NOT NULL, source VARCHAR(30) DEFAULT 'user_correction', created_at TIMESTAMP DEFAULT NOW())",
             "CREATE INDEX IF NOT EXISTS idx_label_annotations_user ON label_annotations(user_id)",
             "ALTER TABLE users ALTER COLUMN occupation DROP NOT NULL",
+            "ALTER TABLE pro_account_members ALTER COLUMN phone_number TYPE VARCHAR(100)",
         ]
         for stmt in migrations:
             try:
