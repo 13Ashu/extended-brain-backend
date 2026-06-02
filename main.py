@@ -259,6 +259,10 @@ class DoneRequest(BaseModel):
     done: bool = True
 
 
+class RemindAtRequest(BaseModel):
+    remind_at: str  # ISO 8601 datetime with timezone, e.g. "2026-06-02T18:00:00+05:30"
+
+
 class CategoryOperation(BaseModel):
     operation:     str
     category_name: Optional[str] = None
@@ -3000,6 +3004,63 @@ async def snooze_reminder(
     return {"success": True, "remind_at": snoozed.remind_at.isoformat()}
 
 
+@app.patch("/api/messages/{message_id}/remind-at")
+async def set_remind_at(
+    message_id: int,
+    body: RemindAtRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set (or update) a reminder time for a saved To-Do that has no time yet."""
+    msg = await db.scalar(
+        select(Message).where(Message.id == message_id, Message.user_id == current_user.id)
+    )
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    # Parse the ISO datetime the iOS app sends (e.g. "2026-06-02T18:00:00+05:30")
+    try:
+        remind_dt = datetime.fromisoformat(body.remind_at)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="remind_at must be an ISO 8601 datetime")
+
+    # Decompose into date + time for reminder_service
+    from zoneinfo import ZoneInfo as _ZI
+    user_tz = current_user.timezone or "Asia/Kolkata"
+    local_dt = remind_dt.astimezone(_ZI(user_tz))
+    analysis = {
+        "event_time":  local_dt.strftime("%H:%M"),
+        "due_date":    local_dt.strftime("%Y-%m-%d"),
+        "priority":    "normal",
+        "actionables": [msg.content[:120]],
+        "essence":     msg.summary or msg.content[:80],
+    }
+
+    reminder = await reminder_service.create(
+        user=current_user,
+        content=msg.content,
+        analysis=analysis,
+        message_id=message_id,
+        db=db,
+    )
+    if not reminder:
+        raise HTTPException(status_code=500, detail="Could not create reminder")
+
+    import json as _json_ra
+    new_tags = {"remind_at": reminder.remind_at.isoformat(), "needs_time": False}
+    await db.execute(
+        text("UPDATE messages SET tags = tags || CAST(:extra AS jsonb) WHERE id = :mid")
+        .bindparams(extra=_json_ra.dumps(new_tags), mid=message_id)
+    )
+    await db.commit()
+
+    return {
+        "success":     True,
+        "remind_at":   reminder.remind_at.isoformat(),
+        "reminder_id": reminder.id,
+    }
+
+
 @app.post("/api/messages/capture")
 async def capture_message(
     message: MessageCreate,
@@ -3150,6 +3211,24 @@ async def capture_message(
                         )
                 except Exception as e:
                     print(f"[push] group reminder notify failed for uid={muid}: {e}")
+
+    # ── Needs-time flag: reminder keyword present but no time extracted ──
+    # Signals to iOS that the capture should prompt the user to set a time.
+    _REMINDER_KW = {"remind", "reminder", "don't forget", "alert", "notify", "ping"}
+    if (
+        result.get("category") == "To-Do"
+        and not result.get("remind_at")
+        and any(kw in content.lower() for kw in _REMINDER_KW)
+        and result.get("message_id")
+        and not group_id
+    ):
+        result["needs_time"] = True
+        import json as _json_nt
+        await db.execute(
+            text("UPDATE messages SET tags = tags || '{\"needs_time\": true}'::jsonb WHERE id = :mid")
+            .bindparams(mid=result["message_id"])
+        )
+        await db.commit()
 
     # ── Recurring task detection (personal captures only) ────────────
     # Group context uses @mention/assignment flow instead.
