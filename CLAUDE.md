@@ -43,8 +43,9 @@ extended-brain-backend/
 │
 ├── models/                   ← ML model weights (not fully in git)
 │   └── intent_classifier/    ← ONNX intent classifier (loaded at startup)
-│       ├── backbone.onnx     ← fine-tuned all-MiniLM-L6-v2 (90 MB, .gitignored)
-│       ├── head_weights.npz  ← logistic regression weights (12 KB, in git)
+│       ├── backbone.onnx     ← fine-tuned all-MiniLM-L6-v2 v4 (86 MB, .gitignored — deployed via GitHub release)
+│       ├── head_weights.npz  ← logistic regression weights (in git)
+│       ├── input_prefix.txt  ← empty for MiniLM-L6 (contains "query: " for E5 models)
 │       └── tokenizer_*.json  ← tokenizer files (in git)
 │
 ├── services/                 ← 23 focused service modules
@@ -406,8 +407,10 @@ classifier_service.classify(text)        ← ONNX, ~10ms, no network
 ```
 
 **Fast path** (`services/classifier_service.py`):
-- Loads `models/intent_classifier/backbone.onnx` + `head_weights.npz` at startup via `lifespan()`
-- Tokenizes with `AutoTokenizer` (all-MiniLM-L6-v2), runs ONNX inference, applies sklearn LogisticRegression head
+- Loads `models/intent_classifier/backbone.onnx` + `head_weights.npz` + `input_prefix.txt` at startup via `lifespan()`
+- Tokenizes with `AutoTokenizer` (all-MiniLM-L6-v2 v4), runs ONNX inference, applies sklearn LogisticRegression head
+- **v4 accuracy:** 89.7% overall · To-Do recall 94.1% · Events recall 95.5% (722 training examples, GPU contrastive fine-tuning)
+- **Deploy:** backbone.onnx published as GitHub release asset; Railway pulls via `ONNX_MODEL_URL` env var
 - Returns `(bucket: str, confidence: float)`; threshold `CONF_THRESHOLD = 0.50`
 - If model files are absent, `is_ready` stays `False` → falls through to Gemini silently
 
