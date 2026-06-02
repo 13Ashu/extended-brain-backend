@@ -336,6 +336,27 @@ class IntentService:
         actions = result["actions"]
         lc      = self._normalize_time_words(content.lower())
 
+        # Normalise non-standard time notations before the am/pm regex runs,
+        # so that the main pattern always sees clean "H:MM am/pm" strings.
+        #
+        # 1. Decimal: "11.0 am" → "11:00 am", "3.30 pm" → "3:30 pm"
+        #    Without this, \b before the trailing digit (e.g. "0" in "11.0")
+        #    causes the am/pm regex to match "0 am" → midnight (00:00).
+        lc = re.sub(
+            r'\b(\d{1,2})\.(\d{1,2})\s*(am|pm)\b',
+            lambda m: f"{m.group(1)}:{int(m.group(2)):02d} {m.group(3)}",
+            lc
+        )
+        # 2. Space-separated: "3 07 pm" → "3:07 pm", "10 45 am" → "10:45 am"
+        #    Without this, the regex grabs only the minute digits (e.g. "07 pm"
+        #    → 07+12=19:00) and loses the hour entirely, or produces impossible
+        #    values like "30 pm" → 42:00.
+        lc = re.sub(
+            r'\b(\d{1,2})\s+(\d{2})\s*(am|pm)\b',
+            lambda m: f"{m.group(1)}:{m.group(2)} {m.group(3)}",
+            lc
+        )
+
         # ── Query detection (rule-based, only when check_query=True) ─
         if check_query and "?" in content:
             query_signals = {"find", "search", "show", "what did", "where is",
