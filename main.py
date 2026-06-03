@@ -3566,6 +3566,7 @@ async def update_message_content(
 
     from services import redis_cache as _rc
     asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(current_user.id, None)))
+    asyncio.create_task(_rc.cache_del_user_searches(current_user.id))
 
     return {"success": True}
 

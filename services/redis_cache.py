@@ -62,3 +62,27 @@ def search_key(user_id: int, query: str) -> str:
 
 def bootstrap_key(user_id: int, group_id: Optional[int]) -> str:
     return f"em:b:{user_id}:{group_id or 'p'}"
+
+
+async def cache_del_user_searches(user_id: int) -> None:
+    """Delete all search cache entries for a user (called after content edits)."""
+    if not _OK:
+        return
+    try:
+        pattern = f"em:s:{user_id}:*"
+        async with httpx.AsyncClient(timeout=3.0) as c:
+            r = await c.post(
+                f"{_URL}/pipeline",
+                headers=_HEADERS,
+                json=[["KEYS", pattern]],
+            )
+            data = r.json()
+            keys = data[0].get("result", []) if data else []
+            if keys:
+                await c.post(
+                    f"{_URL}/pipeline",
+                    headers=_HEADERS,
+                    json=[["DEL"] + keys],
+                )
+    except Exception:
+        pass
