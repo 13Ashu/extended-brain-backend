@@ -145,8 +145,10 @@ extended-brain-backend/
 | GET | `/api/messages/assigned` | Tasks @assigned to current user (their "Assigned to Me" feed) |
 | GET | `/api/messages/assigned-to-others` | Group tasks the current user assigned to others (their delegation dashboard) |
 | PATCH | `/api/messages/{id}/assignments/{idx}/complete` | Assignee marks their slot done; notifies assigner via APNs + WS broadcast |
+| PATCH | `/api/messages/{id}/assign` | Retroactively assign a group To-Do to a member; body: `{user_id, name, phone}`; updates `assigned_to_user_id` + `tags.assignments`, mirrors To-Do in assignee feed, sends APNs; cannot self-assign; 409 if already assigned to same member |
 | GET | `/api/messages/detail/{id}` | Single message detail |
 | PATCH | `/api/messages/{id}/done` | Mark task done/undone `{"done": bool}` |
+| PATCH | `/api/messages/{id}/content` | Edit message text `{"content": str}` — updates `content` + `summary`; busts bootstrap cache |
 | PATCH | `/api/messages/{id}/items/{idx}/complete` | Check off a list item |
 | DELETE | `/api/messages/{id}` | Delete message |
 

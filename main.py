@@ -2592,6 +2592,124 @@ async def complete_assignment(
     }
 
 
+@app.patch("/api/messages/{message_id}/assign")
+async def assign_message(
+    message_id: int,
+    payload: dict,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retroactively assign an existing group message to a member.
+    Callable by the message owner. Appends to tags.assignments, forces bucket=To-Do,
+    mirrors a personal To-Do for the assignee, and sends APNs."""
+    import json as _json
+
+    msg = await db.get(Message, message_id)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the message owner can assign it")
+    if not msg.group_id:
+        raise HTTPException(status_code=400, detail="Message is not in a group")
+
+    assignee_id   = int(payload.get("user_id", 0))
+    assignee_name = str(payload.get("name", ""))
+    assignee_phone = str(payload.get("phone", ""))
+    if not assignee_id or not assignee_name:
+        raise HTTPException(status_code=422, detail="user_id and name are required")
+    if assignee_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot assign a task to yourself")
+
+    tags: dict = msg.tags if isinstance(msg.tags, dict) else {}
+    assignments: list[dict] = list(tags.get("assignments", []))
+
+    # Prevent duplicate slot for the same assignee
+    if any(a.get("user_id") == assignee_id for a in assignments):
+        raise HTTPException(status_code=409, detail="Already assigned to this member")
+
+    new_slot = {
+        "user_id": assignee_id,
+        "name":    assignee_name,
+        "phone":   assignee_phone,
+        "done":    False,
+        "done_at": None,
+    }
+    assignments.append(new_slot)
+
+    # Update tags AND assigned_to_user_id column so GET /api/messages/assigned works for the assignee.
+    # assigned_to_user_id tracks the primary (most recent) assignee for the single-assignee query path.
+    await db.execute(
+        text(
+            "UPDATE messages "
+            "SET tags = tags || CAST(:extra AS jsonb), "
+            "    assigned_to_user_id = :auid "
+            "WHERE id = :mid"
+        ).bindparams(
+            extra=_json.dumps({
+                "assignments":    assignments,
+                "primary_bucket": "To-Do",
+                "intent_bucket":  "To-Do",
+            }),
+            auid=assignee_id,
+            mid=message_id,
+        )
+    )
+
+    # Mirror a personal To-Do in the assignee's feed (same as capture path)
+    content_preview = msg.summary or msg.content
+    todo_tags = {
+        "primary_bucket":    "To-Do",
+        "intent_bucket":     "To-Do",
+        "assigned_by":       current_user.name,
+        "assigned_by_id":    current_user.id,
+        "group_id":          msg.group_id,
+        "source_message_id": message_id,
+    }
+    mirror = Message(
+        user_id=assignee_id,
+        content=msg.content,
+        message_type=msg.message_type,
+        summary=content_preview[:80],
+        tags=todo_tags,
+        assigned_to_user_id=assignee_id,
+    )
+    db.add(mirror)
+    await db.flush()
+
+    await db.commit()
+
+    # Push notification to assignee
+    try:
+        tokens_rows = await db.execute(
+            select(DeviceToken.token).where(DeviceToken.user_id == assignee_id)
+        )
+        for (token,) in tokens_rows.all():
+            await send_apns_notification(
+                device_token=token,
+                title=f"{current_user.name} assigned you a task",
+                body=content_preview[:80],
+                data={"type": "assignment", "group_id": msg.group_id,
+                      "message_id": message_id},
+            )
+    except Exception as e:
+        print(f"[push] assign notify failed for uid={assignee_id}: {e}")
+
+    # Broadcast to group so other clients refresh
+    asyncio.create_task(ws_manager.broadcast(msg.group_id, {
+        "type":        "assignment_added",
+        "message_id":  message_id,
+        "assigned_to": assignee_name,
+        "assigned_by": current_user.name,
+    }))
+
+    return {
+        "success":     True,
+        "message_id":  message_id,
+        "assignment":  new_slot,
+        "assignments": assignments,
+    }
+
+
 @app.get("/api/bootstrap")
 async def bootstrap(
     group_id: Optional[int] = None,
@@ -3421,6 +3539,33 @@ async def update_message_bucket(
     asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(current_user.id, None)))
     if msg.group_id:
         asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(current_user.id, msg.group_id)))
+
+    return {"success": True}
+
+
+@app.patch("/api/messages/{message_id}/content")
+async def update_message_content(
+    message_id: int,
+    body: dict,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import update as sa_update
+    new_content = (body.get("content") or "").strip()
+    if not new_content:
+        raise HTTPException(status_code=422, detail="content is required")
+
+    result = await db.execute(
+        sa_update(Message)
+        .where(and_(Message.id == message_id, Message.user_id == current_user.id))
+        .values(content=new_content, summary=new_content)
+    )
+    await db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    from services import redis_cache as _rc
+    asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(current_user.id, None)))
 
     return {"success": True}
 
