@@ -208,10 +208,18 @@ def _sniff_buckets_fast(content: str) -> List[str]:
         if "To-Do" not in buckets:
             buckets.append("To-Do")
 
+    # "todo"/"tasks" header + numbered/bulleted list → To-Do
+    if re.search(r'\b(todo|task|tasks|to-do)\b', lc) or (
+        re.search(r'\n\s*\d+[.)]\s|\n\s*[-*•]\s', lc)
+        and re.search(r'\b(today|tomorrow|this week)\b', lc)
+    ):
+        if "To-Do" not in buckets:
+            buckets.append("To-Do")
+
     # Events — requires a specific time OR a named day-of-week.
     # "today" alone does NOT make something an Event; it just anchors a To-Do to today.
     has_specific_time = bool(re.search(
-        r"\b(\d{1,2}(am|pm)|\d{1,2}:\d{2}|noon|midnight|tonight|morning|afternoon|evening)\b", lc
+        r"\b(\d{1,2}\s*(am|pm)|\d{1,2}:\d{2}|noon|midnight|tonight|morning|afternoon|evening)\b", lc
     ))
     has_day_of_week = bool(re.search(
         r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lc
@@ -437,6 +445,8 @@ class MessageProcessor:
             list_result = self.list_service._regex_detect(content)
             if list_result:
                 if list_result["intent"] == "create_or_add" and list_result.get("items"):
+                    from services.intent_service import _infer_bucket_from_rules
+                    fallback_bucket = _infer_bucket_from_rules(content)
                     return await self._handle_list_save_direct(
                         user,
                         list_result["list_name"],
@@ -444,7 +454,7 @@ class MessageProcessor:
                         list_result["items"],
                         db,
                         group_id=group_id,
-                        bucket="Remember",
+                        bucket=fallback_bucket,
                     )
                 elif list_result["intent"] == "show":
                     return {
@@ -629,13 +639,17 @@ class MessageProcessor:
         if not _DATE_RE.match(str(due_date)):
             due_date = _today_str()
 
+        # When the classifier identified this as an event (save_as_event=True),
+        # store it under the Events bucket while keeping To-Do in all_buckets so
+        # it still appears in task lists.
+        primary_bucket = "Events" if actions.get("save_as_event") else "To-Do"
         buckets = ["To-Do"]
         if actions.get("save_as_event") or evt_time:
             buckets.append("Events")
 
         category = await self._get_or_create_category(
-            user_id=user.id, name="To-Do",
-            auto_description=INTENT_BUCKETS["To-Do"], db=db,
+            user_id=user.id, name=primary_bucket,
+            auto_description=INTENT_BUCKETS.get(primary_bucket, INTENT_BUCKETS["To-Do"]), db=db,
         )
 
         tags = {
@@ -647,7 +661,7 @@ class MessageProcessor:
             "time_reference": "today" if due_date == _today_str() else "future",
             "event_time":     evt_time,
             "all_buckets":    buckets,
-            "primary_bucket": "To-Do",
+            "primary_bucket": primary_bucket,
             "due_date":       due_date,
             "events": (
                 [{"date": due_date, "time": evt_time, "label": task_text[:40]}]
@@ -673,12 +687,12 @@ class MessageProcessor:
 
         # Debug: confirm what was stored in DB tags
         stored_tags = msg.tags if isinstance(msg.tags, dict) else {}
-        print(f"[task_save] id={msg.id} stored tags.due_date={stored_tags.get('due_date')!r} "
+        print(f"[task_save] id={msg.id} primary={primary_bucket} due={stored_tags.get('due_date')!r} "
               f"event_time={stored_tags.get('event_time')!r} task='{task_text[:50]}'")
 
         result = {
             "message_id":  msg.id,
-            "category":    "To-Do",
+            "category":    primary_bucket,
             "all_buckets": buckets,
             "tags":        [],
             "essence":     parsed.get("essence") or task_text,

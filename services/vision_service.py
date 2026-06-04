@@ -45,7 +45,7 @@ Return ONLY this JSON, no markdown:
 async def _analyze_with_gemini(
     image_data: bytes,
     mime_type: str,
-    model: str = "gemini-2.0-flash-lite",
+    model: str = "gemini-2.5-flash-lite",
 ) -> Dict:
     api_key = os.getenv("GOOGLE_AI_STUDIO_API_KEY", "")
     if not api_key:
@@ -105,7 +105,7 @@ class VisionService:
 
     def __init__(self):
         self.provider = os.getenv("VISION_PROVIDER", "gemini")
-        self.model    = os.getenv("VISION_MODEL", "gemini-2.0-flash-lite")
+        self.model    = os.getenv("VISION_MODEL", "gemini-2.5-flash-lite")
 
     async def analyze_image(
         self,

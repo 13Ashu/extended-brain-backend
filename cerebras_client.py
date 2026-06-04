@@ -27,11 +27,12 @@ CEREBRAS_BASE_URL   = "https://api.cerebras.ai/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 GEMINI_BASE_URL     = "https://generativelanguage.googleapis.com/v1beta/models"
 
-CEREBRAS_DEFAULT_MODEL = "qwen-3-235b-a22b-instruct-2507"
-CEREBRAS_FALLBACK_MODELS = ["llama3.1-8b"]
+CEREBRAS_DEFAULT_MODEL = "llama-3.3-70b"
+CEREBRAS_FALLBACK_MODELS = ["llama-3.1-8b"]
 OPENROUTER_DEFAULT_MODEL = "google/gemma-3-4b-it:free"
-GEMINI_DEFAULT_MODEL     = "gemini-2.0-flash-lite"   # faster than 2.5-flash-lite, better JSON
-GEMINI_LITE_MODEL = "gemini-2.0-flash-lite"
+GEMINI_DEFAULT_MODEL     = "gemini-2.5-flash-lite"
+GEMINI_LITE_MODEL        = "gemini-2.5-flash-lite"
+GEMINI_FALLBACK_MODELS   = ["gemini-3.1-flash-lite", "gemini-2.5-flash"]
 
 _response_cache: dict = {}  # simple TTL-less cache for identical prompts
 
@@ -132,62 +133,75 @@ class CerebrasClient:
     async def _gemini(self, prompt: str, max_tokens: int, temperature: float, model_override: Optional[str] = None, json_mode: bool = True) -> str:
         global _last_request_time
 
-        model = model_override or self.model
+        # Build model chain: primary + fallbacks in case the primary has limit=0 (deprecated free tier)
+        primary = model_override or self.model
+        models_to_try = [primary] + [m for m in GEMINI_FALLBACK_MODELS if m != primary]
 
-        # Throttle — enforce minimum gap between requests
         now = time.monotonic()
         gap = now - _last_request_time
         if gap < _min_request_gap:
             await asyncio.sleep(_min_request_gap - gap)
         _last_request_time = time.monotonic()
 
-        url = f"{self.base_url}/{model}:generateContent"
         headers = {"Content-Type": "application/json", "X-goog-api-key": self.api_key}
-        gen_config: Dict[str, Any] = {
-            "maxOutputTokens": max_tokens,
-            "temperature": temperature,
-        }
-        if json_mode:
-            gen_config["responseMimeType"] = "application/json"
-        payload = {
-            "system_instruction": {
-                "parts": [{"text": (
-                    "You are a precise assistant. "
-                    "When asked for JSON, output ONLY the JSON object — "
-                    "no markdown, no explanation, no ``` fences."
-                )}]
-            },
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": gen_config,
-        }
 
-        delays = [2, 5, 15]  # more patient backoff
-        for attempt in range(4):
-            try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    resp = await client.post(url, headers=headers, json=payload)
-                    
-                    if resp.status_code == 429:
-                        # Respect Retry-After header if present
-                        retry_after = int(resp.headers.get("Retry-After", delays[min(attempt, 2)]))
-                        print(f"[gemini] 429 rate limit — waiting {retry_after}s (attempt {attempt+1})")
-                        await asyncio.sleep(retry_after)
+        for model in models_to_try:
+            url = f"{self.base_url}/{model}:generateContent"
+            gen_config: Dict[str, Any] = {
+                "maxOutputTokens": max_tokens,
+                "temperature": temperature,
+            }
+            if json_mode:
+                gen_config["responseMimeType"] = "application/json"
+            payload = {
+                "system_instruction": {
+                    "parts": [{"text": (
+                        "You are a precise assistant. "
+                        "When asked for JSON, output ONLY the JSON object — "
+                        "no markdown, no explanation, no ``` fences."
+                    )}]
+                },
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": gen_config,
+            }
+
+            delays = [2, 5, 15]
+            for attempt in range(4):
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        resp = await client.post(url, headers=headers, json=payload)
+
+                        if resp.status_code == 429:
+                            # Check if this is a hard limit=0 (deprecated model) vs a soft rate limit
+                            try:
+                                body = resp.json()
+                                msg = body.get("error", {}).get("message", "")
+                                if "limit: 0" in msg:
+                                    print(f"[gemini] {model} free tier quota is 0 — trying next model")
+                                    break  # skip to next model immediately
+                            except Exception:
+                                pass
+                            retry_after = int(resp.headers.get("Retry-After", delays[min(attempt, 2)]))
+                            print(f"[gemini] 429 rate limit on {model} — waiting {retry_after}s (attempt {attempt+1})")
+                            await asyncio.sleep(retry_after)
+                            continue
+
+                        resp.raise_for_status()
+                        if model != primary:
+                            print(f"[gemini] using fallback model {model}")
+                        return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code in (500, 503) and attempt < 3:
+                        await asyncio.sleep(delays[min(attempt, 2)])
                         continue
-                        
-                    resp.raise_for_status()
-                    return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in (500, 503) and attempt < 3:
-                    await asyncio.sleep(delays[min(attempt, 2)])
-                    continue
-                print(f"[gemini] HTTP {e.response.status_code}: {e.response.text[:200]}")
-                raise
-            except Exception as e:
-                if attempt < 3:
-                    await asyncio.sleep(delays[min(attempt, 2)])
-                    continue
-                raise
+                    print(f"[gemini] HTTP {e.response.status_code} on {model}: {e.response.text[:200]}")
+                    raise
+                except Exception as e:
+                    if attempt < 3:
+                        await asyncio.sleep(delays[min(attempt, 2)])
+                        continue
+                    raise
 
         return "{}"
 

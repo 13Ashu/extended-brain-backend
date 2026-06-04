@@ -150,7 +150,7 @@ class IntentService:
     def __init__(self, cerebras_client: CerebrasClient):
         self.cerebras = cerebras_client
         # Gemini Flash Lite — used for enrichment (essence, entities) and low-confidence fallback
-        self.fast = CerebrasClient(provider="gemini", model="gemini-2.0-flash-lite")
+        self.fast = CerebrasClient(provider="gemini", model="gemini-2.5-flash-lite")
 
     async def parse(
         self,
