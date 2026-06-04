@@ -245,6 +245,7 @@ class MessageCreate(BaseModel):
     expense_category: Optional[str]   = None
     expense_payer_id:   Optional[int] = None
     expense_payer_name: Optional[str] = None
+    force_bucket:     Optional[str]   = None
 
 
 class SearchQuery(BaseModel):
@@ -3201,7 +3202,7 @@ async def capture_message(
         skip_query=True,
         group_id=group_id,
         # @mention tasks are always To-Do — skip classifier/LLM entirely
-        force_bucket="Track" if message.expense_amount is not None else ("To-Do" if assignments else None),
+        force_bucket="Track" if message.expense_amount is not None else ("To-Do" if assignments else (message.force_bucket or None)),
         # All group captures: use classifier or rule-based fallback, never LLM
         no_llm_fallback=bool(group_id),
     )
