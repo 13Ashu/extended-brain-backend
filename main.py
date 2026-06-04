@@ -3123,6 +3123,21 @@ async def snooze_reminder(
     return {"success": True, "remind_at": snoozed.remind_at.isoformat()}
 
 
+@app.delete("/api/reminders/{reminder_id}")
+async def delete_reminder(
+    reminder_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Cancel (soft-delete) a reminder so it no longer appears in the list."""
+    reminder = await db.get(Reminder, reminder_id)
+    if not reminder or reminder.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Reminder not found")
+    reminder.is_cancelled = True
+    await db.commit()
+    return {"success": True}
+
+
 @app.patch("/api/messages/{message_id}/remind-at")
 async def set_remind_at(
     message_id: int,
