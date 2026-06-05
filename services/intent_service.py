@@ -233,12 +233,17 @@ class IntentService:
                 return result
 
         if confidence >= CONF_THRESHOLD and bucket:
-            print(f"[intent] classifier → {bucket} ({confidence:.2f}) for: {content[:60]}")
-            result = self._build_from_bucket(
-                content, bucket, today, tomorrow, day_map, check_query,
-            )
-            result["_classifier_confidence"] = confidence
-            return result
+            # Events always use the LLM — calendar dates must be exact and natural-language
+            # date expressions ("two weeks from now", "end of next month", etc.) can't be
+            # reliably covered by regex. Latency tradeoff is acceptable for low-volume Events.
+            if bucket != "Events":
+                print(f"[intent] classifier → {bucket} ({confidence:.2f}) for: {content[:60]}")
+                result = self._build_from_bucket(
+                    content, bucket, today, tomorrow, day_map, check_query,
+                )
+                result["_classifier_confidence"] = confidence
+                return result
+            print(f"[intent] classifier→Events ({confidence:.2f}), deferring to LLM for date accuracy: {content[:60]}")
 
         # ── Slow path: Gemini full parse (or rule-based if no_llm_fallback) ─
         if no_llm_fallback:
@@ -255,6 +260,15 @@ class IntentService:
             )
         except Exception as e:
             print(f"[intent] LLM parse failed: {e}")
+            # Events: classifier was confident about the bucket — use regex date extraction
+            # as fallback rather than dropping the capture entirely.
+            if bucket == "Events" and confidence >= CONF_THRESHOLD:
+                print(f"[intent] Events LLM fallback → regex for: {content[:60]}")
+                result = self._build_from_bucket(
+                    content, "Events", today, tomorrow, day_map, check_query=False,
+                )
+                result["_classifier_confidence"] = confidence
+                return result
             return _default_result()
 
     # ── Word-form number helpers (shared by fast path) ────────────
@@ -379,10 +393,6 @@ class IntentService:
         primary_action = bucket_to_action.get(bucket, "save_as_note")
         actions[primary_action] = True
 
-        # Events always also a todo
-        if bucket == "Events":
-            actions["save_as_todo"] = True
-
         # ── Time / date extraction (rule-based) ───────────────────
         time_str: Optional[str] = None
         date_str: Optional[str] = None
@@ -442,6 +452,47 @@ class IntentService:
                     if day_name in lc:
                         date_str = day_date
                         break
+
+        # Specific calendar date: "17th June", "June 17", "3 July", "12-14th August"
+        # Handles formats with or without ordinal suffix and optional whitespace.
+        if not date_str:
+            _MONTHS = {
+                "january": 1, "february": 2, "march": 3, "april": 4,
+                "may": 5, "june": 6, "july": 7, "august": 8,
+                "september": 9, "october": 10, "november": 11, "december": 12,
+                "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+                "jun": 6, "jul": 7, "aug": 8,
+                "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+            }
+            _month_pat = (
+                r"january|february|march|april|may|june|july|august|september|"
+                r"october|november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec"
+            )
+            # Day then month: "17th June", "12-14th August", "3july"
+            m_dm = re.search(
+                rf"\b(\d{{1,2}})(?:-\d{{1,2}})?(?:st|nd|rd|th)?\s?({_month_pat})\b", lc
+            )
+            # Month then day: "June 17", "June 17th", "july3"
+            m_md = re.search(
+                rf"\b({_month_pat})\s?(\d{{1,2}})(?:st|nd|rd|th)?\b", lc
+            )
+            _day, _mon = 0, 0
+            if m_dm:
+                _day = int(m_dm.group(1))
+                _mon = _MONTHS.get(m_dm.group(2), 0)
+            elif m_md:
+                _mon = _MONTHS.get(m_md.group(1), 0)
+                _day = int(m_md.group(2))
+            if _mon and 1 <= _day <= 31:
+                from datetime import date as _date
+                today_date = _date.fromisoformat(today)
+                try:
+                    candidate = _date(today_date.year, _mon, _day)
+                    if candidate < today_date:
+                        candidate = _date(today_date.year + 1, _mon, _day)
+                    date_str = candidate.isoformat()
+                except ValueError:
+                    pass  # invalid date (e.g. Feb 30) — fall through to today
 
         if not date_str:
             date_str = today
@@ -516,6 +567,14 @@ class IntentService:
                 "time":     time_str,
                 "priority": priority,
             }]
+
+        if actions["save_as_event"]:
+            result["event"] = {
+                "title":    content[:80],
+                "due_date": date_str,
+                "time":     time_str,
+                "people":   [],
+            }
 
         if actions["save_as_note"]:
             result["note"] = {"content": content, "keywords": []}
@@ -672,7 +731,7 @@ class IntentService:
             "  ('call', 'buy', 'submit', 'book', 'pay', 'fix', 'check', 'need to', 'have to') OR\n"
             "  time pressure ('by Friday', 'urgent', 'before 5pm'). Without one → save_as_note.\n\n"
             "  - A reminder IS ALWAYS also a todo → save_as_todo AND set_reminder = true\n"
-            "  - An event with time IS ALWAYS also a todo → save_as_event AND save_as_todo = true\n"
+            "  - save_as_event = true for scheduled appointments/meetings; save_as_todo = false for pure events\n"
             "  - set_reminder = true ONLY when a specific time is mentioned\n"
             "  - Time without explicit date → assume TODAY\n"
             "  - Any task/actionable without a date → due_date = TODAY\n"

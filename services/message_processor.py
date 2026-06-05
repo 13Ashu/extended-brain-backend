@@ -438,6 +438,19 @@ class MessageProcessor:
                 message_type=message_type, media_url=media_url, db=db, ref=ref
             )
 
+        # ── Pure Event (no To-Do) ─────────────────────────────────
+        # Fires when classifier said "Events" + LLM failed.
+        # _build_from_bucket("Events") sets save_as_event=True and populates
+        # result["event"] with the regex-extracted date — we land here and
+        # save it directly to the Events bucket without touching To-Do.
+        if actions.get("save_as_event") and not actions.get("save_as_todo"):
+            evt = parsed.get("event") or {}
+            return await self._save_single_event(
+                user=user, content=content,
+                due_date=evt.get("due_date"), event_time=evt.get("time"),
+                message_type=message_type, media_url=media_url, db=db, ref=ref,
+            )
+
         # ── Fallback ──────────────────────────────────────────────
         # When intent LLM 429'd (all actions False), try pure-regex list
         # detection before saving as a generic note/random entry.
@@ -800,6 +813,51 @@ class MessageProcessor:
             "all_buckets": [bucket], "tags": keywords,
             "essence": content[:100], "connections": [],
             "due_date": None, "events": [], "priority": "normal",
+        }
+
+    async def _save_single_event(
+        self, user, content: str, due_date: Optional[str],
+        event_time: Optional[str], message_type: str,
+        media_url: Optional[str], db: AsyncSession, ref: datetime
+    ) -> Dict:
+        if not due_date:
+            due_date = ref.strftime("%Y-%m-%d")
+
+        category = await self._get_or_create_category(
+            user_id=user.id, name="Events",
+            auto_description=INTENT_BUCKETS["Events"], db=db,
+        )
+
+        events = [{"date": due_date, "time": event_time, "label": content[:40]}]
+        tags = {
+            "all_buckets":    ["Events"],
+            "primary_bucket": "Events",
+            "priority":       "normal",
+            "due_date":       due_date,
+            "event_time":     event_time,
+            "events":         events,
+        }
+
+        msg = Message(
+            user_id=user.id, category_id=category.id,
+            content=content, message_type=MessageType(message_type),
+            media_url=media_url, summary=content[:100], tags=tags, created_at=ref,
+        )
+        db.add(msg)
+        await db.commit()
+        await db.refresh(msg)
+        await self._save_embedding(msg.id, content, {}, db)
+
+        return {
+            "message_id":  msg.id,
+            "category":    "Events",
+            "all_buckets": ["Events"],
+            "tags":        [],
+            "essence":     content[:100],
+            "connections": [],
+            "due_date":    due_date,
+            "events":      events,
+            "priority":    "normal",
         }
 
     async def _process_fallback(
