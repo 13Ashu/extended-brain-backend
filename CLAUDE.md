@@ -230,7 +230,7 @@ All models in `database.py`. Uses SQLAlchemy 2.0 async with `asyncpg`.
 
 **`messages`**
 - `id` (PK), `user_id` (FK), `group_id` (FK, nullable), `category_id` (FK, nullable)
-- `content` (TEXT), `message_type` (enum: text/image/audio/pdf/link)
+- `content` (TEXT), `message_type` (enum: text/image/audio/document/video) — `"link"` is **not** a valid value
 - `media_url` (nullable), `summary` (nullable)
 - `tags` (JSONB): `{buckets, primary_bucket, priority, due_date, event_time, done, reminded_at, original_dump, split_from, assignments, group_reminder, expense_amount, expense_category, expense_payer_id, expense_payer_name, ...}`
   - `assignments`: `[{user_id, name, phone, done, done_at}]` — per-assignee completion slots for group @mention tasks
