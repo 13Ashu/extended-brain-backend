@@ -11,7 +11,7 @@
 FastAPI backend powering the Extended Minds iOS app and web dashboard. It:
 - Accepts message captures and classifies them via a two-path AI pipeline:
   - **Fast path**: on-server ONNX classifier (~10ms, no network) for bucket classification
-  - **Slow path**: Gemini Flash Lite LLM (~500ms) when classifier is absent or low-confidence
+  - **Slow path**: Gemini 2.5 Flash Lite LLM, paid (~500ms) when classifier is absent or low-confidence
 - Stores all knowledge in Neon PostgreSQL with pgvector for semantic search
 - Handles authentication (phone + OTP + password → JWT)
 - Delivers reminders via APNs (primary) and Telegram (legacy, to be retired)
@@ -34,7 +34,7 @@ extended-brain-backend/
 ├── database.py               ← SQLAlchemy ORM models + async engine setup
 ├── models.py                 ← Re-exports from database.py (thin wrapper)
 ├── config.py                 ← Config class reading all env vars
-├── cerebras_client.py        ← Unified LLM client: Gemini primary / Cerebras legacy
+├── cerebras_client.py        ← Unified LLM client: Gemini 2.5 Flash Lite only (Cerebras removed)
 ├── requirements.txt          ← Python dependencies
 ├── Procfile                  ← Railway/Heroku start command
 ├── railway.json              ← Railway build + deploy config
@@ -90,7 +90,7 @@ extended-brain-backend/
 | Database connection / engine | `database.py` (`create_async_engine`, `get_db`) |
 | Model re-exports | `models.py` |
 | All env vars / config | `config.py` (`Config` class) |
-| LLM calls (Gemini/Cerebras) | `cerebras_client.py` |
+| LLM calls (Gemini 2.5 Flash Lite only) | `cerebras_client.py` |
 | JWT issuance + verification | `services/auth_service.py` |
 | Password hashing | `services/auth_service.py` (`hash_password`, `verify_password`) |
 | Current user dependency | `services/auth_service.py` (`get_current_user`) |
@@ -294,7 +294,7 @@ Written every time a user moves a message to a different bucket via `PATCH /api/
 # Required
 DATABASE_URL=postgresql+asyncpg://user:pass@host/db
 SECRET_KEY=<long-random-string>           # JWT signing — MUST override default
-GEMINI_API_KEY=AIzaS...                    # Primary LLM + embeddings
+GEMINI_API_KEY=AIzaS...                    # LLM (2.5 Flash Lite paid) + embeddings — REQUIRED
 
 # Messaging (one platform active at a time)
 MESSAGING_PLATFORM=telegram                # "telegram" | "whatsapp"
@@ -306,7 +306,7 @@ WHATSAPP_PHONE_NUMBER_ID=...
 WHATSAPP_VERIFY_TOKEN=...
 
 # Optional but recommended
-CEREBRAS_API_KEY=csk-...                   # Fallback LLM
+CEREBRAS_API_KEY=csk-...                   # ⚠️ Not used — Cerebras removed; key can be omitted
 UPSTASH_REDIS_REST_URL=https://...
 UPSTASH_REDIS_REST_TOKEN=...
 
@@ -420,15 +420,17 @@ classifier_service.classify(text)        ← ONNX, ~10ms, no network
 - Constructs the full actions dict from the classifier bucket + regex-extracted time/date/reminder flags
 - Bypasses LLM entirely for routine captures; still runs rule-based extraction for `event_time`, `due_date`, `is_reminder`
 
-**Slow path** (Gemini):
-- `CerebrasClient(provider="gemini", model="gemini-2.0-flash-lite")`
+**Slow path** (Gemini 2.5 Flash Lite, paid):
+- `CerebrasClient(provider="gemini", model="gemini-2.5-flash-lite")` — default provider and model
 - Full structured prompt → JSON response with bucket, summary, entities, time, reminder flag
 - Retry: 3 attempts, exponential backoff on 429/500/503
 
-### Other LLM Use Cases
-1. Search result re-ranking (`search_service`) — Gemini Flash
-2. Morning briefing generation (`briefing_service`) — Gemini Flash
-3. Category suggestions (`category_manager`) — Gemini Flash Lite
+### Other LLM Use Cases — all use Gemini 2.5 Flash Lite (paid)
+1. Reminder + recurrence temporal parsing (`recurrence_service.parse_temporal`) — one LLM call extracts time, date, recurrence rule, multi-day patterns
+2. Search result re-ranking (`search_service`)
+3. Morning briefing generation (`briefing_service`)
+4. Category suggestions (`category_manager`)
+5. Subtask breakdown (`subtask_service`)
 
 ### Embeddings
 Gemini `text-embedding-004` via REST, 1536 dims, stored in pgvector column on `messages`.
@@ -441,7 +443,7 @@ Gemini `text-embedding-004` via REST, 1536 dims, stored in pgvector column on `m
 ## Things to Always Do
 
 - Use `async with get_db() as db:` (or the FastAPI `Depends(get_db)` pattern) — never create a session manually.
-- Run through `cerebras_client` for all LLM calls — it handles retries, caching, and fallback.
+- Run through `cerebras_client` for all LLM calls — it handles retries and uses Gemini 2.5 Flash Lite (paid). Never instantiate `CerebrasClient` without `provider="gemini"`.
 - Invalidate the relevant Redis cache keys when mutating messages or groups.
 - Respect the 7 bucket names exactly: `"Remember"`, `"To-Do"`, `"Ideas"`, `"Track"`, `"Events"`, `"List"`, `"Random"`.
 - New routes go in `main.py` (that's the current convention, even if undesirable).
