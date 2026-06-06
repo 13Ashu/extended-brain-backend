@@ -242,6 +242,17 @@ class AuthService:
                     "message": "Invalid credentials"
                 }
 
+            if user.password_hash == "google_oauth_no_password":
+                return {
+                    "success": False,
+                    "message": "This account was created with Google Sign-In. Please use the 'Sign in with Google' button instead."
+                }
+            if user.password_hash == "apple_oauth_no_password":
+                return {
+                    "success": False,
+                    "message": "This account was created with Apple Sign-In. Please use the 'Sign in with Apple' button instead."
+                }
+
             if not self.verify_password(password, user.password_hash):
                 return {
                     "success": False,
