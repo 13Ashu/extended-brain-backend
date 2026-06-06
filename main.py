@@ -126,7 +126,7 @@ app.add_middleware(
 )
 
 # Services — ORDER MATTERS
-cerebras_client    = CerebrasClient()
+cerebras_client    = CerebrasClient(provider="gemini")
 messaging_client: MessagingClient = create_messaging_client()
 search_service     = SearchService(cerebras_client)
 category_manager   = CategoryManager(cerebras_client)
