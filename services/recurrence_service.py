@@ -57,6 +57,9 @@ RECURRENCE_SIGNALS = {
     "every week", "weekly", "every month", "monthly",
     "each day", "each week", "each month",
     "repeat", "recurring", "remind me every",
+    # weekday variants
+    "weekday", "weekdays", "every weekday", "all weekdays", "on weekdays",
+    "monday to friday", "mon to fri", "mon-fri",
 }
 
 DAY_MAP = {
@@ -88,14 +91,18 @@ class RecurrenceService:
 INPUT: "{content}"
 
 RULES:
-- rule: "daily" | "weekly" | "monthly"
-- day_of_week: 0=Monday, 1=Tuesday ... 6=Sunday (only for weekly)
+- rule: "daily" | "weekly" | "weekday" | "monthly"
+  - "daily"   = every calendar day
+  - "weekday" = Monday through Friday only (use for "weekdays", "all weekdays", "mon-fri")
+  - "weekly"  = once a week on a specific day
+  - "monthly" = once a month
+- day_of_week: 0=Monday, 1=Tuesday ... 6=Sunday (only for weekly; null otherwise)
 - time_of_day: "HH:MM" in 24hr format (default "09:00" if not specified)
 - task: the actual task content without the recurrence part
 
 Return ONLY this JSON:
 {{
-  "rule":         "daily | weekly | monthly",
+  "rule":         "daily | weekly | weekday | monthly",
   "day_of_week":  null,
   "time_of_day":  "HH:MM",
   "task":         "clean task description"
@@ -106,7 +113,13 @@ Examples:
   {{"rule":"weekly","day_of_week":0,"time_of_day":"09:00","task":"do weekly review"}}
 
 "drink water every day at 8am" →
-  {{"rule":"daily","day_of_week":null,"time_of_day":"08:00","task":"drink water"}}"""
+  {{"rule":"daily","day_of_week":null,"time_of_day":"08:00","task":"drink water"}}
+
+"remind me at 6pm on all weekdays to take medicine" →
+  {{"rule":"weekday","day_of_week":null,"time_of_day":"18:00","task":"take medicine"}}
+
+"remind me every Friday 10pm for lawn tennis" →
+  {{"rule":"weekly","day_of_week":4,"time_of_day":"22:00","task":"lawn tennis"}}"""
 
         try:
             response = await self.cerebras.chat_lite(prompt, max_tokens=200)
@@ -334,10 +347,14 @@ Examples:
         now_ist  = after.replace(tzinfo=UTC).astimezone(IST)
         h, m     = map(int, time_of_day.split(":"))
 
-        if rule == "daily":
+        if rule in ("daily", "weekday"):
             candidate = now_ist.replace(hour=h, minute=m, second=0, microsecond=0)
             if candidate <= now_ist:
                 candidate += timedelta(days=1)
+            if rule == "weekday":
+                # Skip Saturday (5) and Sunday (6)
+                while candidate.weekday() >= 5:
+                    candidate += timedelta(days=1)
 
         elif rule == "weekly" and day_of_week is not None:
             days_ahead = (day_of_week - now_ist.weekday()) % 7
@@ -369,6 +386,8 @@ Examples:
         days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         if rec.rule == "daily":
             return f"Repeats daily at {rec.time_of_day} IST"
+        elif rec.rule == "weekday":
+            return f"Repeats every weekday (Mon–Fri) at {rec.time_of_day} IST"
         elif rec.rule == "weekly" and rec.day_of_week is not None:
             return f"Repeats every {days[rec.day_of_week]} at {rec.time_of_day} IST"
         elif rec.rule == "monthly":
