@@ -81,6 +81,71 @@ class RecurrenceService:
         lc = content.lower()
         return any(sig in lc for sig in RECURRENCE_SIGNALS)
 
+    async def parse_temporal(self, content: str, today: str, now_ist: str) -> Optional[Dict]:
+        """
+        One LLM call that extracts ALL temporal entities for a reminder/recurring capture.
+        Returns:
+          is_recurring, recurrence_rule, recurrence_days (list for multi-day),
+          day_of_week (single day for weekly), time_of_day (recurring),
+          remind_at_date, remind_at_time (one-time), task
+        """
+        prompt = f"""Extract temporal entities from a personal reminder message.
+
+TODAY: {today}   CURRENT TIME: {now_ist} IST
+
+INPUT: "{content}"
+
+Return ONLY this JSON (no extra text):
+{{
+  "is_recurring":    true | false,
+  "recurrence_rule": "daily" | "weekday" | "weekly" | "multi-weekly" | "monthly" | null,
+  "recurrence_days": [0,2,3] or null,
+  "day_of_week":     0-6 or null,
+  "time_of_day":     "HH:MM" or null,
+  "remind_at_date":  "YYYY-MM-DD" or null,
+  "remind_at_time":  "HH:MM" or null,
+  "task":            "clean task text"
+}}
+
+Rules:
+- recurrence_rule meanings:
+    "daily"        = every single day
+    "weekday"      = Mon–Fri only ("weekdays", "all weekdays", "mon-fri")
+    "weekly"       = one specific day ("every Friday", "every Monday")
+    "multi-weekly" = 2+ specific days ("mon and wed", "tue, thu", "mon/wed/fri")
+    "monthly"      = once a month
+- recurrence_days: used ONLY for "multi-weekly", list of day numbers Mon=0…Sun=6
+- day_of_week: used ONLY for "weekly" single-day rule
+- time_of_day: HH:MM 24-hr (for recurring schedule time)
+- remind_at_date / remind_at_time: for one-time reminders only (is_recurring=false)
+  - If time is already past today → use tomorrow for remind_at_date
+  - "in X minutes/hours" → compute absolute time from {now_ist} IST
+- task: the core task text, stripped of all temporal language
+
+Examples:
+"remind me every Friday 10pm for lawn tennis"
+→ {{"is_recurring":true,"recurrence_rule":"weekly","recurrence_days":null,"day_of_week":4,"time_of_day":"22:00","remind_at_date":null,"remind_at_time":null,"task":"lawn tennis"}}
+
+"remind me at 6pm on mon, wed, thursday to take medicine"
+→ {{"is_recurring":true,"recurrence_rule":"multi-weekly","recurrence_days":[0,2,3],"day_of_week":null,"time_of_day":"18:00","remind_at_date":null,"remind_at_time":null,"task":"take medicine"}}
+
+"remind me everyday at 7:40am to book tt table"
+→ {{"is_recurring":true,"recurrence_rule":"daily","recurrence_days":null,"day_of_week":null,"time_of_day":"07:40","remind_at_date":null,"remind_at_time":null,"task":"book tt table"}}
+
+"remind me tomorrow at 3pm to call dentist"
+→ {{"is_recurring":false,"recurrence_rule":null,"recurrence_days":null,"day_of_week":null,"time_of_day":null,"remind_at_date":"{today}","remind_at_time":"15:00","task":"call dentist"}}
+
+"remind me at 6pm on all weekdays to take this medicine"
+→ {{"is_recurring":true,"recurrence_rule":"weekday","recurrence_days":null,"day_of_week":null,"time_of_day":"18:00","remind_at_date":null,"remind_at_time":null,"task":"take this medicine"}}"""
+
+        try:
+            response = await self.cerebras.chat_lite(prompt, max_tokens=300)
+            if isinstance(response, dict) and "task" in response:
+                return response
+        except Exception as e:
+            print(f"[recurrence] parse_temporal failed: {e}")
+        return None
+
     async def parse_recurrence(self, content: str) -> Optional[Dict]:
         """
         Parse recurrence rule from natural language.

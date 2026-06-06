@@ -3410,13 +3410,116 @@ async def capture_message(
                 except Exception as e:
                     print(f"[push] group reminder notify failed for uid={muid}: {e}")
 
-    # ── Needs-time flag: reminder keyword present but no time extracted ──
-    # Signals to iOS that the capture should prompt the user to set a time.
+    # ── Temporal parsing: LLM extracts time/date for all reminder + recurring captures ──
+    # Runs for any personal capture that has reminder keywords or recurring signals.
+    # One LLM call handles both one-time reminder time correction AND recurrence creation.
     _REMINDER_KW = {"remind", "reminder", "don't forget", "alert", "notify", "ping"}
+    _lc = content.lower()
+    _has_temporal = (
+        not group_id
+        and (
+            recurrence_service.is_recurring(content)
+            or result.get("remind_at")
+            or any(kw in _lc for kw in _REMINDER_KW)
+        )
+        and result.get("message_id")
+    )
+    if _has_temporal:
+        try:
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo as _ZI
+            _now_ist = _dt.now(_ZI("Asia/Kolkata"))
+            _today   = _now_ist.strftime("%Y-%m-%d")
+            _now_str = _now_ist.strftime("%H:%M")
+
+            temporal = await recurrence_service.parse_temporal(content, _today, _now_str)
+
+            if temporal:
+                # 1. Correct one-time reminder time with LLM result
+                if result.get("reminder_id") and temporal.get("remind_at_time"):
+                    r_date = temporal.get("remind_at_date") or _today
+                    r_h, r_m = map(int, temporal["remind_at_time"].split(":"))
+                    _tz = _ZI(current_user.timezone or "Asia/Kolkata")
+                    _local = _dt.fromisoformat(r_date).replace(
+                        hour=r_h, minute=r_m, second=0, microsecond=0, tzinfo=_tz
+                    )
+                    if _local <= _now_ist.replace(tzinfo=_tz):
+                        _local += timedelta(days=1)
+                    _utc = _local.astimezone(_ZI("UTC")).replace(tzinfo=None)
+                    await db.execute(
+                        update(Reminder)
+                        .where(Reminder.id == result["reminder_id"])
+                        .values(remind_at=_utc)
+                    )
+                    await db.commit()
+                    result["remind_at"] = _utc.isoformat()
+                    print(f"[temporal] corrected reminder #{result['reminder_id']} → {_utc} UTC")
+
+                # 2. Create recurrence(s) if recurring
+                if temporal.get("is_recurring") and temporal.get("recurrence_rule"):
+                    _rule      = temporal["recurrence_rule"]
+                    _time      = temporal.get("time_of_day") or "09:00"
+                    _task      = temporal.get("task") or content
+                    _mid       = result["message_id"]
+                    _days      = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                    _recs      = []
+
+                    if _rule == "multi-weekly" and temporal.get("recurrence_days"):
+                        for _dow in temporal["recurrence_days"]:
+                            _rec = await recurrence_service.create(
+                                current_user.id,
+                                {"rule": "weekly", "day_of_week": _dow,
+                                 "time_of_day": _time, "task": _task},
+                                content, db,
+                            )
+                            if _rec:
+                                _recs.append(_rec)
+                                await db.execute(
+                                    update(Recurrence).where(Recurrence.id == _rec.id)
+                                    .values(message_id=_mid)
+                                )
+                        _dow_names = ", ".join(
+                            _days[d] for d in sorted(temporal["recurrence_days"])
+                        )
+                        _rule_str = f"Repeats {_dow_names} at {_time} IST"
+                    else:
+                        _rec = await recurrence_service.create(
+                            current_user.id,
+                            {"rule": _rule,
+                             "day_of_week": temporal.get("day_of_week"),
+                             "time_of_day": _time, "task": _task},
+                            content, db,
+                        )
+                        if _rec:
+                            _recs.append(_rec)
+                            await db.execute(
+                                update(Recurrence).where(Recurrence.id == _rec.id)
+                                .values(message_id=_mid)
+                            )
+                        _rule_str = recurrence_service._rule_display(_recs[0]) if _recs else ""
+
+                    if _recs:
+                        result["recurring"]       = True
+                        result["recurrence_rule"] = _rule_str
+                        result["recurrence_id"]   = _recs[0].id
+                        if result.get("essence"):
+                            result["essence"] = f"{result['essence']} · {_rule_str}"
+                        # Cancel the companion one-time reminder
+                        await db.execute(
+                            update(Reminder).where(Reminder.message_id == _mid)
+                            .values(is_cancelled=True)
+                        )
+                        await db.commit()
+                        print(f"[temporal] created {len(_recs)} recurrence(s): {_rule_str}")
+
+        except Exception as e:
+            print(f"[capture] Temporal parsing failed: {e}")
+
+    # ── Needs-time flag: reminder keyword but no time found by LLM or regex ──
     if (
         result.get("category") == "To-Do"
         and not result.get("remind_at")
-        and any(kw in content.lower() for kw in _REMINDER_KW)
+        and any(kw in _lc for kw in _REMINDER_KW)
         and result.get("message_id")
         and not group_id
     ):
@@ -3427,39 +3530,6 @@ async def capture_message(
             .bindparams(mid=result["message_id"])
         )
         await db.commit()
-
-    # ── Recurring task detection (personal captures only) ────────────
-    # Group context uses @mention/assignment flow instead.
-    if not group_id and recurrence_service.is_recurring(content):
-        try:
-            parsed = await recurrence_service.parse_recurrence(content)
-            if parsed:
-                rec = await recurrence_service.create(current_user.id, parsed, content, db)
-                if rec:
-                    rule_str = recurrence_service._rule_display(rec)
-                    result["recurring"]        = True
-                    result["recurrence_rule"]  = rule_str
-                    result["recurrence_id"]    = rec.id
-                    # Append rule to essence so the iOS capture bubble shows it
-                    if result.get("essence"):
-                        result["essence"] = f"{result['essence']} · {rule_str}"
-                    # Link recurrence to source message + cancel any one-time Reminder
-                    # so it doesn't show as "Fired" in the Brain View alongside active recurrences
-                    if result.get("message_id"):
-                        mid = result["message_id"]
-                        await db.execute(
-                            update(Recurrence)
-                            .where(Recurrence.id == rec.id)
-                            .values(message_id=mid)
-                        )
-                        await db.execute(
-                            update(Reminder)
-                            .where(Reminder.message_id == mid)
-                            .values(is_cancelled=True)
-                        )
-                        await db.commit()
-        except Exception as e:
-            print(f"[capture] Recurrence detection failed: {e}")
 
     # ── Expense metadata ─────────────────────────────────────────────
     if message.expense_amount is not None and result.get("message_id"):
