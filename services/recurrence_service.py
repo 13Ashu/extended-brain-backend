@@ -51,7 +51,7 @@ class Recurrence(Base):
 # ── Service ───────────────────────────────────────────────────────────────────
 
 RECURRENCE_SIGNALS = {
-    "every day", "daily", "every morning", "every evening", "every night",
+    "every day", "everyday", "daily", "every morning", "every evening", "every night",
     "every monday", "every tuesday", "every wednesday", "every thursday",
     "every friday", "every saturday", "every sunday",
     "every week", "weekly", "every month", "monthly",

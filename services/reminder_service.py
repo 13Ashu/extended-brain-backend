@@ -444,6 +444,12 @@ class ReminderService:
         else:
             local_dt = base.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=tz)
 
+        # Never schedule a reminder in the past — push to the same time tomorrow.
+        now_local = datetime.now(tz)
+        if local_dt <= now_local:
+            from datetime import timedelta as _td
+            local_dt = local_dt + _td(days=1)
+
         return local_dt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
 
     def _best_task_label(self, content: str, analysis: Dict) -> str:
