@@ -4536,6 +4536,42 @@ async def delete_group(
     return {"success": True}
 
 
+@app.post("/api/groups/{group_id}/settle")
+async def settle_group_expenses(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Record a settlement marker for a group — resets the shared balance baseline."""
+    member = await db.scalar(
+        select(GroupMember).where(
+            GroupMember.group_id == group_id,
+            GroupMember.user_id == current_user.id,
+        )
+    )
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this group")
+
+    now = datetime.utcnow()
+    marker = Message(
+        user_id=current_user.id,
+        group_id=group_id,
+        content="Expenses settled",
+        message_type=MessageType.TEXT,
+        tags={
+            "primary_bucket": "Track",
+            "settlement_marker": True,
+            "settled_by_name": current_user.name,
+            "settled_by_id": current_user.id,
+        },
+        created_at=now,
+    )
+    db.add(marker)
+    await db.commit()
+    await db.refresh(marker)
+    return {"success": True, "settled_at": now.isoformat(), "message_id": marker.id}
+
+
 @app.delete("/api/pro/members/{phone_number}")
 async def remove_pro_member(
     phone_number: str,
