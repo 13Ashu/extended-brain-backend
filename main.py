@@ -21,6 +21,7 @@ import httpx
 from sqlalchemy import and_, or_, select, update, func, text, delete as sql_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from loguru import logger
 from config import Config, MessagingPlatform
 from messaging_factory import create_messaging_client, get_platform_name
 from messaging_interface import MessagingClient
@@ -225,6 +226,10 @@ class AppleSignInRequest(BaseModel):
     full_name: Optional[str] = None
 
 
+class OAuthVerifyPhoneRequest(BaseModel):
+    session_token: str
+    phone_id_token: str
+
 class GoogleSignInRequest(BaseModel):
     id_token:  str = Field(..., min_length=1)
     full_name: Optional[str] = None
@@ -328,9 +333,11 @@ async def firebase_verify_phone(request: FirebaseVerifyPhoneRequest, db: AsyncSe
     """
     from services.firebase_service import verify_phone_token
     from database import OTPVerification
+    logger.info("[auth/firebase-verify-phone] request received")
     try:
         phone_number = verify_phone_token(request.id_token)
     except ValueError as e:
+        logger.warning("[auth/firebase-verify-phone] token verification FAILED — {}", e)
         raise HTTPException(status_code=400, detail=str(e))
 
     # Remove any existing OTP records for this phone and insert a pre-verified one.
@@ -347,6 +354,7 @@ async def firebase_verify_phone(request: FirebaseVerifyPhoneRequest, db: AsyncSe
     db.add(otp_record)
     await db.commit()
 
+    logger.info("[auth/firebase-verify-phone] OK — phone=***{}", phone_number[-4:])
     return {"success": True, "verified": True, "phone_number": phone_number}
 
 
@@ -362,33 +370,93 @@ async def apple_sign_in(request: AppleSignInRequest, db: AsyncSession = Depends(
         logger.error(f"Apple sign-in Firebase error: {e}")
         raise HTTPException(status_code=500, detail="Apple sign-in verification failed")
 
-    # Apple users are stored with a synthetic phone placeholder so the unique
-    # constraint is preserved without requiring a real phone number.
-    phone_placeholder = f"apple|{uid}"
     display_name = request.full_name or firebase_name or (email.split("@")[0] if email else "Apple User")
 
-    user = await db.scalar(select(User).where(User.phone_number == phone_placeholder))
-    if not user and email:
-        # Check if an existing account already has this email (e.g., registered via phone first)
-        user = await db.scalar(select(User).where(User.email == email))
-        if user and not user.phone_number.startswith("apple|"):
-            # Link Apple UID to the existing phone-registered account — don't create a duplicate
-            pass
+    # 1. Returning Apple user (already linked)
+    user = await db.scalar(select(User).where(User.apple_uid == uid))
 
+    # 2. Existing account with same email — link the Apple UID
+    if not user and email:
+        user = await db.scalar(select(User).where(User.email == email))
+        if user:
+            user.apple_uid = uid
+
+    # 3. No account found — need phone to link or create
     if not user:
-        user = User(
-            phone_number=phone_placeholder,
-            email=email or f"{uid}@apple.extendedminds",
-            name=display_name,
-            age=0,
-            password_hash="apple_oauth_no_password",
+        logger.info("[auth/apple] uid={}... no account found — returning needs_phone", uid[:8])
+        session_token = auth_service.create_oauth_session_token(
+            provider="apple", uid=uid, email=email or "", name=display_name
         )
-        db.add(user)
-        await db.flush()
+        return {"success": True, "needs_phone": True, "session_token": session_token}
+
+    logger.info("[auth/apple] uid={}... matched user_id={}", uid[:8], user.id)
+    user.last_login = datetime.utcnow()
+    await db.commit()
+
+    token = auth_service.create_access_token(user.id)
+    return {
+        "success": True,
+        "data": {
+            "access_token": token,
+            "user": {
+                "id": user.id,
+                "phone_number": user.phone_number,
+                "name": user.name,
+                "email": user.email,
+                "timezone": user.timezone,
+            },
+        },
+    }
+
+
+@app.post("/api/auth/apple/verify-phone")
+async def apple_verify_phone(request: OAuthVerifyPhoneRequest, db: AsyncSession = Depends(get_db)):
+    """Complete Apple Sign-In by verifying phone — links to existing account or creates new one."""
+    from services.firebase_service import verify_phone_token
+    logger.info("[auth/apple/verify-phone] request received")
+    try:
+        session = auth_service.decode_oauth_session_token(request.session_token)
+    except ValueError as e:
+        logger.warning("[auth/apple/verify-phone] session token INVALID — {}", e)
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        phone_number = verify_phone_token(request.phone_id_token)
+    except ValueError as e:
+        logger.warning("[auth/apple/verify-phone] phone token FAILED — {}", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+    uid   = session["uid"]
+    email = session["email"]
+    name  = session["name"]
+    logger.info("[auth/apple/verify-phone] uid={}... email={} phone=***{}", uid[:8], email, phone_number[-4:])
+
+    user = await db.scalar(select(User).where(User.phone_number == phone_number))
+    if user:
+        logger.info("[auth/apple/verify-phone] found existing user by phone — user_id={}, linking apple_uid", user.id)
+        user.apple_uid = uid
+    else:
+        if email:
+            user = await db.scalar(select(User).where(User.email == email))
+        if user:
+            logger.info("[auth/apple/verify-phone] found existing user by email — user_id={}, linking apple_uid", user.id)
+            user.apple_uid = uid
+        else:
+            logger.info("[auth/apple/verify-phone] no existing user found — creating new account")
+            user = User(
+                phone_number=phone_number,
+                email=email or f"{uid}@apple.extendedminds",
+                name=name,
+                age=0,
+                password_hash="apple_oauth_no_password",
+                apple_uid=uid,
+            )
+            db.add(user)
+            await db.flush()
 
     user.last_login = datetime.utcnow()
     await db.commit()
 
+    logger.info("[auth/apple/verify-phone] OK — user_id={}", user.id)
     token = auth_service.create_access_token(user.id)
     return {
         "success": True,
@@ -417,28 +485,92 @@ async def google_sign_in(request: GoogleSignInRequest, db: AsyncSession = Depend
         logger.error(f"Google sign-in Firebase error: {e}")
         raise HTTPException(status_code=500, detail="Google sign-in verification failed")
 
-    phone_placeholder = f"google|{uid}"
     display_name = request.full_name or firebase_name or (email.split("@")[0] if email else "Google User")
 
-    user = await db.scalar(select(User).where(User.phone_number == phone_placeholder))
+    # 1. Returning Google user (already linked)
+    user = await db.scalar(select(User).where(User.google_uid == uid))
+
+    # 2. Existing account with same email — link the Google UID
     if not user and email:
         user = await db.scalar(select(User).where(User.email == email))
-        if user and not user.phone_number.startswith("google|"):
-            pass  # Link Google UID to an existing email-registered account
+        if user:
+            user.google_uid = uid
 
+    # 3. No account found — need phone to link or create
     if not user:
-        user = User(
-            phone_number=phone_placeholder,
-            email=email or f"{uid}@google.extendedminds",
-            name=display_name,
-            age=0,
-            password_hash="google_oauth_no_password",
+        logger.info("[auth/google] uid={}... no account found — returning needs_phone", uid[:8])
+        session_token = auth_service.create_oauth_session_token(
+            provider="google", uid=uid, email=email or "", name=display_name
         )
-        db.add(user)
-        await db.flush()
+        return {"success": True, "needs_phone": True, "session_token": session_token}
+
+    logger.info("[auth/google] uid={}... matched user_id={}", uid[:8], user.id)
+    user.last_login = datetime.utcnow()
+    await db.commit()
+
+    token = auth_service.create_access_token(user.id)
+    return {
+        "success": True,
+        "data": {
+            "access_token": token,
+            "user": {
+                "id":           user.id,
+                "phone_number": user.phone_number,
+                "name":         user.name,
+                "email":        user.email,
+                "timezone":     user.timezone,
+            },
+        },
+    }
+
+
+@app.post("/api/auth/google/verify-phone")
+async def google_verify_phone(request: OAuthVerifyPhoneRequest, db: AsyncSession = Depends(get_db)):
+    """Complete Google Sign-In by verifying phone — links to existing account or creates new one."""
+    from services.firebase_service import verify_phone_token
+    logger.info("[auth/google/verify-phone] request received")
+    try:
+        session = auth_service.decode_oauth_session_token(request.session_token)
+    except ValueError as e:
+        logger.warning("[auth/google/verify-phone] session token INVALID — {}", e)
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        phone_number = verify_phone_token(request.phone_id_token)
+    except ValueError as e:
+        logger.warning("[auth/google/verify-phone] phone token FAILED — {}", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+    uid   = session["uid"]
+    email = session["email"]
+    name  = session["name"]
+    logger.info("[auth/google/verify-phone] uid={}... email={} phone=***{}", uid[:8], email, phone_number[-4:])
+
+    user = await db.scalar(select(User).where(User.phone_number == phone_number))
+    if user:
+        logger.info("[auth/google/verify-phone] found existing user by phone — user_id={}, linking google_uid", user.id)
+        user.google_uid = uid
+    else:
+        if email:
+            user = await db.scalar(select(User).where(User.email == email))
+        if user:
+            logger.info("[auth/google/verify-phone] found existing user by email — user_id={}, linking google_uid", user.id)
+            user.google_uid = uid
+        else:
+            logger.info("[auth/google/verify-phone] no existing user found — creating new account")
+            user = User(
+                phone_number=phone_number,
+                email=email or f"{uid}@google.extendedminds",
+                name=name,
+                age=0,
+                password_hash="google_oauth_no_password",
+                google_uid=uid,
+            )
+            db.add(user)
+            await db.flush()
 
     user.last_login = datetime.utcnow()
     await db.commit()
+    logger.info("[auth/google/verify-phone] OK — user_id={}", user.id)
 
     token = auth_service.create_access_token(user.id)
     return {
@@ -4500,6 +4632,27 @@ async def admin_list_coupons(
         raise HTTPException(status_code=403, detail="Forbidden")
     coupons = await cpn_svc.list_coupons(db)
     return {"coupons": coupons}
+
+
+@app.patch("/api/admin/coupons/{coupon_id}")
+async def admin_update_coupon(
+    coupon_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    provided = request.headers.get("X-Admin-Secret") or request.query_params.get("admin_secret") or ""
+    if not admin_secret or provided != admin_secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    body = await request.json()
+    result = await db.execute(select(CouponCode).where(CouponCode.id == coupon_id))
+    coupon = result.scalar_one_or_none()
+    if not coupon:
+        raise HTTPException(status_code=404, detail="Coupon not found")
+    if "max_uses" in body:
+        coupon.max_uses = int(body["max_uses"]) if body["max_uses"] is not None else None
+    await db.commit()
+    return {"success": True, "code": coupon.code, "max_uses": coupon.max_uses}
 
 
 @app.delete("/api/admin/coupons/{coupon_id}")

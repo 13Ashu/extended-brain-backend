@@ -68,6 +68,26 @@ class AuthService:
 
         return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
+    def create_oauth_session_token(self, provider: str, uid: str, email: str, name: str) -> str:
+        payload = {
+            "sub": "oauth_session",
+            "provider": provider,
+            "uid": uid,
+            "email": email,
+            "name": name,
+            "exp": datetime.utcnow() + timedelta(hours=24),
+        }
+        return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+    def decode_oauth_session_token(self, token: str) -> dict:
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            if payload.get("sub") != "oauth_session":
+                raise ValueError("Invalid session token type")
+            return payload
+        except JWTError:
+            raise ValueError("Invalid or expired session token")
+
     async def send_otp(self, phone_number: str, db: AsyncSession) -> dict:
 
         if not Config.ENABLE_OTP:

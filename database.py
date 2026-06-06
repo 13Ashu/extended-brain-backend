@@ -83,6 +83,8 @@ class User(Base):
     
     # Authentication
     password_hash: Mapped[str] = mapped_column(String(255))  # Store hashed password
+    google_uid: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, unique=True, index=True)
+    apple_uid: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, unique=True, index=True)
     
     # Settings
     timezone: Mapped[str] = mapped_column(String(50), default="Asia/Kolkata")
@@ -397,6 +399,10 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_label_annotations_user ON label_annotations(user_id)",
             "ALTER TABLE users ALTER COLUMN occupation DROP NOT NULL",
             "ALTER TABLE pro_account_members ALTER COLUMN phone_number TYPE VARCHAR(100)",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_uid VARCHAR(128)",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_uid VARCHAR(128)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_uid ON users(google_uid) WHERE google_uid IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_apple_uid ON users(apple_uid) WHERE apple_uid IS NOT NULL",
         ]
         for stmt in migrations:
             try:
