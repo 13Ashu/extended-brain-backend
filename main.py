@@ -3123,6 +3123,25 @@ async def snooze_reminder(
     return {"success": True, "remind_at": snoozed.remind_at.isoformat()}
 
 
+@app.delete("/api/reminders/fired")
+async def clear_fired_reminders(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bulk-cancel all already-sent reminders so they no longer appear in the list."""
+    await db.execute(
+        update(Reminder)
+        .where(
+            Reminder.user_id == current_user.id,
+            Reminder.is_sent == True,
+            Reminder.is_cancelled == False,
+        )
+        .values(is_cancelled=True)
+    )
+    await db.commit()
+    return {"success": True}
+
+
 @app.delete("/api/reminders/{reminder_id}")
 async def delete_reminder(
     reminder_id: int,
@@ -3134,6 +3153,51 @@ async def delete_reminder(
     if not reminder or reminder.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Reminder not found")
     reminder.is_cancelled = True
+    await db.commit()
+    return {"success": True}
+
+
+@app.get("/api/recurrences")
+async def list_recurrences(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return all active recurring reminders for the current user."""
+    result = await db.execute(
+        select(Recurrence)
+        .where(
+            Recurrence.user_id == current_user.id,
+            Recurrence.is_active == True,
+        )
+        .order_by(Recurrence.created_at.desc())
+    )
+    recs = result.scalars().all()
+    items = []
+    for r in recs:
+        items.append({
+            "id":          r.id,
+            "task":        r.template_content,
+            "rule":        r.rule,
+            "time_of_day": r.time_of_day,
+            "day_of_week": r.day_of_week,
+            "next_fire":   r.next_fire.isoformat() if r.next_fire else None,
+            "last_fired":  r.last_fired.isoformat() if r.last_fired else None,
+            "is_active":   r.is_active,
+        })
+    return {"success": True, "recurrences": items}
+
+
+@app.delete("/api/recurrences/{recurrence_id}")
+async def delete_recurrence(
+    recurrence_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Cancel a recurring reminder so it no longer fires."""
+    rec = await db.get(Recurrence, recurrence_id)
+    if not rec or rec.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Recurring reminder not found")
+    rec.is_active = False
     await db.commit()
     return {"success": True}
 
@@ -3379,6 +3443,21 @@ async def capture_message(
                     # Append rule to essence so the iOS capture bubble shows it
                     if result.get("essence"):
                         result["essence"] = f"{result['essence']} · {rule_str}"
+                    # Link recurrence to source message + cancel any one-time Reminder
+                    # so it doesn't show as "Fired" in the Brain View alongside active recurrences
+                    if result.get("message_id"):
+                        mid = result["message_id"]
+                        await db.execute(
+                            update(Recurrence)
+                            .where(Recurrence.id == rec.id)
+                            .values(message_id=mid)
+                        )
+                        await db.execute(
+                            update(Reminder)
+                            .where(Reminder.message_id == mid)
+                            .values(is_cancelled=True)
+                        )
+                        await db.commit()
         except Exception as e:
             print(f"[capture] Recurrence detection failed: {e}")
 
