@@ -50,7 +50,7 @@ class CerebrasClient:
     def __init__(
         self,
         api_key:   Optional[str] = None,
-        provider:  str = "cerebras",
+        provider:  str = "gemini",
         model:     Optional[str] = None,
         site_url:  Optional[str] = None,
         site_name: Optional[str] = None,
