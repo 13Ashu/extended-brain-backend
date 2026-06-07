@@ -372,8 +372,10 @@ class AuthService:
                 select(OTPVerification)
                 .where(OTPVerification.phone_number == phone_number)
                 .where(OTPVerification.is_verified == True)
+                .order_by(OTPVerification.created_at.desc())
             )
-            otp_verified = otp_result.scalar_one_or_none()
+            # Several verified rows can coexist (resend) — any one is sufficient.
+            otp_verified = otp_result.scalars().first()
             if not otp_verified:
                 return {"success": False, "message": "OTP verification required"}
 

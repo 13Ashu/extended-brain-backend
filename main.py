@@ -212,6 +212,7 @@ class LoginRequest(BaseModel):
 class ForgotPasswordRequest(BaseModel):
     phone_number: str
     new_password: str = Field(..., min_length=6)
+    otp: Optional[str] = None              # required when ENABLE_OTP (MSG91 path)
 
 
 class FirebaseVerifyPhoneRequest(BaseModel):
@@ -230,7 +231,11 @@ class AppleSignInRequest(BaseModel):
 
 class OAuthVerifyPhoneRequest(BaseModel):
     session_token: str
-    phone_id_token: str
+    # Phone verification — two supported paths during the Firebase→MSG91 transition:
+    #   MSG91/OTP: phone_number + otp   ·   Legacy Firebase: phone_id_token
+    phone_id_token: Optional[str] = None
+    phone_number:   Optional[str] = None
+    otp:            Optional[str] = None
 
 class GoogleSignInRequest(BaseModel):
     id_token:  str = Field(..., min_length=1)
@@ -411,21 +416,38 @@ async def apple_sign_in(request: AppleSignInRequest, db: AsyncSession = Depends(
     }
 
 
+async def _resolve_verified_phone(request: OAuthVerifyPhoneRequest, db: AsyncSession) -> str:
+    """
+    Resolve and verify the phone number for an OAuth link-phone request.
+    Supports both paths during the Firebase→MSG91 transition:
+      • MSG91/OTP:  {phone_number, otp}  — verified against otp_verifications
+      • Legacy:     {phone_id_token}     — verified Firebase phone token
+    Returns the verified phone number, or raises HTTPException(400).
+    """
+    if request.phone_number and request.otp:
+        result = await auth_service.verify_otp(request.phone_number, request.otp, db)
+        if not result.get("verified"):
+            raise HTTPException(status_code=400, detail=result.get("message", "Invalid OTP"))
+        return request.phone_number
+    if request.phone_id_token:
+        from services.firebase_service import verify_phone_token
+        try:
+            return verify_phone_token(request.phone_id_token)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    raise HTTPException(status_code=400, detail="Phone verification required (otp or phone_id_token)")
+
+
 @app.post("/api/auth/apple/verify-phone")
 async def apple_verify_phone(request: OAuthVerifyPhoneRequest, db: AsyncSession = Depends(get_db)):
     """Complete Apple Sign-In by verifying phone — links to existing account or creates new one."""
-    from services.firebase_service import verify_phone_token
     logger.info("[auth/apple/verify-phone] request received")
     try:
         session = auth_service.decode_oauth_session_token(request.session_token)
     except ValueError as e:
         logger.warning("[auth/apple/verify-phone] session token INVALID — {}", e)
         raise HTTPException(status_code=400, detail=str(e))
-    try:
-        phone_number = verify_phone_token(request.phone_id_token)
-    except ValueError as e:
-        logger.warning("[auth/apple/verify-phone] phone token FAILED — {}", e)
-        raise HTTPException(status_code=400, detail=str(e))
+    phone_number = await _resolve_verified_phone(request, db)
 
     uid   = session["uid"]
     email = session["email"]
@@ -529,18 +551,13 @@ async def google_sign_in(request: GoogleSignInRequest, db: AsyncSession = Depend
 @app.post("/api/auth/google/verify-phone")
 async def google_verify_phone(request: OAuthVerifyPhoneRequest, db: AsyncSession = Depends(get_db)):
     """Complete Google Sign-In by verifying phone — links to existing account or creates new one."""
-    from services.firebase_service import verify_phone_token
     logger.info("[auth/google/verify-phone] request received")
     try:
         session = auth_service.decode_oauth_session_token(request.session_token)
     except ValueError as e:
         logger.warning("[auth/google/verify-phone] session token INVALID — {}", e)
         raise HTTPException(status_code=400, detail=str(e))
-    try:
-        phone_number = verify_phone_token(request.phone_id_token)
-    except ValueError as e:
-        logger.warning("[auth/google/verify-phone] phone token FAILED — {}", e)
-        raise HTTPException(status_code=400, detail=str(e))
+    phone_number = await _resolve_verified_phone(request, db)
 
     uid   = session["uid"]
     email = session["email"]
@@ -627,6 +644,13 @@ async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/auth/forgot-password")
 async def forgot_password(request: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
+    # When OTP is enabled, require a verified OTP for this phone before resetting.
+    if Config.ENABLE_OTP:
+        if not request.otp:
+            raise HTTPException(status_code=400, detail="OTP required")
+        verify = await auth_service.verify_otp(request.phone_number, request.otp, db)
+        if not verify.get("verified"):
+            raise HTTPException(status_code=400, detail=verify.get("message", "Invalid OTP"))
     result = await auth_service.reset_password(
         phone_number=request.phone_number, new_password=request.new_password, db=db
     )
