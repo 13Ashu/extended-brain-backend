@@ -24,7 +24,18 @@ class Config:
 
     ENABLE_OTP = os.getenv("ENABLE_OTP", "false").lower() == "true"
     FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS")  # JSON string of service account key
-    
+
+    # MSG91 SMS — transactional OTP delivery (India). OTP generation/verification
+    # stays in auth_service; MSG91 is only the SMS transport (DLT-approved template).
+    MSG91_AUTH_KEY = os.getenv("MSG91_AUTH_KEY", "")
+    MSG91_OTP_TEMPLATE_ID = os.getenv("MSG91_OTP_TEMPLATE_ID", "")  # DLT/MSG91 template id
+    MSG91_SENDER_ID = os.getenv("MSG91_SENDER_ID", "")             # 6-char DLT header, e.g. EMINDS
+    MSG91_OTP_VAR_NAME = os.getenv("MSG91_OTP_VAR_NAME", "OTP")    # variable name in the template
+
+    # OTP anti-pumping (you pay per SMS — these cap abuse of /api/auth/send-otp)
+    OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "30"))
+    OTP_MAX_PER_DAY = int(os.getenv("OTP_MAX_PER_DAY", "10"))
+
     # WhatsApp Configuration
     WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
     WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")

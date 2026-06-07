@@ -12,13 +12,14 @@ import hashlib
 import secrets
 import os
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
 from database import User, OTPVerification, get_db
 from messaging_interface import MessagingClient
 from config import Config
+from services.sms_service import sms_service
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -36,6 +37,8 @@ class AuthService:
 
     OTP_EXPIRY_MINUTES = 10
     MAX_OTP_ATTEMPTS = 5
+    RESEND_COOLDOWN_SECONDS = Config.OTP_RESEND_COOLDOWN_SECONDS
+    MAX_OTP_PER_DAY = Config.OTP_MAX_PER_DAY
 
     def __init__(self, messaging_client: MessagingClient):
         self.messaging_client = messaging_client
@@ -97,41 +100,93 @@ class AuthService:
                 "expires_in": 0
             }
         try:
-            otp_code = self.generate_otp()
-            expires_at = datetime.utcnow() + timedelta(
-                minutes=self.OTP_EXPIRY_MINUTES
-            )
+            now = datetime.utcnow()
+            day_ago = now - timedelta(hours=24)
 
-            logger.info(f"Generated OTP for {phone_number}: {otp_code}")
-
-            existing = await db.execute(
+            # Pull this phone's OTPs from the last 24h for anti-pumping checks.
+            recent_result = await db.execute(
                 select(OTPVerification)
                 .where(OTPVerification.phone_number == phone_number)
+                .where(OTPVerification.created_at > day_ago)
+                .order_by(OTPVerification.created_at.desc())
             )
+            recent = recent_result.scalars().all()
 
-            for otp in existing.scalars():
-                await db.delete(otp)
+            # Resend cooldown — block rapid re-requests (we pay per SMS).
+            if recent:
+                since_last = (now - recent[0].created_at).total_seconds()
+                if since_last < self.RESEND_COOLDOWN_SECONDS:
+                    wait = int(self.RESEND_COOLDOWN_SECONDS - since_last) + 1
+                    return {
+                        "success": False,
+                        "message": f"Please wait {wait}s before requesting another code.",
+                        "retry_after": wait,
+                    }
+
+            # Daily cap per phone number.
+            if len(recent) >= self.MAX_OTP_PER_DAY:
+                return {
+                    "success": False,
+                    "message": "Too many OTP requests today. Please try again later.",
+                }
+
+            otp_code = self.generate_otp()
+            expires_at = now + timedelta(minutes=self.OTP_EXPIRY_MINUTES)
+
+            if Config.DEBUG:
+                logger.info(f"Generated OTP for {phone_number}: {otp_code}")
+            else:
+                logger.info("Generated OTP for ***{}", phone_number[-4:])
+
+            # Invalidate any still-valid previous code (one active code at a time)
+            # but keep the rows so the 24h rate-limit counter stays accurate.
+            for r in recent:
+                if not r.is_verified and r.expires_at > now:
+                    r.expires_at = now
+
+            # Hard-delete only truly-old rows (>24h) to keep the table bounded.
+            await db.execute(
+                delete(OTPVerification)
+                .where(OTPVerification.phone_number == phone_number)
+                .where(OTPVerification.created_at <= day_ago)
+            )
 
             otp_record = OTPVerification(
                 phone_number=phone_number,
                 otp_code=otp_code,
-                expires_at=expires_at
+                expires_at=expires_at,
             )
-
             db.add(otp_record)
             await db.commit()
 
-            message = (
-                f"🧠 Extended Brain Verification\n\n"
-                f"Your OTP code is: {otp_code}\n\n"
-                f"This code will expire in {self.OTP_EXPIRY_MINUTES} minutes.\n"
-                f"Do not share this code with anyone."
-            )
-
-            try:
-                await self.messaging_client.send_message(phone_number, message)
-            except Exception as e:
-                logger.warning(f"Failed to send OTP: {e}")
+            # Deliver. Prefer MSG91 SMS when configured (production OTP transport);
+            # otherwise fall back to the legacy messaging client (Telegram) so the
+            # existing /send-otp path keeps working until MSG91 is switched on.
+            if sms_service.is_configured:
+                # On failure, roll back the stored code so a user who never
+                # received an SMS can't be left with a "valid" OTP.
+                try:
+                    await sms_service.send_otp(phone_number, otp_code)
+                except Exception as e:
+                    logger.error(f"Failed to send OTP SMS: {e}")
+                    await db.delete(otp_record)
+                    await db.commit()
+                    return {
+                        "success": False,
+                        "message": "Could not send verification code. Please try again.",
+                    }
+            else:
+                # Legacy fallback — kept ready; lenient (matches prior behaviour).
+                message = (
+                    f"Extended Minds verification\n\n"
+                    f"Your OTP code is: {otp_code}\n\n"
+                    f"This code expires in {self.OTP_EXPIRY_MINUTES} minutes.\n"
+                    f"Do not share it with anyone."
+                )
+                try:
+                    await self.messaging_client.send_message(phone_number, message)
+                except Exception as e:
+                    logger.warning(f"Failed to send OTP via messaging client: {e}")
 
             return {
                 "success": True,
@@ -143,7 +198,7 @@ class AuthService:
             logger.error(f"Error sending OTP: {e}")
             return {
                 "success": False,
-                "message": str(e)
+                "message": "Could not send verification code.",
             }
 
     async def verify_otp(
@@ -168,7 +223,9 @@ class AuthService:
                 .order_by(OTPVerification.created_at.desc())
             )
 
-            otp_record = result.scalar_one_or_none()
+            # send_otp() now keeps superseded rows for rate-limiting, so there
+            # can be several unverified rows — the newest is the active code.
+            otp_record = result.scalars().first()
 
             if not otp_record:
                 return {
