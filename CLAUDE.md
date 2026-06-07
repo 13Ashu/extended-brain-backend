@@ -68,6 +68,8 @@ extended-brain-backend/
 │   ├── subtask_service.py    ← Task breakdown into subtasks
 │   ├── recurrence_service.py ← Recurring reminders (daily/weekly/monthly)
 │   ├── coupon_service.py     ← Coupon validation and redemption
+│   ├── payment_service.py    ← Razorpay web payments (web dashboard only — not iOS)
+│   ├── iap_service.py        ← Apple IAP: JWS verification, App Store Server API, webhook handler
 │   └── context_service.py    ← Multi-turn conversation context storage
 │
 ├── messaging_interface.py    ← Abstract base class for messaging clients
@@ -196,6 +198,17 @@ extended-brain-backend/
 | POST | `/api/pro/validate-coupon` | Check if coupon code is valid |
 | POST | `/api/pro/redeem-coupon` | Apply coupon to account |
 
+### Payments — Razorpay (web dashboard only)
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/payments/create-order` | Create Razorpay order for web checkout |
+| POST | `/api/payments/verify` | Verify Razorpay signature + activate Pro |
+
+### Payments — Apple IAP (iOS app)
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/iap/verify` | Verify StoreKit 2 transaction with Apple + activate Pro (auth required) |
+
 ### Admin (requires `X-Admin-Secret` header)
 | Method | Path | Description |
 |--------|------|-------------|
@@ -212,6 +225,8 @@ extended-brain-backend/
 | POST | `/webhook/whatsapp` | Incoming WhatsApp message |
 | POST | `/webhook/telegram` | Incoming Telegram update |
 | GET | `/api/webhook/info` | Webhook registration status |
+| POST | `/webhook/razorpay` | Razorpay payment events (web only) |
+| POST | `/webhook/apple` | App Store Server Notifications V2 — renewal, expiry, refund |
 
 ---
 
@@ -278,6 +293,10 @@ All models in `database.py`. Uses SQLAlchemy 2.0 async with `asyncpg`.
 
 **`coupon_redemptions`** — `coupon_id`, `user_id`, `redeemed_at`
 
+**`payment_orders`** — `razorpay_order_id` (unique), `razorpay_payment_id`, `user_id`, `plan` (monthly/annual), `amount` (paise), `status` (created/paid/failed) — Razorpay web payments only
+
+**`iap_transactions`** — `transaction_id` (unique), `original_transaction_id` (indexed), `user_id`, `product_id`, `environment` (Production/Sandbox), `expires_at` — links Apple transaction IDs to backend users for webhook resolution
+
 **`stored_images`** — `user_id`, `data` (LargeBinary), `mime_type` — fallback for images without CDN URL
 
 ### Annotation Table (Classifier Flywheel)
@@ -316,6 +335,17 @@ APNS_TEAM_ID=ABCDE
 APNS_AUTH_KEY=-----BEGIN PRIVATE KEY-----...
 APNS_BUNDLE_ID=com.extendedminds.app
 APNS_PRODUCTION=true                       # false = sandbox
+
+# Razorpay (web dashboard payments only — NOT used in iOS app)
+RAZORPAY_KEY_ID=rzp_live_xxx
+RAZORPAY_KEY_SECRET=xxx
+RAZORPAY_WEBHOOK_SECRET=xxx
+
+# Apple IAP — App Store Server API (iOS subscriptions)
+# Keys from App Store Connect → Users and Access → Integrations → In-App Purchase
+APPLE_ISSUER_ID=<UUID from App Store Connect → Keys → Issuer ID>
+APPLE_KEY_ID=<Key ID of the In-App Purchase .p8 key>
+APPLE_PRIVATE_KEY=<contents of .p8 file, \n-escaped for Railway>
 
 # Admin
 ADMIN_SECRET=<password>                    # Gating for /api/admin/* endpoints

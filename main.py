@@ -30,6 +30,8 @@ from database import get_db, init_db, engine, Base, async_session_maker, DeviceT
 from models import User, Message, Category, MessageType, ProAccount, ProAccountMember, Group, GroupMember, CouponCode, CouponRedemption
 from services.group_service import group_service as grp_svc
 from services.coupon_service import coupon_service as cpn_svc
+from services.payment_service import payment_service as pay_svc
+from services.iap_service import iap_service
 from cerebras_client import CerebrasClient
 from services.message_processor import MessageProcessor
 from services.search_service import SearchService
@@ -4689,6 +4691,97 @@ async def admin_update_coupon(
         coupon.max_uses = int(body["max_uses"]) if body["max_uses"] is not None else None
     await db.commit()
     return {"success": True, "code": coupon.code, "max_uses": coupon.max_uses}
+
+
+# ── Payments (Razorpay) ─────────────────────────────────────────────────────
+
+class PaymentCreateOrderRequest(BaseModel):
+    plan: str  # "monthly" | "annual"
+
+class PaymentVerifyRequest(BaseModel):
+    order_id: str
+    payment_id: str
+    signature: str
+
+
+@app.post("/api/payments/create-order")
+async def create_payment_order(
+    req: PaymentCreateOrderRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await pay_svc.create_order(current_user, req.plan, db)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@app.post("/api/payments/verify")
+async def verify_payment(
+    req: PaymentVerifyRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await pay_svc.verify_and_activate(
+        current_user, req.order_id, req.payment_id, req.signature, db
+    )
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@app.post("/webhook/razorpay")
+async def razorpay_webhook(request: Request, db: AsyncSession = Depends(get_db)):
+    body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    ok = await pay_svc.handle_webhook(body, signature, db)
+    return {"status": "ok" if ok else "ignored"}
+
+
+# ── Apple In-App Purchase ────────────────────────────────────────────────────
+
+class IAPVerifyRequest(BaseModel):
+    transaction_id: str
+    original_transaction_id: str
+
+
+@app.post("/api/iap/verify")
+async def iap_verify(
+    req: IAPVerifyRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Called by iOS immediately after a successful StoreKit 2 purchase.
+    Verifies the transaction with Apple's App Store Server API and activates Pro.
+    The iOS client must call transaction.finish() AFTER this returns success.
+    """
+    result = await iap_service.verify_and_activate(
+        current_user, req.transaction_id, req.original_transaction_id, db
+    )
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@app.post("/webhook/apple")
+async def apple_webhook(request: Request, db: AsyncSession = Depends(get_db)):
+    """
+    App Store Server Notifications V2.
+    Apple sends renewal, expiration, refund, and billing-retry events here.
+    Must return HTTP 200 quickly — Apple retries on failure (up to 3 times).
+    Configure in App Store Connect → your app → Subscriptions → Server URL.
+    """
+    body = await request.json()
+    signed_payload = body.get("signedPayload", "")
+    if not signed_payload:
+        # Malformed — acknowledge so Apple stops retrying this exact payload
+        return {"status": "ignored"}
+
+    ok = await iap_service.handle_notification(signed_payload, db)
+    # Return 200 regardless so Apple doesn't flood us with retries on transient issues.
+    # Genuine signature failures are logged; benign unknowns are silently acked.
+    return {"status": "ok" if ok else "signature_error"}
 
 
 @app.delete("/api/admin/coupons/{coupon_id}")

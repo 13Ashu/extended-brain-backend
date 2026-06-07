@@ -42,6 +42,19 @@ class Config:
     # Database
     DATABASE_URL = os.getenv("DATABASE_URL")
     
+    # Razorpay (web dashboard payments only — not used in iOS app)
+    RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
+    RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
+    RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
+
+    # Apple In-App Purchase — App Store Server API
+    # APPLE_ISSUER_ID:   App Store Connect → Users and Access → Integrations → Issuer ID
+    # APPLE_KEY_ID:      Key ID of the App Store Connect API key (.p8)
+    # APPLE_PRIVATE_KEY: Full contents of the .p8 file (-----BEGIN PRIVATE KEY----- ...)
+    APPLE_ISSUER_ID = os.getenv("APPLE_ISSUER_ID", "")
+    APPLE_KEY_ID = os.getenv("APPLE_KEY_ID", "")
+    APPLE_PRIVATE_KEY = os.getenv("APPLE_PRIVATE_KEY", "").replace("\\n", "\n")
+
     # Application
     DEBUG = os.getenv("DEBUG", "false").lower() == "true"
     

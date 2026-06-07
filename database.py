@@ -362,6 +362,34 @@ class LabelAnnotation(Base):
     user: Mapped["User"] = relationship("User")
 
 
+class IAPTransaction(Base):
+    """Apple IAP transaction record — links original_transaction_id → user for webhook lookup."""
+    __tablename__ = "iap_transactions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    transaction_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    original_transaction_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    product_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    environment: Mapped[str] = mapped_column(String(20), default="Production")  # Production | Sandbox
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PaymentOrder(Base):
+    """Razorpay payment orders — one row per checkout attempt."""
+    __tablename__ = "payment_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    razorpay_order_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    razorpay_payment_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    plan: Mapped[str] = mapped_column(String(20), nullable=False)    # "monthly" | "annual"
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)      # paise
+    status: Mapped[str] = mapped_column(String(20), default="created")  # created | paid | failed
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class StoredImage(Base):
     """Binary image storage — no external CDN needed."""
     __tablename__ = "stored_images"
@@ -403,6 +431,11 @@ async def init_db():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_uid VARCHAR(128)",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_uid ON users(google_uid) WHERE google_uid IS NOT NULL",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_apple_uid ON users(apple_uid) WHERE apple_uid IS NOT NULL",
+            "CREATE TABLE IF NOT EXISTS payment_orders (id SERIAL PRIMARY KEY, razorpay_order_id VARCHAR(100) UNIQUE NOT NULL, razorpay_payment_id VARCHAR(100), user_id INTEGER REFERENCES users(id) NOT NULL, plan VARCHAR(20) NOT NULL, amount INTEGER NOT NULL, status VARCHAR(20) DEFAULT 'created', created_at TIMESTAMP DEFAULT NOW())",
+            "CREATE INDEX IF NOT EXISTS idx_payment_orders_user ON payment_orders(user_id)",
+            "CREATE TABLE IF NOT EXISTS iap_transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) NOT NULL, transaction_id VARCHAR(100) UNIQUE NOT NULL, original_transaction_id VARCHAR(100) NOT NULL, product_id VARCHAR(100) NOT NULL, environment VARCHAR(20) DEFAULT 'Production', expires_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW())",
+            "CREATE INDEX IF NOT EXISTS idx_iap_transactions_original ON iap_transactions(original_transaction_id)",
+            "CREATE INDEX IF NOT EXISTS idx_iap_transactions_user ON iap_transactions(user_id)",
         ]
         for stmt in migrations:
             try:
