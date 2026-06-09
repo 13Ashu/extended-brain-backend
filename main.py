@@ -2934,6 +2934,7 @@ async def bootstrap(
             "expense_category":    tags.get("expense_category"),
             "expense_payer_id":    tags.get("expense_payer_id"),
             "expense_payer_name":  tags.get("expense_payer_name"),
+            "assignments":         tags.get("assignments", []),
         }
 
     recent = [_serialize(m, c, s) for m, c, s in recent_rows.all()]
@@ -3102,6 +3103,7 @@ async def get_recent_messages(
             "expense_category":      tags.get("expense_category"),
             "expense_payer_id":      tags.get("expense_payer_id"),
             "expense_payer_name":    tags.get("expense_payer_name"),
+            "assignments":           tags.get("assignments", []),
         })
 
     return {"success": True, "results": messages, "total": len(messages)}
@@ -4595,6 +4597,13 @@ async def settle_group_expenses(
     db.add(marker)
     await db.commit()
     await db.refresh(marker)
+
+    # Bust bootstrap cache for all group members so they see the settlement immediately
+    from services import redis_cache as _rc_settle
+    settle_members = await grp_svc.get_group_members(group_id, db)
+    for _sm in settle_members:
+        asyncio.create_task(_rc_settle.cache_del(_rc_settle.bootstrap_key(_sm["id"], group_id)))
+
     return {"success": True, "settled_at": now.isoformat(), "message_id": marker.id}
 
 

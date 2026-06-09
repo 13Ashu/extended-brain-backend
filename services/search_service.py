@@ -210,266 +210,109 @@ class SearchService:
         import time as _time
         _t0 = _time.monotonic()
 
-        # ── 1. List fetch FIRST — before any LLM call ────────────────
-        list_result = await self._try_list_fetch(user.id, query, db, group_id=group_id)
-        if list_result is not None:
-            print(f"[search] list_fetch hit → {_time.monotonic()-_t0:.2f}s total")
-            return list_result
+        # ── TIER 1: keyword-only, no embedding (fast=True) ───────────
+        # iOS calls this first and shows the result immediately.
+        # Text match: content/summary ILIKE — returns in ~5ms.
+        date_from, date_to = _resolve_date_range(query, today)
+        bucket_hint        = _detect_bucket(query)
+        words              = [w for w in query.lower().split() if len(w) > 2]
+        base_expansion = {
+            "core_concepts": words,
+            "keywords":      words,
+            "entities":      [],
+            "intent":        "find_specific",
+            "search_focus":  "all",
+            "extra_buckets": [],
+            "bucket_filter": bucket_hint,
+        }
+        if date_from:
+            base_expansion["date_from"] = date_from
+            base_expansion["date_to"]   = date_to
 
-
-        # ── 2a. FAST PATH — skip all LLM, pure embedding + keyword ──────
         if fast:
-            from services.embedding_service import embedding_service
-            date_from, date_to = _resolve_date_range(query, today)
-            bucket_hint        = _detect_bucket(query)
-            words              = [w for w in query.lower().split() if len(w) > 2]
-            expansion = {
-                "core_concepts": words,
-                "keywords":      words,
-                "entities":      [],
-                "intent":        "find_specific",
-                "search_focus":  "all",
-                "extra_buckets": [],
-                "bucket_filter": bucket_hint,
-            }
-            if date_from:
-                expansion["date_from"] = date_from
-                expansion["date_to"]   = date_to
-            try:
-                query_embedding = await embedding_service.aembed_query(query)
-            except Exception:
-                query_embedding = None
             messages = await self._retrieve(
-                user=user, query=query, expansion=expansion,
+                user=user, query=query, expansion=base_expansion,
                 use_due_filter=bool(date_from), db=db, limit=limit * 2,
-                group_id=group_id, precomputed_embedding=query_embedding,
+                group_id=group_id, skip_semantic=True,
             )
-            ranked = self._rank(messages=messages, query=query, expansion=expansion,
+            ranked = self._rank(messages=messages, query=query, expansion=base_expansion,
                                 use_due_filter=bool(date_from))[:limit]
-            print(f"[search] fast path → {_time.monotonic()-_t0:.2f}s ({len(ranked)} results)")
+            print(f"[search] tier1 keyword → {_time.monotonic()-_t0:.2f}s ({len(ranked)} results)")
             result = {"results": ranked, "natural_response": ""}
             if ck:
-                await redis_cache.cache_set(ck, result, ex=120)  # shorter TTL for fast results
+                await redis_cache.cache_set(ck, result, ex=120)
             return result
 
-        # ── 2b. Intent parse + embedding in parallel ──────────────────
-        # Embedding is independent of intent; start it immediately.
-        from services.intent_service import get_intent_service
+        # ── TIERS 2+3: embedding + optional LLM expansion (fast=False) ─
+        # iOS calls this after showing the tier-1 result. Runs in parallel:
+        #   Tier 2 — embed raw query → vector similarity
+        #   Tier 3 — LLM expand query → richer keyword terms (skipped for ≤3-word queries)
         from services.embedding_service import embedding_service
         import asyncio as _asyncio
 
-        intent_svc   = get_intent_service(self.cerebras)
-        intent_task  = _asyncio.create_task(
-            intent_svc.parse(query, user.name, user.timezone or "Asia/Kolkata")
-        )
-        embed_task   = _asyncio.create_task(
-            embedding_service.aembed_query(query)
-        )
-
-        parsed = await intent_task
-        _t1 = _time.monotonic()
-        print(f"[search] intent parse → {_t1-_t0:.2f}s")
-
-        actions        = parsed.get("actions", {})
-        is_query       = actions.get("is_query", False)
-        query_sub      = parsed.get("query") or {}
-        list_name_hint = query_sub.get("list_name")
-        date_hint      = query_sub.get("date_hint")
-
-        # ── 3. Second list fetch attempt with IntentService hint ──────
-        if is_query and list_name_hint:
-            list_result = await self._try_list_fetch(
-                user.id, query, db, list_name_hint=list_name_hint, group_id=group_id
-            )
-            if list_result is not None:
-                embed_task.cancel()
-                print(f"[search] list_fetch(hint) hit → {_time.monotonic()-_t0:.2f}s total")
-                return list_result
-
-        # ── 4. Resolve date range ─────────────────────────────────────
-        date_from, date_to = _resolve_date_range(query, today)
-        if not date_from and is_query:
-            if date_hint == "today":
-                date_from = date_to = str(today)
-            elif date_hint == "tomorrow":
-                d = today + timedelta(days=1)
-                date_from = date_to = str(d)
-            elif date_hint == "this_week":
-                monday = today - timedelta(days=today.weekday())
-                date_from = str(monday)
-                date_to   = str(monday + timedelta(days=6))
-
-        print(f"[search] query={query!r} date_from={date_from} date_to={date_to} is_query={is_query} is_todo={_is_todo_query(query)}")
-
-        # ── 5. Direct todo fetch ──────────────────────────────────────
+        # Todo queries: direct DB fetch, no embeddings needed
         if _is_todo_query(query):
-            fetch_from  = date_from or str(today)
-            fetch_to    = date_to   or str(today)
-            todo_result = await self._fetch_todos_direct(
-                user.id, fetch_from, fetch_to, db, limit
-            )
-            embed_task.cancel()
-            print(f"[search] todo_direct hit → {_time.monotonic()-_t0:.2f}s total")
+            use_due = bool(date_from)
+            fetch_from = date_from or str(today)
+            fetch_to   = date_to   or str(today)
+            todo_result = await self._fetch_todos_direct(user.id, fetch_from, fetch_to, db, limit)
+            print(f"[search] todo_direct → {_time.monotonic()-_t0:.2f}s")
             return todo_result
 
-        # ── 6. Standard semantic + keyword search ─────────────────────
-        bucket_hint    = _detect_bucket(query)
         use_due_filter = _is_due_date_query(query) and date_from is not None
         person_hint    = _extract_person_name(query)
 
-        expansion = await self._expand_query(
-            query=query, user=user, db=db,
-            date_from=date_from, date_to=date_to, bucket_hint=bucket_hint,
+        # Tier 2 and Tier 3 start in parallel
+        embed_task  = _asyncio.create_task(embedding_service.aembed_query(query))
+        expand_task = (
+            _asyncio.create_task(
+                self._expand_query(query=query, user=user, db=db,
+                                   date_from=date_from, date_to=date_to, bucket_hint=bucket_hint)
+            )
+            if len(words) > 3 else None
         )
-        _t2 = _time.monotonic()
-        print(f"[search] expand_query → {_t2-_t1:.2f}s")
 
-        if date_from:
-            expansion["date_from"] = date_from
-            expansion["date_to"]   = date_to
-        if bucket_hint:
-            expansion["bucket_filter"] = bucket_hint
+        try:
+            query_embedding = await embed_task
+        except Exception as e:
+            print(f"[search] embed failed: {e}")
+            query_embedding = None
+
+        expansion = base_expansion
+        if expand_task:
+            try:
+                expansion = await expand_task
+                if date_from:
+                    expansion["date_from"] = date_from
+                    expansion["date_to"]   = date_to
+                if bucket_hint:
+                    expansion["bucket_filter"] = bucket_hint
+            except Exception as e:
+                print(f"[search] expand failed: {e}")
+
         if person_hint:
             expansion.setdefault("entities", [])
             if person_hint not in expansion["entities"]:
                 expansion["entities"].insert(0, person_hint)
 
-        # Wait for embedding (likely already done since it ran in parallel)
-        try:
-            query_embedding = await embed_task
-        except Exception as e:
-            print(f"[search] embed_task failed: {e}")
-            query_embedding = None
-        _t3 = _time.monotonic()
-        print(f"[search] embedding ready → {_t3-_t0:.2f}s total")
+        print(f"[search] tier2+3 ready → {_time.monotonic()-_t0:.2f}s")
 
         messages = await self._retrieve(
             user=user, query=query, expansion=expansion,
             use_due_filter=use_due_filter, db=db, limit=limit * 3,
-            group_id=group_id,
-            precomputed_embedding=query_embedding,
+            group_id=group_id, precomputed_embedding=query_embedding,
         )
-        _t4 = _time.monotonic()
-        print(f"[search] retrieve ({len(messages)} msgs) → {_t4-_t3:.2f}s")
-
         ranked = self._rank(
             messages=messages, query=query, expansion=expansion,
             use_due_filter=use_due_filter,
         )[:limit]
 
-        natural = await self._natural_response(
-            query=query, results=ranked,
-            date_from=date_from, date_to=date_to, today=today,
-        )
-        print(f"[search] natural_response → {_time.monotonic()-_t4:.2f}s | total={_time.monotonic()-_t0:.2f}s")
-
-        result = {"results": ranked, "natural_response": natural}
+        print(f"[search] tier2+3 done → {_time.monotonic()-_t0:.2f}s ({len(ranked)} results)")
+        result = {"results": ranked, "natural_response": ""}
         if ck:
             await redis_cache.cache_set(ck, result, ex=300)
         return result
 
-    # ──────────────────────────────────────────────────────────────
-    # Direct list fetch — ZERO hallucination
-    # ──────────────────────────────────────────────────────────────
-
-    async def _try_list_fetch(
-        self, user_id: int, query: str, db: AsyncSession,
-        list_name_hint: Optional[str] = None,
-        group_id: Optional[int] = None,
-    ) -> Optional[Dict]:
-        from services.list_service import ListService
-        ls = ListService(self.cerebras)
-
-        # Never intercept todo/task queries as list queries
-        q_lower = query.lower().strip()
-        TODO_BLOCK = {"todo", "to-do", "to do", "task", "tasks", "pending"}
-        if any(kw in q_lower for kw in TODO_BLOCK):
-            return None
-
-        # Fast path: IntentService already extracted the list name
-        if list_name_hint:
-            msg = await ls.find_best_matching_list(user_id, list_name_hint, db, group_id=group_id)
-            if msg:
-                tags      = msg.tags if isinstance(msg.tags, dict) else {}
-                subtasks  = tags.get("subtasks", [])
-                list_name = tags.get("list_name", msg.content)
-                items     = [{"task": s["task"], "done": s.get("done", False)}
-                             for s in subtasks if isinstance(s, dict) and "task" in s]
-                return {
-                    "results": [{
-                        "id":           msg.id,
-                        "content":      msg.content,
-                        "message_type": "text",
-                        "essence":      list_name,
-                        "category":     "List",
-                        "all_buckets":  ["List"],
-                        "priority":     "normal",
-                        "tags":         tags,
-                        "items":        items,
-                        "created_at":   msg.created_at.isoformat(),
-                        "due_date":     None,
-                        "event_time":   None,
-                        "events":       [],
-                        "relevance":    100.0,
-                        "preview":      f"{len(subtasks)} items",
-                        "is_list":      True,
-                    }],
-                    "natural_response": "",
-                    "is_list":          True,
-                    "list_name":        list_name,
-                    "list_message_id":  msg.id,
-                }
-
-        intent = await ls.detect_list_intent(query)
-        if not intent or intent["intent"] != "show":
-            return None
-
-        list_name = intent["list_name"]
-        list_type = intent["list_type"]
-
-        msg = await ls.find_best_matching_list(user_id, list_name, db, group_id=group_id)
-        if not msg:
-            return {
-                "results":          [],
-                "natural_response": (
-                    f"You don't have a *{list_name}* yet.\n\n"
-                    f"Start by sending:\n`{list_name.lower()}:\n- item1\n- item2`"
-                ),
-                "is_list":   True,
-                "list_name": list_name,
-                "list_type": list_type,
-            }
-
-        tags     = msg.tags if isinstance(msg.tags, dict) else {}
-        subtasks = tags.get("subtasks", [])
-        items    = [{"task": s["task"], "done": s.get("done", False)}
-                    for s in subtasks if isinstance(s, dict) and "task" in s]
-
-        return {
-            "results": [{
-                "id":           msg.id,
-                "content":      msg.content,
-                "message_type": "text",
-                "essence":      tags.get("list_name", msg.content),
-                "category":     "List",
-                "all_buckets":  ["List"],
-                "priority":     "normal",
-                "tags":         tags,
-                "items":        items,
-                "created_at":   msg.created_at.isoformat(),
-                "due_date":     None,
-                "event_time":   None,
-                "events":       [],
-                "relevance":    100.0,
-                "preview":      f"{len(subtasks)} items",
-                "is_list":      True,
-            }],
-            "natural_response": "",
-            "is_list":          True,
-            "list_type":        list_type,
-            "list_name":        list_name,
-            "list_message_id":  msg.id,
-        }
 
     # ──────────────────────────────────────────────────────────────
     # Direct todo fetch — ZERO LLM
@@ -677,6 +520,7 @@ Return ONLY this JSON:
         use_due_filter: bool, db: AsyncSession, limit: int,
         group_id: Optional[int] = None,
         precomputed_embedding: Optional[List[float]] = None,
+        skip_semantic: bool = False,
     ) -> List[tuple]:
         semantic_hits: Dict[int, float] = {}
         # Only include messages with cosine similarity above this floor.
@@ -684,6 +528,8 @@ Return ONLY this JSON:
         # 0.40 is the practical cutoff for "genuinely related" in this embedding space.
         MIN_SEMANTIC_SIMILARITY = 0.40
         try:
+            if skip_semantic:
+                raise ValueError("semantic skipped")
             from services.embedding_service import embedding_service
             query_embedding = precomputed_embedding or await embedding_service.aembed_query(query)
             embedding_str   = f"[{','.join(map(str, query_embedding))}]"
@@ -915,36 +761,40 @@ Return ONLY this JSON:
         self, message: Message, category: Optional[Category],
         query: str, expansion: Dict, use_due_filter: bool,
     ) -> float:
+        from rapidfuzz import fuzz
+
         score   = 0.0
         content = message.content.lower()
         summary = (message.summary or "").lower()
         tags    = message.tags if isinstance(message.tags, dict) else {}
         q_lower = query.lower()
 
-        # Semantic is secondary — keyword matches always rank first
+        # Semantic score (secondary to text)
         score += getattr(message, "_semantic_score", 0.0) * 15.0
 
-        # Tier 1: exact full query in content/summary
-        if q_lower in content:  score += 60.0
-        elif q_lower in summary: score += 40.0
+        # Primary text score via token_set_ratio:
+        # returns 100 when all query words appear in the stored text (any order, any extras).
+        # "people call" → "people to call" = 100 (same as exact match)
+        # "peoples call" → "people to call" = 84 (fuzzy on typo)
+        # Take max(content, summary) to avoid double-counting.
+        text_tsr = max(
+            fuzz.token_set_ratio(q_lower, content),
+            fuzz.token_set_ratio(q_lower, summary) if summary else 0,
+        )
+        score += text_tsr * 0.60   # 100 → +60, 84 → +50, 0 → +0
 
-        # Tier 2: raw query word matches (before LLM expansion)
-        raw_words = [w for w in q_lower.split() if len(w) > 2]
-        tags_str         = str(tags).lower()
-        subtasks_str     = " ".join(
+        # Secondary text fields at lower weight
+        subtasks_str   = " ".join(
             s.get("task", "").lower() for s in tags.get("subtasks", []) if isinstance(s, dict)
         )
-        split_from_str   = str(tags.get("split_from", "")).lower()
-        original_dump    = str(tags.get("original_dump", "")).lower()
-        for w in raw_words:
-            if w in content: score += 12.0
-            if w in summary: score += 8.0
-            # List item match — finding the list by its contents
-            if subtasks_str and w in subtasks_str: score += 10.0
-            # Multi-task original context match
-            if split_from_str and w in split_from_str: score += 8.0
-            # Single-task original dump match
-            if original_dump and w in original_dump: score += 8.0
+        split_from_str = str(tags.get("split_from", "")).lower()
+        original_dump  = str(tags.get("original_dump", "")).lower()
+        if subtasks_str:
+            score += fuzz.token_set_ratio(q_lower, subtasks_str) * 0.15   # max +15
+        if split_from_str:
+            score += fuzz.token_set_ratio(q_lower, split_from_str) * 0.12  # max +12
+        if original_dump:
+            score += fuzz.token_set_ratio(q_lower, original_dump) * 0.12   # max +12
 
         for c in expansion.get("core_concepts", []):
             if c.lower() in content: score += 6.0
@@ -988,71 +838,73 @@ Return ONLY this JSON:
         return score
 
     # ──────────────────────────────────────────────────────────────
-    # Natural response
+    # Natural response (reserved for future product iterations)
+    # Currently not called — search returns raw results only.
+    # Restore the call in search() when an AI summary feature is added.
     # ──────────────────────────────────────────────────────────────
 
-    async def _natural_response(
-        self, query: str, results: List[Dict],
-        date_from: Optional[str], date_to: Optional[str], today: date,
-    ) -> str:
-        if not results:
-            time_ctx = ""
-            if date_from:
-                if date_from == date_to:
-                    d        = datetime.fromisoformat(date_from).strftime("%A, %d %b")
-                    time_ctx = f" for {d}"
-                else:
-                    time_ctx = f" between {date_from} and {date_to}"
-            return f"Nothing found{time_ctx} in your notes."
-
-        saved_dates  = {r["_saved_date"] for r in results if r.get("_saved_date")}
-        multi_source = len(saved_dates) > 1
-        today_str    = str(today)
-        yesterday    = str(today - timedelta(days=1))
-
-        if date_from and date_to:
-            if date_from == date_to == today_str:    time_ctx = "today"
-            elif date_from == date_to == yesterday:   time_ctx = "yesterday"
-            elif date_from == date_to:                time_ctx = datetime.fromisoformat(date_from).strftime("%A, %d %b")
-            else:                                     time_ctx = f"between {date_from} and {date_to}"
-        else:
-            time_ctx = "any time"
-
-        context = ""
-        for r in results[:8]:
-            due       = f" [due: {r['due_date']}]" if r.get("due_date") else ""
-            ev_time   = f" at {r['event_time']}" if r.get("event_time") else ""
-            buckets   = ", ".join(r.get("all_buckets", [r.get("category", "?")]))
-            date_note = (
-                f" [saved {_date_label(r.get('_saved_date', ''), today)}]"
-                if multi_source else ""
-            )
-            context += f"\n[{buckets}]{due}{ev_time}{date_note}: {r['content']}\n"
-
-        prompt = f"""Personal assistant answering a search in the user's notes.
-
-TODAY: {today}
-USER ASKED: "{query}"
-TIME SCOPE: {time_ctx}
-
-MATCHING NOTES:
-{context}
-
-Instructions:
-- Answer the specific question directly
-- List tasks/events clearly with times if available
-- Be concise — max 4 sentences or a short list
-- If results are from different dates, mention dates naturally (e.g. "yesterday you saved...")
-- Never invent information not in the notes
-- Don't say "based on your notes"
-
-Reply:"""
-
-        try:
-            return await self.cerebras.chat_text(prompt, max_tokens=250, temperature=0.2)
-        except Exception as e:
-            print(f"[search] _natural_response failed ({type(e).__name__}): {e}")
-            return f"Found {len(results)} result(s) matching your query."
+    # async def _natural_response(
+    #     self, query: str, results: List[Dict],
+    #     date_from: Optional[str], date_to: Optional[str], today: date,
+    # ) -> str:
+    #     if not results:
+    #         time_ctx = ""
+    #         if date_from:
+    #             if date_from == date_to:
+    #                 d        = datetime.fromisoformat(date_from).strftime("%A, %d %b")
+    #                 time_ctx = f" for {d}"
+    #             else:
+    #                 time_ctx = f" between {date_from} and {date_to}"
+    #         return f"Nothing found{time_ctx} in your notes."
+    #
+    #     saved_dates  = {r["_saved_date"] for r in results if r.get("_saved_date")}
+    #     multi_source = len(saved_dates) > 1
+    #     today_str    = str(today)
+    #     yesterday    = str(today - timedelta(days=1))
+    #
+    #     if date_from and date_to:
+    #         if date_from == date_to == today_str:    time_ctx = "today"
+    #         elif date_from == date_to == yesterday:   time_ctx = "yesterday"
+    #         elif date_from == date_to:                time_ctx = datetime.fromisoformat(date_from).strftime("%A, %d %b")
+    #         else:                                     time_ctx = f"between {date_from} and {date_to}"
+    #     else:
+    #         time_ctx = "any time"
+    #
+    #     context = ""
+    #     for r in results[:8]:
+    #         due       = f" [due: {r['due_date']}]" if r.get("due_date") else ""
+    #         ev_time   = f" at {r['event_time']}" if r.get("event_time") else ""
+    #         buckets   = ", ".join(r.get("all_buckets", [r.get("category", "?")]))
+    #         date_note = (
+    #             f" [saved {_date_label(r.get('_saved_date', ''), today)}]"
+    #             if multi_source else ""
+    #         )
+    #         context += f"\n[{buckets}]{due}{ev_time}{date_note}: {r['content']}\n"
+    #
+    #     prompt = f"""Personal assistant answering a search in the user's notes.
+    #
+    # TODAY: {today}
+    # USER ASKED: "{query}"
+    # TIME SCOPE: {time_ctx}
+    #
+    # MATCHING NOTES:
+    # {context}
+    #
+    # Instructions:
+    # - Answer the specific question directly
+    # - List tasks/events clearly with times if available
+    # - Be concise — max 4 sentences or a short list
+    # - If results are from different dates, mention dates naturally (e.g. "yesterday you saved...")
+    # - Never invent information not in the notes
+    # - Don't say "based on your notes"
+    #
+    # Reply:"""
+    #
+    #     try:
+    #         return await self.cerebras.chat_text(prompt, max_tokens=250, temperature=0.2)
+    #     except Exception as e:
+    #         print(f"[search] _natural_response failed ({type(e).__name__}): {e}")
+    #         return f"Found {len(results)} result(s) matching your query."
 
     # ──────────────────────────────────────────────────────────────
     # Helpers

@@ -516,48 +516,86 @@ class IntentService:
         elif any(w in lc for w in {"important", "must", "definitely", "high priority"}):
             priority = "high"
 
-        # ── Bullet list for To-Do with 2+ items ──────────────────────
-        # Named header + bullets → is_list=True (expandable ListTodoRow).
-        # Neutral headers (todo/tasks/today/tomorrow/this week) → individual To-Do rows,
-        # matching the LLM NEUTRAL HEADER RULE so fast and slow paths behave the same.
-        if bucket == "To-Do":
-            has_bullets = bool(re.search(r'\n\s*[-*•]|\n\s*\d+[.)]', content))
-            if has_bullets:
-                from services.list_service import _extract_items_from_content, _BLOCKED_NAME_WORDS
-                items = _extract_items_from_content(content)
-                if len(items) >= 2:
-                    header_m = re.match(r'^([^\n]+)', content)
-                    raw_header = (
-                        header_m.group(1).strip().rstrip(':').strip()
-                        if header_m else ""
-                    ) or "Tasks"
-                    # Neutral headers → split as individual tasks (mirrors LLM behaviour).
-                    # Neutral = ALL non-stopword words are blocked words (e.g. "todo for today").
-                    # Named qualifier present (e.g. "Em issues for today", "Office work") → named list.
-                    _h_stopwords = {"for", "this", "my", "the", "a", "an", "of", "in", "on"}
-                    header_words = set(raw_header.lower().split()) - _h_stopwords
-                    is_neutral = not bool(header_words - _BLOCKED_NAME_WORDS)
-                    if is_neutral:
-                        # Save as separate To-Do tasks, not a named list
-                        result["tasks"] = [
-                            {"task": item, "due_date": date_str, "time": time_str, "priority": priority}
-                            for item in items
-                        ]
-                        result["priority"] = priority
-                        result["essence"]  = content[:100]
-                        return result
-                    # Named header → named list
+        # ── List detection (all buckets) ─────────────────────────────
+        # Named header + bullets/numbered/bare-items → save_as_list=True.
+        # Bucket-agnostic: Remember, To-Do, Ideas etc. can all be lists.
+        # Mirrors the LLM NAMED HEADER RULE so fast and slow paths behave the same.
+        # Neutral headers (todo/tasks/today) + To-Do → split to individual tasks.
+        # Neutral headers + other buckets → fall through, save as plain note/idea.
+        if '\n' in content:
+            from services.list_service import (
+                _extract_items_from_content, _BLOCKED_NAME_WORDS, _classify_list_type,
+            )
+            has_bullets      = bool(re.search(r'\n\s*[-*•]|\n\s*\d+[.)]', content))
+            header_m         = re.match(r'^([^\n]+)', content)
+            # Colon at end of header line is an explicit list delimiter
+            has_colon_header = bool(header_m and header_m.group(1).rstrip().endswith(':'))
+            items            = _extract_items_from_content(content)
+            # Bare lines (no bullets, no colon) are a weaker signal:
+            # only treat as list when ALL items are short (≤5 words), filtering prose/sentences.
+            has_bare_items = (
+                not has_bullets and not has_colon_header
+                and len(items) >= 2
+                and all(len(i.split()) <= 5 for i in items)
+            )
+            if len(items) >= 2 and (has_bullets or has_colon_header or has_bare_items):
+                raw_header = (
+                    header_m.group(1).strip().rstrip(':').strip()
+                    if header_m else ""
+                ) or "Tasks"
+                _h_stopwords = {"for", "this", "my", "the", "a", "an", "of", "in", "on"}
+                header_words = set(raw_header.lower().split()) - _h_stopwords
+                is_neutral   = not bool(header_words - _BLOCKED_NAME_WORDS)
+                if not is_neutral:
+                    # Named header → named list (any bucket)
                     actions["save_as_list"] = True
                     result["list"] = {
                         "list_name": raw_header,
-                        "list_type": "todo",
+                        "list_type": _classify_list_type(raw_header),
                         "items":     items,
                         "due_date":  date_str,
-                        "bucket":    "To-Do",
+                        "bucket":    bucket,
                     }
                     result["priority"] = priority
                     result["essence"]  = content[:100]
                     return result
+                elif bucket == "To-Do":
+                    # Neutral header + To-Do → split as individual tasks
+                    result["tasks"] = [
+                        {"task": item, "due_date": date_str, "time": time_str, "priority": priority}
+                        for item in items
+                    ]
+                    result["priority"] = priority
+                    result["essence"]  = content[:100]
+                    return result
+                # Neutral header + non-To-Do → fall through, save as plain note/idea/etc.
+
+        # ── Single-line inline list: "Header: item1, item2, ..." ─────
+        # Handles "Places in Goa: Baga, Fort Aguada" / "People to call: Rahul, Aditi"
+        # Only fires when no newline (multi-line handled above) and classifier is
+        # confident enough to skip the LLM — purely format-based, no list-signal gate.
+        elif '\n' not in content:
+            _inline_m = re.match(r'^([\w][\w\s\-]+?):\s*(.{5,})$', content)
+            if _inline_m:
+                from services.list_service import _BLOCKED_NAME_WORDS, _classify_list_type
+                _raw_header = _inline_m.group(1).strip()
+                _parts      = re.split(r'[,;]|\band\b', _inline_m.group(2), flags=re.IGNORECASE)
+                _items      = [p.strip() for p in _parts if len(p.strip()) >= 2]
+                if len(_items) >= 2:
+                    _h_stopwords = {"for", "this", "my", "the", "a", "an", "of", "in", "on"}
+                    _hwords      = set(_raw_header.lower().split()) - _h_stopwords
+                    if bool(_hwords - _BLOCKED_NAME_WORDS):
+                        actions["save_as_list"] = True
+                        result["list"] = {
+                            "list_name": _raw_header,
+                            "list_type": _classify_list_type(_raw_header),
+                            "items":     _items,
+                            "due_date":  date_str,
+                            "bucket":    bucket,
+                        }
+                        result["priority"] = priority
+                        result["essence"]  = content[:100]
+                        return result
 
         # ── Build task / note / etc. ──────────────────────────────
         if actions["save_as_todo"]:

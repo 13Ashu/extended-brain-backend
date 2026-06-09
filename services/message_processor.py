@@ -642,7 +642,6 @@ class MessageProcessor:
         message_type: str, media_url: Optional[str], db: AsyncSession, ref: datetime
     ) -> Dict:
         """Save a single task, optionally with reminder and event."""
-        task_text = str(task.get("task", content)).strip() or content
         due_date  = task.get("due_date") or _today_str()
         evt_time  = task.get("time")
         priority  = task.get("priority", "normal")
@@ -666,9 +665,9 @@ class MessageProcessor:
         )
 
         tags = {
-            "keywords":       [task_text],
+            "keywords":       [content],
             "entities":       {"people": people},
-            "actionables":    [task_text],
+            "actionables":    [content],
             "sentiment":      "neutral",
             "priority":       priority,
             "time_reference": "today" if due_date == _today_str() else "future",
@@ -677,20 +676,20 @@ class MessageProcessor:
             "primary_bucket": primary_bucket,
             "due_date":       due_date,
             "events": (
-                [{"date": due_date, "time": evt_time, "label": task_text[:40]}]
+                [{"date": due_date, "time": evt_time, "label": content[:40]}]
                 if evt_time else []
             ),
-            # Preserve original dump text so retrieval works even if task was paraphrased
-            "original_dump":  content[:300] if content != task_text else "",
         }
 
+        # Always store the user's original text — never the LLM-rewritten task description.
+        # due_date/priority/evt_time come from the parsed task dict; content stays verbatim.
         msg = Message(
             user_id=user.id,
             category_id=category.id,
-            content=task_text,
+            content=content,
             message_type=MessageType(message_type),
             media_url=media_url,
-            summary=task_text[:100],
+            summary=content[:100],
             tags=tags,
             created_at=ref,
         )
@@ -701,14 +700,14 @@ class MessageProcessor:
         # Debug: confirm what was stored in DB tags
         stored_tags = msg.tags if isinstance(msg.tags, dict) else {}
         print(f"[task_save] id={msg.id} primary={primary_bucket} due={stored_tags.get('due_date')!r} "
-              f"event_time={stored_tags.get('event_time')!r} task='{task_text[:50]}'")
+              f"event_time={stored_tags.get('event_time')!r} task='{content[:50]}'")
 
         result = {
             "message_id":  msg.id,
             "category":    primary_bucket,
             "all_buckets": buckets,
             "tags":        [],
-            "essence":     parsed.get("essence") or task_text,
+            "essence":     content,
             "connections": [],
             "due_date":    due_date,
             "events":      tags["events"],
@@ -721,13 +720,13 @@ class MessageProcessor:
                 rem_data = parsed.get("reminder") or {}
                 reminder = await self.reminder_service.create(
                     user=user,
-                    content=task_text,
+                    content=content,
                     analysis={
                         "event_time":  evt_time,
                         "due_date":    due_date,
                         "priority":    priority,
-                        "actionables": [task_text],
-                        "essence":     task_text,
+                        "actionables": [content],
+                        "essence":     content,
                     },
                     message_id=msg.id,
                     db=db,
@@ -738,7 +737,7 @@ class MessageProcessor:
             except Exception as e:
                 print(f"⚠ Reminder failed: {e}")
 
-        await self._save_embedding(msg.id, task_text, {}, db)
+        await self._save_embedding(msg.id, content, {}, db)
         return result
 
     async def _process_track(

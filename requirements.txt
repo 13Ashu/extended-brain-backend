@@ -44,4 +44,7 @@ firebase-admin
 onnxruntime
 transformers
 
+# Fuzzy text matching for search scoring
+rapidfuzz
+
 
