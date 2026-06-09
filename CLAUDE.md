@@ -53,7 +53,7 @@ extended-brain-backend/
 │   ├── intent_service.py     ← ★ Two-path parse: ONNX fast → Gemini slow
 │   ├── message_processor.py  ← Rule-based bucket pre-filter + time/entity extraction
 │   ├── auth_service.py       ← OTP, JWT creation/verify, password hashing
-│   ├── search_service.py     ← Semantic search: embed → pgvector → LLM rank
+│   ├── search_service.py     ← Two-tier search: keyword (fast) + embed+expand (slow, parallel)
 │   ├── embedding_service.py  ← Gemini embedding generation (1536 dims)
 │   ├── redis_cache.py        ← Upstash Redis wrapper (async, graceful)
 │   ├── list_service.py       ← Named list management (shopping, packing, etc.)
@@ -99,7 +99,7 @@ extended-brain-backend/
 | **Intent classifier (ONNX fast path)** | **`services/classifier_service.py`** |
 | **Intent parse orchestrator** | **`services/intent_service.py`** — routes to ONNX or Gemini |
 | Rule-based time/entity extraction | `services/message_processor.py` |
-| Semantic search | `services/search_service.py` |
+| Semantic search + fuzzy text ranking | `services/search_service.py` |
 | Embeddings | `services/embedding_service.py` |
 | Redis caching | `services/redis_cache.py` |
 | Pro accounts / groups | `services/group_service.py` |
@@ -157,7 +157,7 @@ extended-brain-backend/
 ### Search & Upload
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/search` | Semantic search (`?fast=true` skips LLM rerank) |
+| POST | `/api/search` | Two-tier search: `fast=true` = keyword-only (~5ms); `fast=false` = embed + optional LLM expand in parallel |
 | POST | `/api/upload` | Upload image (multipart) → returns URL |
 | GET | `/api/images/{id}` | Download stored image |
 
@@ -449,15 +449,44 @@ classifier_service.classify(text)        ← ONNX, ~10ms, no network
 **`_build_from_bucket()`** in `intent_service.py`:
 - Constructs the full actions dict from the classifier bucket + regex-extracted time/date/reminder flags
 - Bypasses LLM entirely for routine captures; still runs rule-based extraction for `event_time`, `due_date`, `is_reminder`
+- **Also detects list format for ALL buckets** (not just To-Do): named header + bullets/colon/bare-lines/inline-comma → `save_as_list=True`. This is bucket-agnostic — "Places to visit in Goa:\n- Baga\n- Anjuna" → Remember bucket + is_list=True.
+- Neutral headers (todo/tasks/today/tomorrow) + To-Do → split to individual task rows, NOT a list.
+
+**List format detection in `_build_from_bucket()` — four signals (priority order):**
+1. Bullets/numbered lines (`\n- item` or `\n1. item`) — highest confidence
+2. Colon at end of header line (`Header:\nitem1\nitem2`)
+3. Bare short lines ≤5 words each (requires named header — filters prose)
+4. Single-line inline (`Header: item1, item2, item3`) — 2+ items required
 
 **Slow path** (Gemini 2.5 Flash Lite, paid):
 - `CerebrasClient(provider="gemini", model="gemini-2.5-flash-lite")` — default provider and model
 - Full structured prompt → JSON response with bucket, summary, entities, time, reminder flag
 - Retry: 3 attempts, exponential backoff on 429/500/503
 
+### Search Pipeline — Two-Tier Architecture
+
+iOS makes two calls per search query:
+
+**Tier 1 — `fast=True` (~5ms, shown immediately):**
+- Keyword ILIKE match only — no embedding, no LLM
+- Returns the top text-match result instantly
+
+**Tiers 2+3 — `fast=False` (~300ms, replaces tier-1 result):**
+- Tier 2: `embed(query)` → pgvector cosine similarity — starts immediately
+- Tier 3: LLM `_expand_query()` → richer keywords — starts in parallel with Tier 2, skipped if ≤3 words
+- Both run concurrently via `asyncio.create_task()`; results merged and ranked
+
+**Scoring (`_score()` in `search_service.py`):**
+- Primary text: `rapidfuzz.token_set_ratio(query, content) × 0.60` (max +60)
+  - Handles word order, partial words, minor typos — "people call" = "people to call" = 100
+- Semantic: `embedding_similarity × 15.0` (max +15, secondary to text)
+- Secondary fields: subtasks ×0.15, split_from ×0.12, original_dump ×0.12
+- Expansion terms, entities, bucket hints, due-date, recency: unchanged
+- `natural_response` is always `""` (LLM summary generation commented out, reserved for future)
+
 ### Other LLM Use Cases — all use Gemini 2.5 Flash Lite (paid)
 1. Reminder + recurrence temporal parsing (`recurrence_service.parse_temporal`) — one LLM call extracts time, date, recurrence rule, multi-day patterns
-2. Search result re-ranking (`search_service`)
+2. Search query expansion for long queries >3 words (`search_service._expand_query`)
 3. Morning briefing generation (`briefing_service`)
 4. Category suggestions (`category_manager`)
 5. Subtask breakdown (`subtask_service`)
@@ -475,7 +504,7 @@ Gemini `text-embedding-004` via REST, 1536 dims, stored in pgvector column on `m
 - Use `async with get_db() as db:` (or the FastAPI `Depends(get_db)` pattern) — never create a session manually.
 - Run through `cerebras_client` for all LLM calls — it handles retries and uses Gemini 2.5 Flash Lite (paid). Never instantiate `CerebrasClient` without `provider="gemini"`.
 - Invalidate the relevant Redis cache keys when mutating messages or groups.
-- Respect the 7 bucket names exactly: `"Remember"`, `"To-Do"`, `"Ideas"`, `"Track"`, `"Events"`, `"List"`, `"Random"`.
+- Respect the 6 bucket names exactly: `"Remember"`, `"To-Do"`, `"Ideas"`, `"Track"`, `"Events"`, `"Random"`. `"List"` is **not a bucket** — it is a format flag (`tags.is_list=true`).
 - New routes go in `main.py` (that's the current convention, even if undesirable).
 
 ## Things to Never Do
