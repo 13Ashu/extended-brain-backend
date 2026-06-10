@@ -27,6 +27,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from cerebras_client import CerebrasClient
 from database import Category, Message, User
 
+class _SemanticSkipped(Exception):
+    """Sentinel: tier-1 fast path intentionally skips embedding search (not an error)."""
+
+
 BUCKET_NAMES = ["Remember", "To-Do", "Ideas", "Track", "Events", "List", "Random"]
 
 BUCKET_ALIASES: Dict[str, str] = {
@@ -45,6 +49,31 @@ TODO_KEYWORDS = {
     "todo", "to-do", "to do", "task", "tasks", "pending",
     "checklist", "check list",
 }
+
+# Structural words that appear in nearly every list/task title. They carry no
+# topical signal — "movie list" must NOT match every *list*. Stripped from the
+# query before keyword retrieval and fuzzy scoring so the distinctive noun
+# ("movie", "shopping", "grocery") is what actually ranks results.
+STRUCTURAL_STOPWORDS = {
+    "list", "lists", "todo", "to-do", "todos", "task", "tasks",
+}
+
+
+def _topic_words(words: List[str]) -> List[str]:
+    """Drop structural stopwords, but never return empty (bare 'list' query keeps it)."""
+    stripped = [w for w in words if w not in STRUCTURAL_STOPWORDS]
+    return stripped or words
+
+
+def _best_partial(query_words: List[str], doc_tokens: List[str]) -> float:
+    """Per-token best partial_ratio, averaged — bridges singular/plural and
+    substring topic words ('movie' → 'movies') that token_set_ratio misses."""
+    from rapidfuzz import fuzz
+    if not query_words or not doc_tokens:
+        return 0.0
+    return sum(
+        max(fuzz.partial_ratio(w, t) for t in doc_tokens) for w in query_words
+    ) / len(query_words)
 
 DUE_DATE_SIGNALS = {
     "due", "todo", "to-do", "task", "pending", "scheduled for",
@@ -529,7 +558,7 @@ Return ONLY this JSON:
         MIN_SEMANTIC_SIMILARITY = 0.40
         try:
             if skip_semantic:
-                raise ValueError("semantic skipped")
+                raise _SemanticSkipped
             from services.embedding_service import embedding_service
             query_embedding = precomputed_embedding or await embedding_service.aembed_query(query)
             embedding_str   = f"[{','.join(map(str, query_embedding))}]"
@@ -565,6 +594,8 @@ Return ONLY this JSON:
                                  if sim >= max_sim - RELATIVE_GAP}
                 scores = sorted(semantic_hits.values(), reverse=True)
                 print(f"[search] semantic hits={len(scores)} scores={[round(s,3) for s in scores[:5]]} (floor={MIN_SEMANTIC_SIMILARITY} gap={RELATIVE_GAP})")
+        except _SemanticSkipped:
+            pass  # fast tier-1 path: keyword-only by design, not a failure
         except Exception as e:
             print(f"⚠ Semantic search failed: {e}")
 
@@ -618,8 +649,10 @@ Return ONLY this JSON:
                 )
 
         kw_conds  = []
-        # Raw query words always searched first — zero LLM dependency, instant match
-        raw_query_words = [w for w in query.lower().split() if len(w) > 2]
+        # Raw query words always searched first — zero LLM dependency, instant match.
+        # Strip structural words ("list", "todo", …) so "movie list" retrieves on
+        # "movie" alone instead of OR-matching every list the user owns.
+        raw_query_words = _topic_words([w for w in query.lower().split() if len(w) > 2])
         for i, w in enumerate(raw_query_words):
             pattern = f"%{w}%"
             kw_conds.append(func.lower(Message.content).contains(w))
@@ -772,14 +805,18 @@ Return ONLY this JSON:
         # Semantic score (secondary to text)
         score += getattr(message, "_semantic_score", 0.0) * 15.0
 
-        # Primary text score via token_set_ratio:
-        # returns 100 when all query words appear in the stored text (any order, any extras).
-        # "people call" → "people to call" = 100 (same as exact match)
-        # "peoples call" → "people to call" = 84 (fuzzy on typo)
-        # Take max(content, summary) to avoid double-counting.
+        # Primary text score. Strip structural stopwords first ("movie list" → "movie")
+        # so the distinctive noun decides relevance, not the ubiquitous word "list".
+        # Combine two signals (take the max):
+        #   • token_set_ratio  — word order / extras   ("people call" → "people to call" = 100)
+        #   • per-token partial — singular/plural, substring topic words ("movie" → "movies" = 100)
+        q_words   = _topic_words([w for w in q_lower.split() if len(w) > 2]) or q_lower.split()
+        topic_q   = " ".join(q_words)
         text_tsr = max(
-            fuzz.token_set_ratio(q_lower, content),
-            fuzz.token_set_ratio(q_lower, summary) if summary else 0,
+            fuzz.token_set_ratio(topic_q, content),
+            fuzz.token_set_ratio(topic_q, summary) if summary else 0,
+            _best_partial(q_words, content.split()),
+            _best_partial(q_words, summary.split()) if summary else 0,
         )
         score += text_tsr * 0.60   # 100 → +60, 84 → +50, 0 → +0
 
@@ -797,11 +834,14 @@ Return ONLY this JSON:
             score += fuzz.token_set_ratio(q_lower, original_dump) * 0.12   # max +12
 
         for c in expansion.get("core_concepts", []):
-            if c.lower() in content: score += 6.0
-            if c.lower() in summary: score += 4.0
+            cl = c.lower()
+            if cl in STRUCTURAL_STOPWORDS: continue
+            if cl in content: score += 6.0
+            if cl in summary: score += 4.0
 
         for kw in expansion.get("keywords", []):
             kl = kw.lower()
+            if kl in STRUCTURAL_STOPWORDS: continue
             if kl in content: score += 2.5
             if kl in summary: score += 1.5
 
