@@ -712,10 +712,19 @@ async def delete_account(
             .values(invited_by=owner_id)
         )
 
-    # 2. Purge single-user-owned dependent rows. Recurrences and Reminders both
-    #    have FK → messages.id so they must go before messages are deleted.
+    # 2. Purge dependent rows that FK → messages.id or → users.id.
+    #
+    #    Reminders and Recurrences are tricky: another user can hold a reminder
+    #    that references a message THIS user authored (e.g. a group member set a
+    #    reminder on this user's group capture). We must delete BOTH:
+    #      a) rows owned by this user (user_id == uid)
+    #      b) rows pointing at any message authored by this user (message_id IN …)
+    #    Do (b) first so (a) is a no-op subset rather than a duplicate condition.
+    user_msg_ids_subq = select(Message.id).where(Message.user_id == uid).scalar_subquery()
     for stmt in (
+        sql_delete(Recurrence).where(Recurrence.message_id.in_(user_msg_ids_subq)),
         sql_delete(Recurrence).where(Recurrence.user_id == uid),
+        sql_delete(Reminder).where(Reminder.message_id.in_(user_msg_ids_subq)),
         sql_delete(Reminder).where(Reminder.user_id == uid),
         sql_delete(LabelAnnotation).where(LabelAnnotation.user_id == uid),
         sql_delete(DeviceToken).where(DeviceToken.user_id == uid),
@@ -735,6 +744,9 @@ async def delete_account(
             select(Group.id).where(Group.account_id == owned_account_id)
         )).scalars().all()
         if group_ids:
+            group_msg_ids_subq = select(Message.id).where(Message.group_id.in_(group_ids)).scalar_subquery()
+            await db.execute(sql_delete(Recurrence).where(Recurrence.message_id.in_(group_msg_ids_subq)))
+            await db.execute(sql_delete(Reminder).where(Reminder.message_id.in_(group_msg_ids_subq)))
             await db.execute(sql_delete(Message).where(Message.group_id.in_(group_ids)))
             await db.execute(sql_delete(GroupLastSeen).where(GroupLastSeen.group_id.in_(group_ids)))
             await db.execute(sql_delete(GroupMember).where(GroupMember.group_id.in_(group_ids)))
