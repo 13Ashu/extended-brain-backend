@@ -712,9 +712,10 @@ async def delete_account(
             .values(invited_by=owner_id)
         )
 
-    # 2. Purge single-user-owned dependent rows (reminders/annotations first so the
-    #    user's messages are no longer referenced).
+    # 2. Purge single-user-owned dependent rows. Recurrences and Reminders both
+    #    have FK → messages.id so they must go before messages are deleted.
     for stmt in (
+        sql_delete(Recurrence).where(Recurrence.user_id == uid),
         sql_delete(Reminder).where(Reminder.user_id == uid),
         sql_delete(LabelAnnotation).where(LabelAnnotation.user_id == uid),
         sql_delete(DeviceToken).where(DeviceToken.user_id == uid),
@@ -905,7 +906,11 @@ async def reset_personal_data(
     authored inside groups. Preserves the account, Pro status, and group
     memberships themselves (other members' messages are untouched).
     """
-    # Reminders first — they hold a FK to messages.id; unlink annotations (preserve training data)
+    # Recurrences and Reminders both FK to messages.id — delete before messages.
+    # Unlink annotations (preserve training data) rather than deleting them.
+    await db.execute(
+        sql_delete(Recurrence).where(Recurrence.user_id == current_user.id)
+    )
     await db.execute(
         sql_delete(Reminder).where(Reminder.user_id == current_user.id)
     )
