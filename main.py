@@ -82,6 +82,47 @@ async def lifespan(app: FastAPI):
     print("✓ Extended Brain API shutdown")
 
 
+async def _cleanup_stale_data():
+    """Delete completed To-Do messages older than 7 days and fired one-time reminders older than 7 days."""
+    cutoff = datetime.utcnow() - timedelta(days=7)
+    async with async_session_maker() as db:
+        # Find stale completed To-Do message IDs (done_at stored as ISO string in JSONB)
+        stale_result = await db.execute(
+            select(Message.id).where(
+                Message.tags["primary_bucket"].astext == "To-Do",
+                Message.tags["done"].astext == "true",
+                Message.tags["done_at"].astext.isnot(None),
+                text("(messages.tags->>'done_at')::timestamp < :cutoff").bindparams(cutoff=cutoff),
+            )
+        )
+        stale_ids = [r[0] for r in stale_result.all()]
+
+        if stale_ids:
+            await db.execute(sql_delete(Reminder).where(Reminder.message_id.in_(stale_ids)))
+            await db.execute(sql_delete(Recurrence).where(Recurrence.message_id.in_(stale_ids)))
+            await db.execute(
+                update(LabelAnnotation)
+                .where(LabelAnnotation.message_id.in_(stale_ids))
+                .values(message_id=None)
+            )
+            await db.execute(sql_delete(Message).where(Message.id.in_(stale_ids)))
+            await db.commit()
+            print(f"[cleanup] Deleted {len(stale_ids)} completed To-Do messages older than 7 days")
+
+        # Delete fired one-time reminders (recurrence IS NULL = not recurring) older than 7 days
+        fired_result = await db.execute(
+            sql_delete(Reminder).where(
+                Reminder.is_sent == True,
+                Reminder.recurrence.is_(None),
+                Reminder.sent_at < cutoff,
+            )
+        )
+        await db.commit()
+        fired_count = fired_result.rowcount
+        if fired_count:
+            print(f"[cleanup] Deleted {fired_count} fired one-time reminders older than 7 days")
+
+
 async def _master_scheduler():
     """Single scheduler loop — runs every 60 seconds."""
     print("[scheduler] Master scheduler started")
@@ -97,6 +138,10 @@ async def _master_scheduler():
             if tick % 30 == 0:
                 await nudge_service.run_idle_nudges()
                 await nudge_service.run_followup_checks()
+
+            # Run stale data cleanup once at startup and then every 24 hours
+            if tick == 1 or tick % 1440 == 0:
+                await _cleanup_stale_data()
 
         except asyncio.CancelledError:
             break
@@ -3344,16 +3389,22 @@ async def delete_message(
 
 @app.get("/api/reminders")
 async def list_reminders(
+    group_id: Optional[int] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return all non-cancelled reminders for the current user (past and upcoming)."""
-    result = await db.execute(
+    """Return non-cancelled reminders scoped to personal brain or a specific group."""
+    stmt = (
         select(Reminder)
+        .outerjoin(Message, Reminder.message_id == Message.id)
         .where(Reminder.user_id == current_user.id, Reminder.is_cancelled == False)
-        .order_by(Reminder.remind_at.desc())
-        .limit(200)
     )
+    if group_id is not None:
+        stmt = stmt.where(Message.group_id == group_id)
+    else:
+        stmt = stmt.where(or_(Reminder.message_id == None, Message.group_id == None))
+    stmt = stmt.order_by(Reminder.remind_at.desc()).limit(200)
+    result = await db.execute(stmt)
     reminders = result.scalars().all()
     now = datetime.utcnow()
     items = []
@@ -3424,18 +3475,22 @@ async def delete_reminder(
 
 @app.get("/api/recurrences")
 async def list_recurrences(
+    group_id: Optional[int] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return all active recurring reminders for the current user."""
-    result = await db.execute(
+    """Return active recurring reminders scoped to personal brain or a specific group."""
+    stmt = (
         select(Recurrence)
-        .where(
-            Recurrence.user_id == current_user.id,
-            Recurrence.is_active == True,
-        )
-        .order_by(Recurrence.created_at.desc())
+        .outerjoin(Message, Recurrence.message_id == Message.id)
+        .where(Recurrence.user_id == current_user.id, Recurrence.is_active == True)
     )
+    if group_id is not None:
+        stmt = stmt.where(Message.group_id == group_id)
+    else:
+        stmt = stmt.where(or_(Recurrence.message_id == None, Message.group_id == None))
+    stmt = stmt.order_by(Recurrence.created_at.desc())
+    result = await db.execute(stmt)
     recs = result.scalars().all()
     items = []
     for r in recs:
