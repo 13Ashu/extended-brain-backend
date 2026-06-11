@@ -226,6 +226,11 @@ class GroupService:
         if not acct:
             return {"success": False, "message": "You need a Pro plan to create groups. Use /upgrade to learn more."}
 
+        # Only the Pro account OWNER may create groups. Invited members belong to
+        # the owner's account but can only participate in groups, not create them.
+        if acct.owner_id != creator.id:
+            return {"success": False, "message": "Only the Pro account owner can create groups. Ask the owner to create one and add you."}
+
         # Deduplicate within account
         existing = await db.scalar(
             select(Group).where(Group.account_id == acct.id, Group.name.ilike(name))

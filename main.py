@@ -26,7 +26,7 @@ from config import Config, MessagingPlatform
 from messaging_factory import create_messaging_client, get_platform_name
 from messaging_interface import MessagingClient
 
-from database import get_db, init_db, engine, Base, async_session_maker, DeviceToken, StoredImage, GroupLastSeen, LabelAnnotation
+from database import get_db, init_db, engine, Base, async_session_maker, DeviceToken, StoredImage, GroupLastSeen, LabelAnnotation, IAPTransaction, PaymentOrder
 from models import User, Message, Category, MessageType, ProAccount, ProAccountMember, Group, GroupMember, CouponCode, CouponRedemption
 from services.group_service import group_service as grp_svc
 from services.coupon_service import coupon_service as cpn_svc
@@ -664,7 +664,91 @@ async def delete_account(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await db.delete(current_user)
+    """
+    Permanently delete the account and all data the user owns.
+
+    Deletes in FK-dependency order (most rows have no ON DELETE CASCADE at the
+    DB level, so a bare `db.delete(user)` would fail for any non-trivial user):
+      1. Reassign cross-account ownership refs (groups/invites this user created
+         inside SOMEONE ELSE'S Pro account) to that account's owner.
+      2. Purge single-user-owned rows that FK to users.id / messages.id.
+      3. Tear down the user's OWN Pro account (cascades members + groups).
+      4. Delete the user's own messages everywhere (personal + group-authored).
+      5. Delete the user (cascades categories + group memberships).
+    """
+    uid = current_user.id
+
+    owned_account = await db.scalar(select(ProAccount).where(ProAccount.owner_id == uid))
+    owned_account_id = owned_account.id if owned_account else None
+
+    # 1. Reassign cross-account references via raw UPDATE so the ORM session
+    #    doesn't get confused trying to flush related ProAccount objects.
+    #
+    #    Groups this user created inside SOMEONE ELSE'S account: hand to that owner.
+    other_account_ids_groups = (await db.execute(
+        select(ProAccount.id, ProAccount.owner_id)
+        .join(Group, Group.account_id == ProAccount.id)
+        .where(Group.created_by == uid)
+        .where(ProAccount.owner_id != uid)
+    )).all()
+    for acct_id, owner_id in other_account_ids_groups:
+        await db.execute(
+            update(Group)
+            .where(Group.account_id == acct_id, Group.created_by == uid)
+            .values(created_by=owner_id)
+        )
+
+    #    Invites this user sent inside SOMEONE ELSE'S account: hand to that owner.
+    other_account_ids_invites = (await db.execute(
+        select(ProAccount.id, ProAccount.owner_id)
+        .join(ProAccountMember, ProAccountMember.account_id == ProAccount.id)
+        .where(ProAccountMember.invited_by == uid)
+        .where(ProAccount.owner_id != uid)
+    )).all()
+    for acct_id, owner_id in other_account_ids_invites:
+        await db.execute(
+            update(ProAccountMember)
+            .where(ProAccountMember.account_id == acct_id, ProAccountMember.invited_by == uid)
+            .values(invited_by=owner_id)
+        )
+
+    # 2. Purge single-user-owned dependent rows (reminders/annotations first so the
+    #    user's messages are no longer referenced).
+    for stmt in (
+        sql_delete(Reminder).where(Reminder.user_id == uid),
+        sql_delete(LabelAnnotation).where(LabelAnnotation.user_id == uid),
+        sql_delete(DeviceToken).where(DeviceToken.user_id == uid),
+        sql_delete(StoredImage).where(StoredImage.user_id == uid),
+        sql_delete(IAPTransaction).where(IAPTransaction.user_id == uid),
+        sql_delete(PaymentOrder).where(PaymentOrder.user_id == uid),
+        sql_delete(CouponRedemption).where(CouponRedemption.user_id == uid),
+        sql_delete(GroupLastSeen).where(GroupLastSeen.user_id == uid),
+    ):
+        await db.execute(stmt)
+
+    # 3. Tear down the user's own Pro account: wipe its groups' shared content, then
+    #    the groups, members, and the account itself. Explicit bulk deletes (not
+    #    `db.delete(instance)`) avoid async lazy-loading of cascade relationships.
+    if owned_account_id is not None:
+        group_ids = (await db.execute(
+            select(Group.id).where(Group.account_id == owned_account_id)
+        )).scalars().all()
+        if group_ids:
+            await db.execute(sql_delete(Message).where(Message.group_id.in_(group_ids)))
+            await db.execute(sql_delete(GroupLastSeen).where(GroupLastSeen.group_id.in_(group_ids)))
+            await db.execute(sql_delete(GroupMember).where(GroupMember.group_id.in_(group_ids)))
+        await db.execute(sql_delete(Group).where(Group.account_id == owned_account_id))
+        await db.execute(sql_delete(ProAccountMember).where(ProAccountMember.account_id == owned_account_id))
+        await db.execute(sql_delete(ProAccount).where(ProAccount.id == owned_account_id))
+
+    # 4. Delete the user's own messages everywhere (personal + authored in groups
+    #    owned by others). Reminders/annotations referencing them are already gone.
+    await db.execute(sql_delete(Message).where(Message.user_id == uid))
+
+    # 5. Delete the user's remaining owned rows, then the user itself.
+    await db.execute(sql_delete(Category).where(Category.user_id == uid))
+    await db.execute(sql_delete(GroupMember).where(GroupMember.user_id == uid))
+    await db.execute(sql_delete(User).where(User.id == uid))
     await db.commit()
     return {"success": True, "message": "Account deleted."}
 
@@ -816,7 +900,11 @@ async def reset_personal_data(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete all personal messages and reminders. Preserves account, pro status, groups."""
+    """
+    Delete all of the user's captured content — personal AND the messages they
+    authored inside groups. Preserves the account, Pro status, and group
+    memberships themselves (other members' messages are untouched).
+    """
     # Reminders first — they hold a FK to messages.id; unlink annotations (preserve training data)
     await db.execute(
         sql_delete(Reminder).where(Reminder.user_id == current_user.id)
@@ -824,13 +912,12 @@ async def reset_personal_data(
     await db.execute(
         update(LabelAnnotation).where(LabelAnnotation.user_id == current_user.id).values(message_id=None)
     )
+    # All messages this user authored, in personal feed and in any group.
     await db.execute(
-        sql_delete(Message).where(
-            and_(Message.user_id == current_user.id, Message.group_id.is_(None))
-        )
+        sql_delete(Message).where(Message.user_id == current_user.id)
     )
     await db.commit()
-    return {"success": True, "message": "Personal data cleared."}
+    return {"success": True, "message": "Brain data cleared."}
 
 
 @app.post("/api/users/register")
