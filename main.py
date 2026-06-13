@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 import os
 import re
+import secrets
 import asyncio
 import httpx
 from sqlalchemy import and_, or_, select, update, func, text, delete as sql_delete
@@ -4580,19 +4581,21 @@ async def add_group_member(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Add an existing user to a group by user_id. Only the group admin (its Pro
+    owner) may add members; the invitee needs no Pro plan. Subject to the cap."""
     group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found or access denied")
-    # Verify the target user is in the same Pro account
-    acct = await grp_svc.get_pro_account_for_user(current_user.id, db)
-    if not acct:
-        raise HTTPException(status_code=403, detail="Pro account required")
-    member_phones = [m["phone"] for m in await grp_svc.get_account_members(acct.id, db)]
+    if not await grp_svc.is_group_admin(group_id, current_user.id, db):
+        raise HTTPException(status_code=403, detail="Only the group owner can add members.")
     target = await db.get(User, req.user_id)
-    if not target or target.phone_number not in member_phones:
-        raise HTTPException(status_code=403, detail="User is not in your Pro account")
-    added = await grp_svc.add_member_to_group(group, req.user_id, "member", db)
-    return {"success": True, "added": added}
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        added = await grp_svc.add_member_to_group(group, req.user_id, "member", db)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"success": True, "added": added, "name": target.name}
 
 
 @app.post("/api/groups/{group_id}/invite")
@@ -4602,41 +4605,60 @@ async def invite_group_member_by_phone(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Add a group member by phone number (must be in same Pro account)."""
+    """Add a group member by phone number. Only the group admin (its Pro owner) may
+    add members; the invitee needs no Pro plan. If no account exists for the number
+    yet, returns user_exists=false so the client can prompt sharing the invite link."""
     group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
     if not group:
         raise HTTPException(status_code=404, detail="Group not found or access denied")
+    if not await grp_svc.is_group_admin(group_id, current_user.id, db):
+        raise HTTPException(status_code=403, detail="Only the group owner can add members.")
+    result = await grp_svc.add_member_by_phone(group, req.phone_number, db)
+    if not result["success"]:
+        # user_exists=False is a normal "share the link" case, not a hard error,
+        # but full groups should surface as a 409.
+        if result.get("user_exists") and "full" in result["message"].lower():
+            raise HTTPException(status_code=409, detail=result["message"])
+        return result
+    return result
 
-    acct = await grp_svc.get_pro_account_for_user(current_user.id, db)
-    if not acct:
-        raise HTTPException(status_code=403, detail="Pro account required to add members")
 
-    member_row = await db.scalar(
-        select(ProAccountMember).where(
-            ProAccountMember.account_id == acct.id,
-            ProAccountMember.phone_number == req.phone_number,
-            ProAccountMember.status == "active",
-        )
-    )
-    if not member_row:
-        raise HTTPException(status_code=404, detail=f"{req.phone_number} is not in your Pro account")
+@app.get("/api/groups/{group_id}/invite-link")
+async def get_group_invite_link(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the shareable invite link. Only the group admin (its Pro owner) may
+    fetch/share it — that is how members get added."""
+    group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found or access denied")
+    if not await grp_svc.is_group_admin(group_id, current_user.id, db):
+        raise HTTPException(status_code=403, detail="Only the group owner can share the invite link.")
+    # Backfill a token for legacy groups that predate the column.
+    if not group.invite_token:
+        group.invite_token = secrets.token_urlsafe(24)
+        await db.commit()
+    return {
+        "success": True,
+        "token": group.invite_token,
+        "url": f"https://extendedmindsai.com/join/{group.invite_token}",
+        "name": group.name,
+    }
 
-    target_user = await db.scalar(select(User).where(User.id == member_row.user_id))
-    if not target_user:
-        raise HTTPException(status_code=404, detail="User has not linked their account yet")
 
-    existing = await db.scalar(
-        select(GroupMember).where(
-            GroupMember.group_id == group_id,
-            GroupMember.user_id == target_user.id,
-        )
-    )
-    if existing:
-        return {"success": True, "added": False, "name": target_user.name}
-
-    db.add(GroupMember(group_id=group_id, user_id=target_user.id, role="member"))
-    await db.commit()
-    return {"success": True, "added": True, "name": target_user.name}
+@app.post("/api/groups/join/{token}")
+async def join_group(
+    token: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Join a group via its shareable invite link. No Pro requirement."""
+    result = await grp_svc.join_group_by_token(token, current_user, db)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
 
 
 @app.delete("/api/groups/{group_id}/members/{user_id}")

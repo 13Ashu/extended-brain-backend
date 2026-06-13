@@ -175,12 +175,14 @@ extended-brain-backend/
 ### Groups
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/groups` | List user's groups |
-| POST | `/api/groups` | Create group (Pro required) |
+| GET | `/api/groups` | List user's groups (includes `member_count`, `max_members`, `invite_token`) |
+| POST | `/api/groups` | Create group (Pro required) — mints `invite_token`, returns it |
 | GET | `/api/groups/{id}/messages` | Group message feed |
 | GET | `/api/groups/{id}/members` | Group members |
-| POST | `/api/groups/{id}/members` | Add member by user_id |
-| POST | `/api/groups/{id}/invite` | Invite member by phone number |
+| POST | `/api/groups/{id}/members` | **Owner/admin only** — add existing user by `user_id` (per-group cap; 409 if full). Invitee needs no Pro |
+| POST | `/api/groups/{id}/invite` | **Owner/admin only** — add existing user by phone. `user_exists=false` → tell client to share the link |
+| GET | `/api/groups/{id}/invite-link` | **Owner/admin only** — shareable join link `https://extendedmindsai.com/join/{token}` |
+| POST | `/api/groups/join/{token}` | Join via invite link — **no Pro required**, any signed-in user (per-group cap) |
 | DELETE | `/api/groups/{id}/leave` | Leave group |
 | DELETE | `/api/groups/{id}` | Delete group |
 | POST | `/api/groups/{id}/seen` | Mark all group messages as read |
@@ -190,13 +192,13 @@ extended-brain-backend/
 ### Pro Account
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/pro/status` | Pro subscription info + members list |
-| POST | `/api/pro/invite` | Invite member by phone |
-| GET | `/api/pro/my-invites` | Pending invites for current user |
-| POST | `/api/pro/accept-invite` | Accept a team invite |
-| DELETE | `/api/pro/members/{phone}` | Remove Pro team member |
+| GET | `/api/pro/status` | Pro subscription info (still returns a `members` array for back-compat) |
 | POST | `/api/pro/validate-coupon` | Check if coupon code is valid |
 | POST | `/api/pro/redeem-coupon` | Apply coupon to account |
+| ~~POST~~ | ~~`/api/pro/invite`~~ | ⚠️ **Defunct** — account-roster invite. Left for back-compat; not used. Add members at the group level instead |
+| ~~GET~~ | ~~`/api/pro/my-invites`~~ | ⚠️ **Defunct** roster path |
+| ~~POST~~ | ~~`/api/pro/accept-invite`~~ | ⚠️ **Defunct** roster path |
+| ~~DELETE~~ | ~~`/api/pro/members/{phone}`~~ | ⚠️ **Defunct** roster path |
 
 ### Payments — Razorpay (web dashboard only)
 | Method | Path | Description |
@@ -277,11 +279,13 @@ All models in `database.py`. Uses SQLAlchemy 2.0 async with `asyncpg`.
 
 ### Pro & Groups Tables
 
-**`pro_accounts`** — `owner_id` (FK→users, unique), `plan_type`, `max_members`, `expires_at`
+**Membership model (WhatsApp-style, since 2026-06-13):** groups are self-contained. **Creating** a group requires Pro. Only the **group owner (admin/creator — the Pro user)** adds members — by phone, or by sharing the group's invite link. Everyone else just participates; **joining via a shared link is free** (no Pro). There is **no account-wide roster** and **no global member cap** — the cap is **per-group** (`groups.max_members`, default 10). The parent `ProAccount` is now only a billing/ownership anchor.
 
-**`pro_account_members`** — `account_id`, `user_id` (nullable), `phone_number`, `invite_token`, `status` (pending/active), `invited_at`, `joined_at`
+**`pro_accounts`** — `owner_id` (FK→users, unique), `plan_type`, `max_members` (**dead — cap is now per-group**), `expires_at`
 
-**`groups`** — `id`, `account_id` (FK→pro_accounts), `name`, `description`, `emoji`, `created_by`, `created_at`
+**`pro_account_members`** — `account_id`, `user_id` (nullable), `phone_number`, `invite_token`, `status` (pending/active), `invited_at`, `joined_at`. ⚠️ **Defunct** — the old account roster. Table kept (account-deletion logic still references it) but nothing gates group access on it anymore.
+
+**`groups`** — `id`, `account_id` (FK→pro_accounts), `name`, `description`, `emoji`, `invite_token` (unique — the shareable join link), `max_members` (default 10), `created_by`, `created_at`
 
 **`group_members`** — `group_id`, `user_id`, `role`, `joined_at`
 

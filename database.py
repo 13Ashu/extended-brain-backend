@@ -259,7 +259,12 @@ class ProAccountMember(Base):
 
 
 class Group(Base):
-    """Collaborative group within a Pro account."""
+    """Collaborative group within a Pro account.
+
+    Membership is now self-contained per group (WhatsApp-style): anyone with the
+    `invite_token` link can join, up to `max_members`. There is no account-wide
+    roster — the parent ProAccount only anchors ownership/billing.
+    """
     __tablename__ = "groups"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -267,6 +272,10 @@ class Group(Base):
     name: Mapped[str] = mapped_column(String(100))
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     emoji: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    # Shareable join link token (minted at creation). Unique so /join/{token} resolves.
+    invite_token: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True, nullable=True)
+    # Per-group member cap (includes the creator/admin).
+    max_members: Mapped[int] = mapped_column(Integer, default=10)
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -436,12 +445,30 @@ async def init_db():
             "CREATE TABLE IF NOT EXISTS iap_transactions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) NOT NULL, transaction_id VARCHAR(100) UNIQUE NOT NULL, original_transaction_id VARCHAR(100) NOT NULL, product_id VARCHAR(100) NOT NULL, environment VARCHAR(20) DEFAULT 'Production', expires_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW())",
             "CREATE INDEX IF NOT EXISTS idx_iap_transactions_original ON iap_transactions(original_transaction_id)",
             "CREATE INDEX IF NOT EXISTS idx_iap_transactions_user ON iap_transactions(user_id)",
+            # Self-contained group membership (WhatsApp-style): per-group join link + cap
+            "ALTER TABLE groups ADD COLUMN IF NOT EXISTS invite_token VARCHAR(64)",
+            "ALTER TABLE groups ADD COLUMN IF NOT EXISTS max_members INTEGER DEFAULT 10",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_invite_token ON groups(invite_token) WHERE invite_token IS NOT NULL",
         ]
         for stmt in migrations:
             try:
                 await conn.execute(sa_text(stmt))
             except Exception as e:
                 print(f"[migration] skipped: {e}")
+
+        # Backfill invite_token for any group created before the column existed.
+        try:
+            import secrets
+            rows = (await conn.execute(
+                sa_text("SELECT id FROM groups WHERE invite_token IS NULL")
+            )).fetchall()
+            for (gid,) in rows:
+                await conn.execute(
+                    sa_text("UPDATE groups SET invite_token = :tok WHERE id = :gid"),
+                    {"tok": secrets.token_urlsafe(24), "gid": gid},
+                )
+        except Exception as e:
+            print(f"[migration] invite_token backfill skipped: {e}")
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

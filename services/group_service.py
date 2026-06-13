@@ -222,14 +222,13 @@ class GroupService:
     async def create_group(
         self, creator: User, name: str, description: Optional[str], db: AsyncSession
     ) -> Dict[str, Any]:
-        acct = await self.get_pro_account_for_user(creator.id, db)
-        if not acct:
+        # Creating a group requires Pro. Joining/participating does not — see
+        # join_group_by_token / add_member_by_phone (no Pro check on the joiner).
+        if not creator.is_pro:
             return {"success": False, "message": "You need a Pro plan to create groups. Use /upgrade to learn more."}
 
-        # Only the Pro account OWNER may create groups. Invited members belong to
-        # the owner's account but can only participate in groups, not create them.
-        if acct.owner_id != creator.id:
-            return {"success": False, "message": "Only the Pro account owner can create groups. Ask the owner to create one and add you."}
+        # Anchor the group to the creator's own Pro account (created on demand).
+        acct = await self.get_or_create_pro_account(creator, db)
 
         # Deduplicate within account
         existing = await db.scalar(
@@ -243,6 +242,7 @@ class GroupService:
             name=name,
             description=description,
             created_by=creator.id,
+            invite_token=secrets.token_urlsafe(24),
         )
         db.add(group)
         await db.flush()
@@ -251,7 +251,17 @@ class GroupService:
         db.add(GroupMember(group_id=group.id, user_id=creator.id, role="admin"))
         await db.commit()
 
-        return {"success": True, "group_id": group.id, "name": group.name}
+        return {
+            "success": True,
+            "group_id": group.id,
+            "name": group.name,
+            "invite_token": group.invite_token,
+        }
+
+    async def _member_count(self, group_id: int, db: AsyncSession) -> int:
+        return await db.scalar(
+            select(func.count()).select_from(GroupMember).where(GroupMember.group_id == group_id)
+        ) or 0
 
     async def add_member_to_group(
         self, group: Group, user_id: int, role: str = "member", db: AsyncSession = None
@@ -263,9 +273,65 @@ class GroupService:
         )
         if existing:
             return False
+        count = await self._member_count(group.id, db)
+        if count >= (group.max_members or 10):
+            raise ValueError(f"This group is full ({group.max_members or 10} members max).")
         db.add(GroupMember(group_id=group.id, user_id=user_id, role=role))
         await db.commit()
         return True
+
+    async def join_group_by_token(self, token: str, user: User, db: AsyncSession) -> Dict[str, Any]:
+        """Join a group via its shareable invite link. No Pro requirement."""
+        group = await db.scalar(select(Group).where(Group.invite_token == token))
+        if not group:
+            return {"success": False, "message": "This invite link is invalid or has expired."}
+
+        existing = await db.scalar(
+            select(GroupMember).where(
+                GroupMember.group_id == group.id, GroupMember.user_id == user.id
+            )
+        )
+        if existing:
+            return {"success": True, "group_id": group.id, "name": group.name, "already_member": True}
+
+        count = await self._member_count(group.id, db)
+        if count >= (group.max_members or 10):
+            return {"success": False, "message": f"This group is full ({group.max_members or 10} members max)."}
+
+        db.add(GroupMember(group_id=group.id, user_id=user.id, role="member"))
+        await db.commit()
+        return {"success": True, "group_id": group.id, "name": group.name, "already_member": False}
+
+    async def add_member_by_phone(
+        self, group: Group, phone_number: str, db: AsyncSession
+    ) -> Dict[str, Any]:
+        """Add an existing user to a group by phone number. No Pro requirement on the
+        invitee. If no account exists for the phone yet, the inviter should share the
+        group link instead (returned by the caller)."""
+        target = await db.scalar(select(User).where(User.phone_number == phone_number))
+        if not target:
+            return {
+                "success": False,
+                "user_exists": False,
+                "message": "No account with that number yet. Share the group invite link instead.",
+            }
+        existing = await db.scalar(
+            select(GroupMember).where(
+                GroupMember.group_id == group.id, GroupMember.user_id == target.id
+            )
+        )
+        if existing:
+            return {"success": True, "added": False, "user_exists": True, "name": target.name}
+        count = await self._member_count(group.id, db)
+        if count >= (group.max_members or 10):
+            return {
+                "success": False,
+                "user_exists": True,
+                "message": f"This group is full ({group.max_members or 10} members max).",
+            }
+        db.add(GroupMember(group_id=group.id, user_id=target.id, role="member"))
+        await db.commit()
+        return {"success": True, "added": True, "user_exists": True, "name": target.name}
 
     async def get_user_groups(self, user_id: int, db: AsyncSession) -> List[Dict]:
         rows = await db.execute(
@@ -286,6 +352,8 @@ class GroupService:
                 "emoji": group.emoji or "👥",
                 "role": membership.role,
                 "member_count": member_count,
+                "max_members": group.max_members or 10,
+                "invite_token": group.invite_token,
                 "created_at": group.created_at.isoformat(),
             })
         return groups
@@ -309,6 +377,18 @@ class GroupService:
         )
         row = rows.first()
         return row[0] if row else None
+
+    async def is_group_admin(self, group_id: int, user_id: int, db: AsyncSession) -> bool:
+        """True only for the group's admin (its Pro creator). Member-management
+        actions (add by phone, fetch/share the invite link) are restricted to them."""
+        row = await db.scalar(
+            select(GroupMember).where(
+                GroupMember.group_id == group_id,
+                GroupMember.user_id == user_id,
+                GroupMember.role == "admin",
+            )
+        )
+        return row is not None
 
     async def get_group_members(self, group_id: int, db: AsyncSession) -> List[Dict]:
         rows = await db.execute(
