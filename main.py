@@ -3777,7 +3777,14 @@ async def capture_message(
                     print(f"[temporal] corrected reminder #{result['reminder_id']} → {_utc} UTC")
 
                 # 2. Create recurrence(s) if recurring
-                if temporal.get("is_recurring") and temporal.get("recurrence_rule"):
+                #    Defense in depth: only honour the LLM's recurrence verdict when
+                #    the text actually contains an explicit repetition signal. Stops
+                #    a hallucinated "daily" rule from a one-time "...today" capture.
+                if (
+                    temporal.get("is_recurring")
+                    and temporal.get("recurrence_rule")
+                    and recurrence_service.is_recurring(content)
+                ):
                     _rule      = temporal["recurrence_rule"]
                     _time      = temporal.get("time_of_day") or "09:00"
                     _task      = temporal.get("task") or content

@@ -108,6 +108,12 @@ Return ONLY this JSON (no extra text):
 }}
 
 Rules:
+- is_recurring MUST be false UNLESS the text contains an explicit repetition word:
+  every, everyday, every day, daily, each (day/week/month), weekly, monthly,
+  weekday/weekdays, recurring, repeat, "remind me every ...".
+  A clock time or the words "today" / "tomorrow" / "tonight" / "this evening"
+  are NOT recurrence — they describe a single one-time reminder.
+  When in doubt, choose is_recurring=false.
 - recurrence_rule meanings:
     "daily"        = every single day
     "weekday"      = Mon–Fri only ("weekdays", "all weekdays", "mon-fri")
@@ -132,8 +138,11 @@ Examples:
 "remind me everyday at 7:40am to book tt table"
 → {{"is_recurring":true,"recurrence_rule":"daily","recurrence_days":null,"day_of_week":null,"time_of_day":"07:40","remind_at_date":null,"remind_at_time":null,"task":"book tt table"}}
 
+"remind me to check the app at 2:36 pm today"
+→ {{"is_recurring":false,"recurrence_rule":null,"recurrence_days":null,"day_of_week":null,"time_of_day":null,"remind_at_date":"{today}","remind_at_time":"14:36","task":"check the app"}}
+
 "remind me tomorrow at 3pm to call dentist"
-→ {{"is_recurring":false,"recurrence_rule":null,"recurrence_days":null,"day_of_week":null,"time_of_day":null,"remind_at_date":"{today}","remind_at_time":"15:00","task":"call dentist"}}
+→ {{"is_recurring":false,"recurrence_rule":null,"recurrence_days":null,"day_of_week":null,"time_of_day":null,"remind_at_date":"<the day after {today}>","remind_at_time":"15:00","task":"call dentist"}}
 
 "remind me at 6pm on all weekdays to take this medicine"
 → {{"is_recurring":true,"recurrence_rule":"weekday","recurrence_days":null,"day_of_week":null,"time_of_day":"18:00","remind_at_date":null,"remind_at_time":null,"task":"take this medicine"}}"""
