@@ -181,7 +181,7 @@ extended-brain-backend/
 | GET | `/api/groups/{id}/members` | Group members |
 | POST | `/api/groups/{id}/members` | **Owner/admin only** — add existing user by `user_id` (per-group cap; 409 if full). Invitee needs no Pro |
 | POST | `/api/groups/{id}/invite` | **Owner/admin only** — add existing user by phone. `user_exists=false` → tell client to share the link |
-| GET | `/api/groups/{id}/invite-link` | **Owner/admin only** — shareable join link `https://extendedmindsai.com/join/{token}` |
+| GET | `/api/groups/{id}/invite-link` | **Owner/admin only** — shareable join link `https://www.extendedmindsai.com/join/{token}` |
 | POST | `/api/groups/join/{token}` | Join via invite link — **no Pro required**, any signed-in user (per-group cap) |
 | DELETE | `/api/groups/{id}/leave` | Leave group |
 | DELETE | `/api/groups/{id}` | Delete group |

@@ -4643,7 +4643,7 @@ async def get_group_invite_link(
     return {
         "success": True,
         "token": group.invite_token,
-        "url": f"https://extendedmindsai.com/join/{group.invite_token}",
+        "url": f"https://www.extendedmindsai.com/join/{group.invite_token}",
         "name": group.name,
     }
 
