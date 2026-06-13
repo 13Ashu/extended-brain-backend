@@ -685,15 +685,20 @@ Return ONLY this JSON:
             kw_conds.append(func.lower(Message.content).contains(t))
             kw_conds.append(func.lower(Message.summary).contains(t))
 
-        if kw_conds:
-            stmt = stmt.where(or_(*kw_conds))
-
-        stmt      = stmt.order_by(Message.created_at.desc()).limit(limit)
-        kw_result = await db.execute(stmt)
-        kw_rows   = kw_result.all()
-
-        kw_ids  = {m.id for m, _ in kw_rows}
-        all_ids = kw_ids | set(semantic_hits.keys())
+        # ── [SEMANTIC-ONLY TEST] ──────────────────────────────────────────────
+        # Candidate generation is now embedding-only for the slow (fast=False) path.
+        # The rapidfuzz/keyword ILIKE retrieval below is kept ONLY for the instant
+        # fast=True tier-1 preview (skip_semantic=True), which has no embedding to use.
+        # To restore hybrid retrieval, set: all_ids = kw_ids | set(semantic_hits.keys())
+        if skip_semantic:
+            if kw_conds:
+                stmt = stmt.where(or_(*kw_conds))
+            stmt      = stmt.order_by(Message.created_at.desc()).limit(limit)
+            kw_result = await db.execute(stmt)
+            kw_rows   = kw_result.all()
+            all_ids   = {m.id for m, _ in kw_rows}
+        else:
+            all_ids   = set(semantic_hits.keys())
         if not all_ids:
             return []
 
@@ -794,88 +799,96 @@ Return ONLY this JSON:
         self, message: Message, category: Optional[Category],
         query: str, expansion: Dict, use_due_filter: bool,
     ) -> float:
-        from rapidfuzz import fuzz
+        # ── [SEMANTIC-ONLY TEST] ──────────────────────────────────────────────
+        # Ranking is driven purely by embedding cosine similarity. Every rapidfuzz /
+        # keyword-substring / metadata text-scoring signal is commented out below so
+        # we can evaluate the quality + speed of pure semantic search in isolation.
+        # Scaled ×100 so 0.40–1.0 cosine → 40–100 (keeps results above _rank's
+        # MIN_RELEVANCE=8 floor). Remove this return + uncomment below to restore hybrid.
+        return getattr(message, "_semantic_score", 0.0) * 100.0
 
-        score   = 0.0
-        content = message.content.lower()
-        summary = (message.summary or "").lower()
-        tags    = message.tags if isinstance(message.tags, dict) else {}
-        q_lower = query.lower()
-
-        # Semantic score (secondary to text)
-        score += getattr(message, "_semantic_score", 0.0) * 15.0
-
-        # Primary text score. Strip structural stopwords first ("movie list" → "movie")
-        # so the distinctive noun decides relevance, not the ubiquitous word "list".
-        # Combine two signals (take the max):
-        #   • token_set_ratio  — word order / extras   ("people call" → "people to call" = 100)
-        #   • per-token partial — singular/plural, substring topic words ("movie" → "movies" = 100)
-        q_words   = _topic_words([w for w in q_lower.split() if len(w) > 2]) or q_lower.split()
-        topic_q   = " ".join(q_words)
-        text_tsr = max(
-            fuzz.token_set_ratio(topic_q, content),
-            fuzz.token_set_ratio(topic_q, summary) if summary else 0,
-            _best_partial(q_words, content.split()),
-            _best_partial(q_words, summary.split()) if summary else 0,
-        )
-        score += text_tsr * 0.60   # 100 → +60, 84 → +50, 0 → +0
-
-        # Secondary text fields at lower weight
-        subtasks_str   = " ".join(
-            s.get("task", "").lower() for s in tags.get("subtasks", []) if isinstance(s, dict)
-        )
-        split_from_str = str(tags.get("split_from", "")).lower()
-        original_dump  = str(tags.get("original_dump", "")).lower()
-        if subtasks_str:
-            score += fuzz.token_set_ratio(q_lower, subtasks_str) * 0.15   # max +15
-        if split_from_str:
-            score += fuzz.token_set_ratio(q_lower, split_from_str) * 0.12  # max +12
-        if original_dump:
-            score += fuzz.token_set_ratio(q_lower, original_dump) * 0.12   # max +12
-
-        for c in expansion.get("core_concepts", []):
-            cl = c.lower()
-            if cl in STRUCTURAL_STOPWORDS: continue
-            if cl in content: score += 6.0
-            if cl in summary: score += 4.0
-
-        for kw in expansion.get("keywords", []):
-            kl = kw.lower()
-            if kl in STRUCTURAL_STOPWORDS: continue
-            if kl in content: score += 2.5
-            if kl in summary: score += 1.5
-
-        for entity in expansion.get("entities", []):
-            el = entity.lower()
-            if el in content: score += 5.0
-            if el in str(tags.get("entities", {})).lower(): score += 3.0
-
-        all_msg_buckets = tags.get("all_buckets", [])
-        bucket_filter   = expansion.get("bucket_filter")
-        extra_buckets   = expansion.get("extra_buckets", [])
-        for b in ([bucket_filter] if bucket_filter else []) + (extra_buckets or []):
-            if b and ((category and category.name == b) or b in all_msg_buckets):
-                score += 8.0
-
-        if use_due_filter:
-            date_from = expansion.get("date_from")
-            date_to   = expansion.get("date_to")
-            if date_from and date_to:
-                due = tags.get("due_date")
-                if due and date_from <= due <= date_to:
-                    score += 15.0
-                for ev in tags.get("events", []):
-                    if isinstance(ev, dict):
-                        ev_date = ev.get("date", "")
-                        if ev_date and date_from <= ev_date <= date_to:
-                            score += 15.0
-
-        if tags.get("priority") == "high":  score += 2.0
-        age = (datetime.utcnow() - message.created_at).days
-        if age < 1:   score += 2.0
-        elif age < 7: score += 1.0
-
-        return score
+        # from rapidfuzz import fuzz
+        #
+        # score   = 0.0
+        # content = message.content.lower()
+        # summary = (message.summary or "").lower()
+        # tags    = message.tags if isinstance(message.tags, dict) else {}
+        # q_lower = query.lower()
+        #
+        # # Semantic score (secondary to text)
+        # score += getattr(message, "_semantic_score", 0.0) * 15.0
+        #
+        # # Primary text score. Strip structural stopwords first ("movie list" → "movie")
+        # # so the distinctive noun decides relevance, not the ubiquitous word "list".
+        # # Combine two signals (take the max):
+        # #   • token_set_ratio  — word order / extras   ("people call" → "people to call" = 100)
+        # #   • per-token partial — singular/plural, substring topic words ("movie" → "movies" = 100)
+        # q_words   = _topic_words([w for w in q_lower.split() if len(w) > 2]) or q_lower.split()
+        # topic_q   = " ".join(q_words)
+        # text_tsr = max(
+        #     fuzz.token_set_ratio(topic_q, content),
+        #     fuzz.token_set_ratio(topic_q, summary) if summary else 0,
+        #     _best_partial(q_words, content.split()),
+        #     _best_partial(q_words, summary.split()) if summary else 0,
+        # )
+        # score += text_tsr * 0.60   # 100 → +60, 84 → +50, 0 → +0
+        #
+        # # Secondary text fields at lower weight
+        # subtasks_str   = " ".join(
+        #     s.get("task", "").lower() for s in tags.get("subtasks", []) if isinstance(s, dict)
+        # )
+        # split_from_str = str(tags.get("split_from", "")).lower()
+        # original_dump  = str(tags.get("original_dump", "")).lower()
+        # if subtasks_str:
+        #     score += fuzz.token_set_ratio(q_lower, subtasks_str) * 0.15   # max +15
+        # if split_from_str:
+        #     score += fuzz.token_set_ratio(q_lower, split_from_str) * 0.12  # max +12
+        # if original_dump:
+        #     score += fuzz.token_set_ratio(q_lower, original_dump) * 0.12   # max +12
+        #
+        # for c in expansion.get("core_concepts", []):
+        #     cl = c.lower()
+        #     if cl in STRUCTURAL_STOPWORDS: continue
+        #     if cl in content: score += 6.0
+        #     if cl in summary: score += 4.0
+        #
+        # for kw in expansion.get("keywords", []):
+        #     kl = kw.lower()
+        #     if kl in STRUCTURAL_STOPWORDS: continue
+        #     if kl in content: score += 2.5
+        #     if kl in summary: score += 1.5
+        #
+        # for entity in expansion.get("entities", []):
+        #     el = entity.lower()
+        #     if el in content: score += 5.0
+        #     if el in str(tags.get("entities", {})).lower(): score += 3.0
+        #
+        # all_msg_buckets = tags.get("all_buckets", [])
+        # bucket_filter   = expansion.get("bucket_filter")
+        # extra_buckets   = expansion.get("extra_buckets", [])
+        # for b in ([bucket_filter] if bucket_filter else []) + (extra_buckets or []):
+        #     if b and ((category and category.name == b) or b in all_msg_buckets):
+        #         score += 8.0
+        #
+        # if use_due_filter:
+        #     date_from = expansion.get("date_from")
+        #     date_to   = expansion.get("date_to")
+        #     if date_from and date_to:
+        #         due = tags.get("due_date")
+        #         if due and date_from <= due <= date_to:
+        #             score += 15.0
+        #         for ev in tags.get("events", []):
+        #             if isinstance(ev, dict):
+        #                 ev_date = ev.get("date", "")
+        #                 if ev_date and date_from <= ev_date <= date_to:
+        #                     score += 15.0
+        #
+        # if tags.get("priority") == "high":  score += 2.0
+        # age = (datetime.utcnow() - message.created_at).days
+        # if age < 1:   score += 2.0
+        # elif age < 7: score += 1.0
+        #
+        # return score
 
     # ──────────────────────────────────────────────────────────────
     # Natural response (reserved for future product iterations)
