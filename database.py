@@ -412,6 +412,25 @@ class StoredImage(Base):
     user: Mapped["User"] = relationship("User")
 
 
+class AnalyticsEvent(Base):
+    """First-party product analytics — one row per tracked client event.
+    Powers the activation funnel + per-user journey readouts in /admin.
+    Ingested via POST /api/events (batched). Works logged-in or anonymous —
+    anon_id correlates pre-login events (app_open, signup steps) to a device."""
+    __tablename__ = "analytics_events"
+
+    id:          Mapped[int]            = mapped_column(primary_key=True)
+    user_id:     Mapped[Optional[int]]  = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    anon_id:     Mapped[Optional[str]]  = mapped_column(String(64), nullable=True, index=True)   # device id (pre-login)
+    session_id:  Mapped[Optional[str]]  = mapped_column(String(64), nullable=True, index=True)
+    event:       Mapped[str]            = mapped_column(String(60), nullable=False, index=True)
+    props:       Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    platform:    Mapped[Optional[str]]  = mapped_column(String(20), nullable=True)               # "ios" | "web"
+    app_version: Mapped[Optional[str]]  = mapped_column(String(20), nullable=True)
+    client_ts:   Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)             # event time on device
+    created_at:  Mapped[datetime]       = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 # Database initialization
 async def init_db():
     """Create all tables and apply safe column migrations."""

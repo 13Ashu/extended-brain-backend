@@ -37,6 +37,19 @@ GEMINI_EMBED_URL = (
 DEFAULT_DIMS = 1536
 
 
+_shared_async_client = None
+
+def _http_client() -> httpx.AsyncClient:
+    """Lazily-created shared AsyncClient — reused across calls so we don't pay a new
+    TLS handshake per embedding request. Per-request timeouts are passed at the call site."""
+    global _shared_async_client
+    if _shared_async_client is None or _shared_async_client.is_closed:
+        _shared_async_client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20)
+        )
+    return _shared_async_client
+
+
 class EmbeddingService:
     _instance: Optional["EmbeddingService"] = None
 
@@ -113,10 +126,9 @@ class EmbeddingService:
 
         for attempt in range(3):
             try:
-                async with httpx.AsyncClient(timeout=20.0) as client:
-                    resp = await client.post(GEMINI_EMBED_URL, headers=headers, json=payload)
-                    resp.raise_for_status()
-                    return resp.json()["embedding"]["values"]
+                resp = await _http_client().post(GEMINI_EMBED_URL, headers=headers, json=payload, timeout=20.0)
+                resp.raise_for_status()
+                return resp.json()["embedding"]["values"]
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 429 and attempt < 2:
                     await asyncio.sleep(2 ** attempt)

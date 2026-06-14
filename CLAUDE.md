@@ -12,7 +12,7 @@ FastAPI backend powering the Extended Minds iOS app and web dashboard. It:
 - Accepts message captures and classifies them via a two-path AI pipeline:
   - **Fast path**: on-server ONNX classifier (~10ms, no network) for bucket classification
   - **Slow path**: Gemini 2.5 Flash Lite LLM, paid (~500ms) when classifier is absent or low-confidence
-- Stores all knowledge in Neon PostgreSQL with pgvector for semantic search
+- Stores all knowledge in Railway PostgreSQL with pgvector for semantic search
 - Handles authentication (phone + OTP + password → JWT)
 - Delivers reminders via APNs (primary) and Telegram (legacy, to be retired)
 - Manages Pro accounts, collaborative groups, and live WebSocket feeds
@@ -21,7 +21,7 @@ FastAPI backend powering the Extended Minds iOS app and web dashboard. It:
 
 **Runtime:** Python 3.11+, FastAPI, SQLAlchemy (async), uvicorn  
 **Deployed on:** Railway  
-**Database:** Neon PostgreSQL (`asyncpg` driver, `pgvector` extension)  
+**Database:** Railway PostgreSQL (`asyncpg` driver, `pgvector` extension)  
 **Cache:** Upstash Redis (optional, REST API)
 
 ---
@@ -126,7 +126,7 @@ extended-brain-backend/
 ### Authentication
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/auth/send-otp` | Send OTP to phone via Telegram |
+| POST | `/api/auth/send-otp` | Send OTP to phone via MSG91 SMS (Telegram = dormant legacy fallback) |
 | POST | `/api/auth/verify-otp` | Verify 6-digit OTP (max 5 attempts, 10 min TTL) |
 | POST | `/api/auth/login` | Phone + password → JWT |
 | POST | `/api/auth/forgot-password` | Reset password |
@@ -398,7 +398,7 @@ uvicorn main:app --reload --port 8000
 - **Build:** Nixpacks auto-detects Python; runs `pip install -r requirements.txt`
 - **Start:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - **Restart:** `ON_FAILURE`, max 10 retries (`railway.json`)
-- **Neon DB:** SSL required; pool_size=5 (Neon free tier limit is hardcoded in `database.py`)
+- **Railway PostgreSQL:** `pool_size=10` + `max_overflow=5` (15 max connections) set in `database.py`
 - **Telegram webhook:** Set `TELEGRAM_WEBHOOK_URL=https://<app>.up.railway.app/webhook/telegram` — app auto-registers on startup
 - **Single process:** No workers configuration; uvicorn runs one async process (no multiprocessing)
 
@@ -518,7 +518,7 @@ Gemini `text-embedding-004` via REST, 1536 dims, stored in pgvector column on `m
 - Never create a synchronous SQLAlchemy session — the engine is async-only.
 - Never call `db.execute()` without `await`.
 - Never log full JWT tokens or password hashes.
-- Never hardcode the Neon DB URL — always use `DATABASE_URL` from env.
+- Never hardcode the database URL — always use `DATABASE_URL` from env.
 - **Never build new features that route through Telegram or WhatsApp** — these channels are being retired. All new flows must be reachable from the iOS app via the REST API.
 
 ---

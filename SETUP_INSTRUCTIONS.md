@@ -95,7 +95,7 @@ nano .env     # Mac/Linux
 
 Add your credentials:
 ```env
-DATABASE_URL=postgresql://YOUR_NEON_URL_HERE
+DATABASE_URL=postgresql://YOUR_RAILWAY_POSTGRES_URL_HERE
 CEREBRAS_API_KEY=YOUR_CEREBRAS_KEY_HERE
 WHATSAPP_ACCESS_TOKEN=YOUR_WHATSAPP_TOKEN
 WHATSAPP_PHONE_NUMBER_ID=YOUR_PHONE_ID
@@ -104,11 +104,10 @@ WHATSAPP_VERIFY_TOKEN=any_random_string_you_create
 
 ### 7. Get Your API Keys
 
-**Neon Database:**
-1. Go to https://neon.tech
-2. Create account
-3. Create new project
-4. Copy connection string
+**Railway PostgreSQL:**
+1. In your Railway project: + New → Database → PostgreSQL
+2. Railway provisions it and sets `DATABASE_URL` automatically
+3. For local dev, copy it from the Postgres service → Variables
 
 **Cerebras API:**
 1. Go to https://cloud.cerebras.ai
@@ -157,7 +156,7 @@ Before running:
 - [ ] Virtual environment created and activated
 - [ ] Dependencies installed (`pip install -r requirements.txt`)
 - [ ] `.env` file created with your credentials
-- [ ] Neon database URL added to `.env`
+- [ ] Railway PostgreSQL `DATABASE_URL` added to `.env`
 - [ ] Cerebras API key added to `.env`
 - [ ] WhatsApp credentials added to `.env`
 
@@ -184,6 +183,6 @@ Check:
 
 ## 🎉 You're Done!
 
-Once everything is set up, your Extended Brain is ready to use via WhatsApp!
+Once everything is set up, your Extended Minds backend is ready to serve the iOS app!
 
 Send a message to your WhatsApp Business number and watch it automatically categorize, tag, and store your information! 🚀

@@ -25,6 +25,14 @@ class Config:
     ENABLE_OTP = os.getenv("ENABLE_OTP", "false").lower() == "true"
     FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS")  # JSON string of service account key
 
+    # ── Founding-member program (free Pro via the FOUNDER coupon) ──────────
+    # The scarcity pill ("X of N founding spots left") reads these. The pill
+    # stays hidden until FOUNDING_PILL_ENABLED is flipped true (public launch);
+    # until then F&F just enter the code on the upgrade screen as usual.
+    FOUNDING_COUPON_CODE  = os.getenv("FOUNDING_COUPON_CODE", "FOUNDER")
+    FOUNDING_SLOTS_TOTAL  = int(os.getenv("FOUNDING_SLOTS_TOTAL", "1000"))
+    FOUNDING_PILL_ENABLED = os.getenv("FOUNDING_PILL_ENABLED", "false").lower() == "true"
+
     # MSG91 SMS — transactional OTP delivery (India). OTP generation/verification
     # stays in auth_service; MSG91 is only the SMS transport (DLT-approved template).
     MSG91_AUTH_KEY = os.getenv("MSG91_AUTH_KEY", "")

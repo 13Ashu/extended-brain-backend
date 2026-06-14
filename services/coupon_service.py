@@ -12,6 +12,7 @@ from typing import Optional, Dict, Any, List
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config import Config
 from database import CouponCode, CouponRedemption, ProAccount, User
 
 
@@ -178,6 +179,40 @@ class CouponService:
         c.is_active = False
         await db.commit()
         return True
+
+    # ── Founding-member scarcity status (public) ──────────────────
+    async def founding_status(self, db: AsyncSession) -> Dict[str, Any]:
+        """Live usage of the founding (FOUNDER) coupon, for the scarcity pill.
+        `enabled` = display flag (Config.FOUNDING_PILL_ENABLED).
+        `active`  = offer still claimable (active, not expired, slots remain).
+        UI shows the pill only when enabled AND active. Never raises."""
+        code    = (Config.FOUNDING_COUPON_CODE or "").strip().upper()
+        enabled = Config.FOUNDING_PILL_ENABLED
+        coupon  = (
+            await db.scalar(select(CouponCode).where(CouponCode.code == code))
+            if code else None
+        )
+        if not coupon:
+            total = Config.FOUNDING_SLOTS_TOTAL
+            return {
+                "enabled": enabled, "active": False, "code": code or None,
+                "slots_total": total, "slots_used": 0, "slots_left": total,
+                "expires_at": None,
+            }
+
+        total = coupon.max_uses if coupon.max_uses else Config.FOUNDING_SLOTS_TOTAL
+        used  = coupon.uses_count or 0
+        left  = max(0, total - used)
+        not_expired = not (coupon.expires_at and coupon.expires_at < datetime.utcnow())
+        return {
+            "enabled":     enabled,
+            "active":      bool(coupon.is_active and not_expired and left > 0),
+            "code":        coupon.code,
+            "slots_total": total,
+            "slots_used":  used,
+            "slots_left":  left,
+            "expires_at":  coupon.expires_at.isoformat() if coupon.expires_at else None,
+        }
 
     # ── Helpers ───────────────────────────────────────────────────
 

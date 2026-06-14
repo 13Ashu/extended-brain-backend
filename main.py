@@ -27,7 +27,7 @@ from config import Config, MessagingPlatform
 from messaging_factory import create_messaging_client, get_platform_name
 from messaging_interface import MessagingClient
 
-from database import get_db, init_db, engine, Base, async_session_maker, DeviceToken, StoredImage, GroupLastSeen, LabelAnnotation, IAPTransaction, PaymentOrder
+from database import get_db, init_db, engine, Base, async_session_maker, DeviceToken, StoredImage, GroupLastSeen, LabelAnnotation, IAPTransaction, PaymentOrder, AnalyticsEvent
 from models import User, Message, Category, MessageType, ProAccount, ProAccountMember, Group, GroupMember, CouponCode, CouponRedemption
 from services.group_service import group_service as grp_svc, total_unread_for_user
 from services.coupon_service import coupon_service as cpn_svc
@@ -37,7 +37,7 @@ from cerebras_client import CerebrasClient
 from services.message_processor import MessageProcessor
 from services.search_service import SearchService
 from services.category_manager import CategoryManager
-from services.auth_service import AuthService, get_current_user
+from services.auth_service import AuthService, get_current_user, decode_user_id_safe
 from services.reminder_service import ReminderService, send_apns_notification, Reminder
 from services.briefing_service import briefing_service
 from services.nudge_service import nudge_service
@@ -70,12 +70,8 @@ async def lifespan(app: FastAPI):
     scheduler_task = asyncio.create_task(_master_scheduler())
     print("✅ Master scheduler running")
 
-    if Config.get_messaging_platform() == MessagingPlatform.TELEGRAM and Config.TELEGRAM_WEBHOOK_URL:
-        try:
-            result = await messaging_client.setup_webhook(Config.TELEGRAM_WEBHOOK_URL)
-            print(f"✓ Telegram webhook configured: {result}")
-        except Exception as e:
-            print(f"⚠ Telegram webhook setup failed: {e}")
+    # Telegram bot is legacy/retired — we no longer register its webhook on startup.
+    # (To fully stop an already-registered webhook, call deleteWebhook on the bot once.)
 
     print("✓ Extended Brain API started successfully")
     yield
@@ -993,33 +989,6 @@ async def register_user(user_data: UserRegistrationRequest, db: AsyncSession = D
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["message"])
     return result
-
-
-# ================== WhatsApp Webhook ==================
-
-@app.get("/webhook/whatsapp")
-async def verify_whatsapp_webhook(
-    hub_mode: str | None = None,
-    hub_verify_token: str | None = None,
-    hub_challenge: str | None = None,
-):
-    if Config.get_messaging_platform() != MessagingPlatform.WHATSAPP:
-        raise HTTPException(status_code=400, detail="WhatsApp not configured")
-    if hub_mode == "subscribe" and hub_verify_token == Config.WHATSAPP_VERIFY_TOKEN:
-        return int(hub_challenge)
-    raise HTTPException(status_code=403, detail="Verification failed")
-
-
-@app.post("/webhook/whatsapp")
-async def handle_whatsapp_webhook(
-    request: Request, background_tasks: BackgroundTasks
-):
-    if Config.get_messaging_platform() != MessagingPlatform.WHATSAPP:
-        raise HTTPException(status_code=400, detail="WhatsApp not configured")
-    webhook_data = await request.json()
-    # FIX: do NOT pass db — background task opens its own session
-    background_tasks.add_task(process_webhook_message, webhook_data)
-    return {"status": "received"}
 
 
 # ================== Telegram Webhook ==================
@@ -4866,6 +4835,62 @@ async def redeem_coupon(
     return result
 
 
+@app.get("/api/promo/founding")
+async def founding_promo(db: AsyncSession = Depends(get_db)):
+    """Public (no auth) — powers the 'X of N founding spots left' pill on web + iOS.
+    Returns live FOUNDER-coupon usage. `enabled` is the display flag
+    (FOUNDING_PILL_ENABLED); `active` means the offer is still claimable.
+    The UI shows the pill only when enabled && active, so it stays invisible
+    until you flip the flag for public launch."""
+    return await cpn_svc.founding_status(db)
+
+
+# ── Product analytics (first-party) ─────────────────────────────────────
+class EventIn(BaseModel):
+    event:       str
+    props:       Optional[dict] = None
+    session_id:  Optional[str]  = None
+    anon_id:     Optional[str]  = None
+    ts:          Optional[str]  = None   # client ISO8601 timestamp
+    platform:    Optional[str]  = None
+    app_version: Optional[str]  = None
+
+
+class EventBatchIn(BaseModel):
+    events: List[EventIn]
+
+
+@app.post("/api/events")
+async def ingest_events(batch: EventBatchIn, request: Request, db: AsyncSession = Depends(get_db)):
+    """Public batched analytics ingest. Works logged-in (user_id resolved from
+    the bearer token) or anonymous (correlated by anon_id). Fire-and-forget."""
+    auth_hdr = request.headers.get("Authorization", "")
+    token    = auth_hdr[7:] if auth_hdr.lower().startswith("bearer ") else None
+    user_id  = decode_user_id_safe(token)
+    rows = []
+    for e in (batch.events or [])[:200]:
+        client_ts = None
+        if e.ts:
+            try:
+                client_ts = datetime.fromisoformat(e.ts.replace("Z", "+00:00"))
+            except Exception:
+                client_ts = None
+        rows.append(AnalyticsEvent(
+            user_id=user_id,
+            anon_id=(e.anon_id or "")[:64] or None,
+            session_id=(e.session_id or "")[:64] or None,
+            event=(e.event or "")[:60],
+            props=e.props,
+            platform=(e.platform or "")[:20] or None,
+            app_version=(e.app_version or "")[:20] or None,
+            client_ts=client_ts,
+        ))
+    if rows:
+        db.add_all(rows)
+        await db.commit()
+    return {"ok": True, "stored": len(rows)}
+
+
 # ── Admin: coupon management ────────────────────────────────────────────
 @app.post("/api/admin/coupons")
 async def admin_create_coupon(
@@ -5048,3 +5073,69 @@ async def admin_grant_pro(
     acct = await grp_svc.get_or_create_pro_account(user, db)
     await db.commit()
     return {"success": True, "message": f"Pro granted to {user.name}", "account_id": acct.id}
+
+
+# ── Admin: product analytics readouts ───────────────────────────────────
+def _check_admin(request: Request):
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    provided = request.headers.get("X-Admin-Secret") or request.query_params.get("admin_secret") or ""
+    if not admin_secret or provided != admin_secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+@app.get("/api/admin/funnel")
+async def admin_funnel(request: Request, db: AsyncSession = Depends(get_db)):
+    """Activation funnel — distinct users reaching each step. Shows where people drop off."""
+    _check_admin(request)
+
+    async def users_with(event: str) -> int:
+        return await db.scalar(
+            select(func.count(func.distinct(AnalyticsEvent.user_id)))
+            .where(AnalyticsEvent.event == event, AnalyticsEvent.user_id.isnot(None))
+        ) or 0
+
+    async def users_with_at_least(event: str, n: int) -> int:
+        sub = (
+            select(AnalyticsEvent.user_id)
+            .where(AnalyticsEvent.event == event, AnalyticsEvent.user_id.isnot(None))
+            .group_by(AnalyticsEvent.user_id)
+            .having(func.count() >= n)
+            .subquery()
+        )
+        return await db.scalar(select(func.count()).select_from(sub)) or 0
+
+    total_users   = await db.scalar(select(func.count(User.id))) or 0
+    signed_up     = await users_with("signup_completed") or await users_with("login_completed")
+    steps = [
+        {"step": "Signed up",           "users": signed_up},
+        {"step": "First capture",       "users": await users_with("capture_sent")},
+        {"step": "Captured again (≥2)", "users": await users_with_at_least("capture_sent", 2)},
+        {"step": "Searched",            "users": await users_with("search_performed")},
+        {"step": "Viewed Pro",          "users": await users_with("paywall_viewed")},
+        {"step": "Created a group",     "users": await users_with("group_created")},
+        {"step": "Became Pro",          "users": await users_with("pro_activated")},
+    ]
+    zero_searches = await db.scalar(
+        select(func.count()).select_from(AnalyticsEvent)
+        .where(AnalyticsEvent.event == "search_performed",
+               AnalyticsEvent.props["results"].astext == "0")
+    ) or 0
+    return {"total_users": total_users, "steps": steps,
+            "signals": {"zero_result_searches": zero_searches}}
+
+
+@app.get("/api/admin/events")
+async def admin_events(request: Request, user_id: Optional[int] = None,
+                       limit: int = 200, db: AsyncSession = Depends(get_db)):
+    """Recent event stream (optionally one user's journey) for eyeballing friction."""
+    _check_admin(request)
+    q = select(AnalyticsEvent).order_by(AnalyticsEvent.id.desc()).limit(min(limit, 1000))
+    if user_id is not None:
+        q = q.where(AnalyticsEvent.user_id == user_id)
+    rows = (await db.execute(q)).scalars().all()
+    return [
+        {"id": r.id, "user_id": r.user_id, "anon_id": r.anon_id, "event": r.event,
+         "props": r.props, "platform": r.platform, "session_id": r.session_id,
+         "ts": (r.client_ts or r.created_at).isoformat()}
+        for r in rows
+    ]

@@ -85,6 +85,7 @@ Output schema — always returns all action flags:
 from __future__ import annotations
 
 import os
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -205,7 +206,10 @@ class IntentService:
         from services.classifier_service import classifier_service, CONF_THRESHOLD
         bucket, confidence = "", 0.0
         if classifier_service.is_ready:
-            bucket, confidence = classifier_service.classify(content)
+            # Run ONNX inference off the event loop — it's CPU-bound and ONNX Runtime
+            # releases the GIL during inference, so this keeps the loop free for other
+            # requests instead of serializing every capture behind ~10-50ms of compute.
+            bucket, confidence = await asyncio.to_thread(classifier_service.classify, content)
 
         # ── List format pre-check (~microseconds, no network) ────
         # Run regex list detection regardless of classifier confidence.

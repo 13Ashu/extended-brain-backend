@@ -36,6 +36,18 @@ GEMINI_FALLBACK_MODELS   = ["gemini-3.1-flash-lite", "gemini-2.5-flash"]
 
 _response_cache: dict = {}  # simple TTL-less cache for identical prompts
 
+_shared_async_client = None
+
+def _http_client() -> httpx.AsyncClient:
+    """Lazily-created shared AsyncClient — reused across calls to avoid a new TLS
+    handshake per LLM request. Per-request timeouts are passed at the call site."""
+    global _shared_async_client
+    if _shared_async_client is None or _shared_async_client.is_closed:
+        _shared_async_client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20)
+        )
+    return _shared_async_client
+
 
 import time
 _last_request_time: float = 0.0
@@ -168,28 +180,27 @@ class CerebrasClient:
             delays = [2, 5, 15]
             for attempt in range(4):
                 try:
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        resp = await client.post(url, headers=headers, json=payload)
+                    resp = await _http_client().post(url, headers=headers, json=payload, timeout=30.0)
 
-                        if resp.status_code == 429:
-                            # Check if this is a hard limit=0 (deprecated model) vs a soft rate limit
-                            try:
-                                body = resp.json()
-                                msg = body.get("error", {}).get("message", "")
-                                if "limit: 0" in msg:
-                                    print(f"[gemini] {model} free tier quota is 0 — trying next model")
-                                    break  # skip to next model immediately
-                            except Exception:
-                                pass
-                            retry_after = int(resp.headers.get("Retry-After", delays[min(attempt, 2)]))
-                            print(f"[gemini] 429 rate limit on {model} — waiting {retry_after}s (attempt {attempt+1})")
-                            await asyncio.sleep(retry_after)
-                            continue
+                    if resp.status_code == 429:
+                        # Check if this is a hard limit=0 (deprecated model) vs a soft rate limit
+                        try:
+                            body = resp.json()
+                            msg = body.get("error", {}).get("message", "")
+                            if "limit: 0" in msg:
+                                print(f"[gemini] {model} free tier quota is 0 — trying next model")
+                                break  # skip to next model immediately
+                        except Exception:
+                            pass
+                        retry_after = int(resp.headers.get("Retry-After", delays[min(attempt, 2)]))
+                        print(f"[gemini] 429 rate limit on {model} — waiting {retry_after}s (attempt {attempt+1})")
+                        await asyncio.sleep(retry_after)
+                        continue
 
-                        resp.raise_for_status()
-                        if model != primary:
-                            print(f"[gemini] using fallback model {model}")
-                        return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    resp.raise_for_status()
+                    if model != primary:
+                        print(f"[gemini] using fallback model {model}")
+                    return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code in (500, 503) and attempt < 3:

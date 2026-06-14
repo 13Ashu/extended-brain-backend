@@ -466,3 +466,17 @@ async def get_current_user(
         raise credentials_exception
 
     return user
+
+
+def decode_user_id_safe(token: Optional[str]) -> Optional[int]:
+    """Best-effort user id from a JWT — returns None instead of raising.
+    For endpoints that accept both authenticated and anonymous callers
+    (e.g. the analytics ingest endpoint)."""
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        uid = payload.get("sub")
+        return int(uid) if uid is not None else None
+    except Exception:
+        return None

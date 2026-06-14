@@ -1,11 +1,11 @@
 # Extended Brain - Complete Backend System
 
-WhatsApp-powered AI knowledge base with Cerebras LLM and PostgreSQL (Neon).
+AI-powered second brain — a native iOS app, backed by Google Gemini and PostgreSQL (Railway).
 
 ## 🎯 Features
 
-- ✅ **WhatsApp Integration**: Send text, images, audio, PDFs via WhatsApp
-- ✅ **AI-Powered Categorization**: Automatic organization using Cerebras LLM
+- ✅ **Native iOS app**: Capture text, images, audio, and documents from the app or share sheet
+- ✅ **AI-Powered Categorization**: On-device ONNX classifier (~10ms) + Google Gemini fallback
 - ✅ **Semantic Search**: Find anything in your knowledge base
 - ✅ **Multi-format Support**: Text, images, audio, documents
 - ✅ **Dynamic Categories**: Create, edit, delete, merge categories
@@ -93,19 +93,19 @@ nano .env  # or use any text editor
 ```
 
 You need:
-- **DATABASE_URL** from Neon.tech
+- **DATABASE_URL** from Railway PostgreSQL
 - **CEREBRAS_API_KEY** from Cerebras Cloud
 - **WHATSAPP credentials** from Meta Business
 
-## 🗄️ Database Setup (Neon)
+## 🗄️ Database Setup (Railway PostgreSQL)
 
-1. Sign up at https://neon.tech
-2. Create a new project
-3. Copy the connection string
-4. Add to `.env` file
+1. In your Railway project: **+ New → Database → PostgreSQL**
+2. Railway provisions it and injects `DATABASE_URL` into linked services automatically
+3. For local dev, copy the connection string from the Postgres service → **Variables**
+4. Add it to your `.env`
 
 ```env
-DATABASE_URL=postgresql://user:pass@ep-xxx.us-east-2.aws.neon.tech/extendedbrain?sslmode=require
+DATABASE_URL=postgresql://postgres:pass@<host>.proxy.rlwy.net:PORT/railway
 ```
 
 ## 🧠 Cerebras API Setup
@@ -166,8 +166,7 @@ python main.py
 
 ## 💰 Cost Estimate
 
-- **Neon**: Free tier (0.5 GB)
-- **Railway**: $5/month
+- **Railway**: $5/month (app + PostgreSQL)
 - **Cerebras**: ~$0.60 per 1M tokens
 - **WhatsApp**: Free (first 1000 conversations/month)
 
