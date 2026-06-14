@@ -268,11 +268,14 @@ class ReminderService:
                     select(DeviceToken).where(DeviceToken.user_id == reminder.user_id)
                 )
                 tokens = result.scalars().all()
+                from services.group_service import total_unread_for_user
+                unread_badge = await total_unread_for_user(apns_db, reminder.user_id)
             for dt in tokens:
                 await send_apns_notification(
                     device_token=dt.token,
                     title="⏰ Reminder",
                     body=reminder.task,
+                    badge=unread_badge,
                     data={"type": "reminder", "reminder_id": reminder.id,
                           "message_id": reminder.message_id},
                     category="REMINDER_ACTION",

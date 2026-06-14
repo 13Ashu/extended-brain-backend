@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import async_session_maker, Message, User, Category, DeviceToken
 from services.reminder_service import send_apns_notification
+from services.group_service import total_unread_for_user
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -144,6 +145,9 @@ class BriefingService:
                     select(DeviceToken).where(DeviceToken.user_id == user.id)
                 )
                 device_tokens = result.scalars().all()
+                # Badge = total unread group messages (the app's single badge meaning),
+                # not the task count — keeps the icon consistent across all push types.
+                unread_badge = await total_unread_for_user(apns_db, user.id)
 
             task_count = len(todos)
             event_count = len(events)
@@ -166,7 +170,7 @@ class BriefingService:
                     device_token=dt.token,
                     title=f"Good morning, {first_name}! ☀️",
                     body=apns_body,
-                    badge=task_count,
+                    badge=unread_badge,
                     data={"type": "briefing"},
                     category="BRIEFING_TAP",
                 )

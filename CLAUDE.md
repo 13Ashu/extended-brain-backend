@@ -105,6 +105,7 @@ extended-brain-backend/
 | Pro accounts / groups | `services/group_service.py` |
 | Reminder scheduling | `services/reminder_service.py` |
 | APNs push delivery | `services/reminder_service.py` |
+| App-icon badge count | `services/group_service.py` → `total_unread_for_user(db, user_id)` — total unread group messages (same logic as `GET /api/groups/unread`). **Every** `send_apns_notification(...)` call (assignment / completion / group-reminder in `main.py`, plus `briefing_service`, `recurrence_service`, `reminder_service`) passes `badge=` this value, so the iOS badge means exactly "unread group messages" and is correct before the app opens |
 | **Annotation storage (retraining data)** | **`database.py` → `LabelAnnotation`** |
 | **Write annotation on bucket move** | **`main.py` → `PATCH /api/messages/{id}/bucket`** |
 | **Export annotations for retraining** | **`main.py` → `GET /api/annotations/export`** |

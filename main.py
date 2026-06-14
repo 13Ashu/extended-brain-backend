@@ -29,7 +29,7 @@ from messaging_interface import MessagingClient
 
 from database import get_db, init_db, engine, Base, async_session_maker, DeviceToken, StoredImage, GroupLastSeen, LabelAnnotation, IAPTransaction, PaymentOrder
 from models import User, Message, Category, MessageType, ProAccount, ProAccountMember, Group, GroupMember, CouponCode, CouponRedemption
-from services.group_service import group_service as grp_svc
+from services.group_service import group_service as grp_svc, total_unread_for_user
 from services.coupon_service import coupon_service as cpn_svc
 from services.payment_service import payment_service as pay_svc
 from services.iap_service import iap_service
@@ -2882,11 +2882,13 @@ async def complete_assignment(
                 select(DeviceToken.token).where(DeviceToken.user_id == msg.user_id)
             )
             task_preview = (msg.summary or msg.content)[:60]
+            badge = await total_unread_for_user(db, msg.user_id)
             for (token,) in tokens_rows.all():
                 await send_apns_notification(
                     device_token=token,
                     title=f"✅ {current_user.name} completed a task",
                     body=task_preview,
+                    badge=badge,
                     data={"type": "assignment_complete", "message_id": message_id,
                           "group_id": msg.group_id},
                 )
@@ -2992,11 +2994,13 @@ async def assign_message(
         tokens_rows = await db.execute(
             select(DeviceToken.token).where(DeviceToken.user_id == assignee_id)
         )
+        badge = await total_unread_for_user(db, assignee_id)
         for (token,) in tokens_rows.all():
             await send_apns_notification(
                 device_token=token,
                 title=f"{current_user.name} assigned you a task",
                 body=content_preview[:80],
+                badge=badge,
                 data={"type": "assignment", "group_id": msg.group_id,
                       "message_id": message_id},
             )
@@ -3697,11 +3701,13 @@ async def capture_message(
                 tokens_rows = await db.execute(
                     select(DeviceToken.token).where(DeviceToken.user_id == auid)
                 )
+                badge = await total_unread_for_user(db, auid)
                 for (token,) in tokens_rows.all():
                     await send_apns_notification(
                         device_token=token,
                         title=f"{current_user.name} assigned you a task",
                         body=content[:80],
+                        badge=badge,
                         data={"type": "assignment", "group_id": group_id,
                               "message_id": result["message_id"]},
                     )
@@ -3720,11 +3726,13 @@ async def capture_message(
                     tokens_rows = await db.execute(
                         select(DeviceToken.token).where(DeviceToken.user_id == muid)
                     )
+                    badge = await total_unread_for_user(db, muid)
                     for (token,) in tokens_rows.all():
                         await send_apns_notification(
                             device_token=token,
                             title=f"Reminder · {current_user.name}",
                             body=content[:80],
+                            badge=badge,
                             data={"type": "group_reminder", "group_id": group_id,
                                   "message_id": result["message_id"]},
                         )

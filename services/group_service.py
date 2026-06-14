@@ -13,8 +13,46 @@ from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import (
-    User, Group, GroupMember, ProAccount, ProAccountMember, Message, async_session_maker
+    User, Group, GroupMember, ProAccount, ProAccountMember, Message,
+    GroupLastSeen, async_session_maker
 )
+
+
+async def total_unread_for_user(db: AsyncSession, user_id: int) -> int:
+    """Total unread group messages for a user — the canonical app-icon badge value.
+
+    Mirrors the per-group logic in ``GET /api/groups/unread``: counts messages in
+    every group the user belongs to that were created after their last-seen marker,
+    excluding the user's own messages. Stamped onto every APNs push so the icon
+    badge is correct the moment the notification lands, before the app is opened.
+    """
+    membership_rows = await db.execute(
+        select(GroupMember.group_id).where(GroupMember.user_id == user_id)
+    )
+    group_ids = [r[0] for r in membership_rows.all()]
+    if not group_ids:
+        return 0
+
+    seen_rows = await db.execute(
+        select(GroupLastSeen).where(
+            GroupLastSeen.user_id == user_id,
+            GroupLastSeen.group_id.in_(group_ids),
+        )
+    )
+    last_seen = {r.group_id: r.last_seen_at for r in seen_rows.scalars()}
+
+    total = 0
+    for gid in group_ids:
+        cutoff = last_seen.get(gid, datetime.min)
+        count = await db.scalar(
+            select(func.count(Message.id)).where(
+                Message.group_id == gid,
+                Message.created_at > cutoff,
+                Message.user_id != user_id,
+            )
+        )
+        total += count or 0
+    return total
 
 
 class GroupService:

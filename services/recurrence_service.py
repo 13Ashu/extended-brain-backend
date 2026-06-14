@@ -24,6 +24,7 @@ from sqlalchemy import String, Boolean, Integer, DateTime, ForeignKey, Text
 from database import async_session_maker, Base, User, Message, Category, DeviceToken
 from cerebras_client import CerebrasClient
 from services.reminder_service import send_apns_notification
+from services.group_service import total_unread_for_user
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -329,11 +330,13 @@ Examples:
                     select(DeviceToken).where(DeviceToken.user_id == user.id)
                 )
                 device_tokens = token_result.scalars().all()
+                unread_badge = await total_unread_for_user(apns_db, user.id)
             for dt in device_tokens:
                 await send_apns_notification(
                     device_token=dt.token,
                     title="🔁 Recurring reminder",
                     body=rec.template_content,
+                    badge=unread_badge,
                     data={"type": "reminder", "reminder_id": rec.id, "message_id": msg.id},
                     category="REMINDER_ACTION",
                 )
