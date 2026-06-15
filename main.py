@@ -4872,7 +4872,7 @@ async def ingest_events(batch: EventBatchIn, request: Request, db: AsyncSession 
         client_ts = None
         if e.ts:
             try:
-                client_ts = datetime.fromisoformat(e.ts.replace("Z", "+00:00"))
+                client_ts = datetime.fromisoformat(e.ts.replace("Z", "+00:00")).replace(tzinfo=None)
             except Exception:
                 client_ts = None
         rows.append(AnalyticsEvent(
