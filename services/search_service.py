@@ -279,14 +279,9 @@ class SearchService:
         from services.embedding_service import embedding_service
         import asyncio as _asyncio
 
-        # Todo queries: direct DB fetch, no embeddings needed
+        # To-Do items are excluded from search — they have a dedicated tab.
         if _is_todo_query(query):
-            use_due = bool(date_from)
-            fetch_from = date_from or str(today)
-            fetch_to   = date_to   or str(today)
-            todo_result = await self._fetch_todos_direct(user.id, fetch_from, fetch_to, db, limit)
-            print(f"[search] todo_direct → {_time.monotonic()-_t0:.2f}s")
-            return todo_result
+            return {"results": [], "natural_response": ""}
 
         use_due_filter = _is_due_date_query(query) and date_from is not None
         person_hint    = _extract_person_name(query)
@@ -568,6 +563,7 @@ Return ONLY this JSON:
                     FROM messages m
                     WHERE m.group_id = :gid AND m.embedding IS NOT NULL
                       AND (1 - (m.embedding <=> :emb ::vector)) > :min_sim
+                      AND COALESCE(m.tags->>'primary_bucket', m.tags->>'intent_bucket', '') != 'To-Do'
                     ORDER BY m.embedding <=> :emb ::vector
                     LIMIT :lim
                 """)
@@ -579,6 +575,7 @@ Return ONLY this JSON:
                     WHERE m.user_id = :uid AND m.group_id IS NULL AND m.embedding IS NOT NULL
                       AND (m.tags->>'assigned_by' IS NULL)
                       AND (1 - (m.embedding <=> :emb ::vector)) > :min_sim
+                      AND COALESCE(m.tags->>'primary_bucket', m.tags->>'intent_bucket', '') != 'To-Do'
                     ORDER BY m.embedding <=> :emb ::vector
                     LIMIT :lim
                 """)
@@ -711,6 +708,7 @@ Return ONLY this JSON:
             select(Message, Category)
             .join(Category, Message.category_id == Category.id, isouter=True)
             .where(Message.id.in_(all_ids))
+            .where(text("COALESCE(messages.tags->>'primary_bucket', messages.tags->>'intent_bucket', '') != 'To-Do'"))
         )
 
         if all_target_buckets:
