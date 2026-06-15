@@ -495,6 +495,13 @@ class MessageProcessor:
         due_date: Optional[str] = None,
         bucket: str = "Remember",
     ) -> Dict:
+        # Shopping/bag/reading/watching lists are recall collections — users look them
+        # up at the store or when packing, they don't "check them off" as tasks.
+        # Override any classifier-assigned To-Do bucket for these types.
+        _RECALL_LIST_TYPES = {"shopping", "bag", "reading", "watching"}
+        if list_type in _RECALL_LIST_TYPES and bucket == "To-Do":
+            bucket = "Remember"
+
         # To-Do lists with no explicit date default to today so they appear
         # under TODAY in the iOS TodoView instead of SOMEDAY.
         if bucket == "To-Do" and not due_date:
