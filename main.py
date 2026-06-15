@@ -3642,18 +3642,18 @@ async def capture_message(
             "starred":             False,
         }, exclude_user_id=current_user.id))
 
-        # ── Mirror To-Do in each assignee's personal feed + push ──────
+        # ── Mirror To-Do in each assignee's personal feed ────────────
         for assignment in assignments:
             auid = assignment["user_id"]
             if auid == current_user.id:
                 continue
             todo_tags = {
-                "primary_bucket":   "To-Do",
-                "intent_bucket":    "To-Do",
-                "due_date":         result.get("due_date"),
-                "assigned_by":      current_user.name,
-                "assigned_by_id":   current_user.id,
-                "group_id":         group_id,
+                "primary_bucket":    "To-Do",
+                "intent_bucket":     "To-Do",
+                "due_date":          result.get("due_date"),
+                "assigned_by":       current_user.name,
+                "assigned_by_id":    current_user.id,
+                "group_id":          group_id,
                 "source_message_id": result["message_id"],
             }
             mirror = Message(
@@ -3665,48 +3665,78 @@ async def capture_message(
                 assigned_to_user_id=auid,
             )
             db.add(mirror)
+
+        # Flush all mirrors in one shot, then collect device tokens
+        await db.flush()
+
+        _push_assign: list[tuple[int, list[str]]] = []
+        for assignment in assignments:
+            auid = assignment["user_id"]
+            if auid == current_user.id:
+                continue
             try:
-                await db.flush()
-                tokens_rows = await db.execute(
+                rows = await db.execute(
                     select(DeviceToken.token).where(DeviceToken.user_id == auid)
                 )
-                badge = await total_unread_for_user(db, auid)
-                for (token,) in tokens_rows.all():
-                    await send_apns_notification(
-                        device_token=token,
-                        title=f"{current_user.name} assigned you a task",
-                        body=content[:80],
-                        badge=badge,
-                        data={"type": "assignment", "group_id": group_id,
-                              "message_id": result["message_id"]},
-                    )
+                _push_assign.append((auid, [r[0] for r in rows.all()]))
             except Exception as e:
-                print(f"[push] assignment notify failed for uid={auid}: {e}")
+                print(f"[push] token fetch failed for uid={auid}: {e}")
 
-        await db.commit()
-
-        # ── Group-wide reminder push to all members ───────────────────
+        _push_grp: list[tuple[int, list[str]]] = []
         if is_group_reminder:
             for member in members:
                 muid = member["id"]
                 if muid == current_user.id:
                     continue
                 try:
-                    tokens_rows = await db.execute(
+                    rows = await db.execute(
                         select(DeviceToken.token).where(DeviceToken.user_id == muid)
                     )
-                    badge = await total_unread_for_user(db, muid)
-                    for (token,) in tokens_rows.all():
+                    _push_grp.append((muid, [r[0] for r in rows.all()]))
+                except Exception as e:
+                    print(f"[push] group reminder token fetch failed for uid={muid}: {e}")
+
+        await db.commit()
+
+        # ── Fire all notifications in the background ──────────────────
+        # Captured by value so the HTTP response is returned immediately.
+        _sender    = current_user.name
+        _gid       = group_id
+        _mid       = result["message_id"]
+        _body      = content[:80]
+
+        async def _send_pushes() -> None:
+            from services.group_service import total_unread_for_user as _tuu
+            for auid, tokens in _push_assign:
+                try:
+                    async with async_session_maker() as _s:
+                        badge = await _tuu(_s, auid)
+                    for token in tokens:
                         await send_apns_notification(
                             device_token=token,
-                            title=f"Reminder · {current_user.name}",
-                            body=content[:80],
-                            badge=badge,
-                            data={"type": "group_reminder", "group_id": group_id,
-                                  "message_id": result["message_id"]},
+                            title=f"{_sender} assigned you a task",
+                            body=_body, badge=badge,
+                            data={"type": "assignment", "group_id": _gid,
+                                  "message_id": _mid},
+                        )
+                except Exception as e:
+                    print(f"[push] assignment notify failed for uid={auid}: {e}")
+            for muid, tokens in _push_grp:
+                try:
+                    async with async_session_maker() as _s:
+                        badge = await _tuu(_s, muid)
+                    for token in tokens:
+                        await send_apns_notification(
+                            device_token=token,
+                            title=f"Reminder · {_sender}",
+                            body=_body, badge=badge,
+                            data={"type": "group_reminder", "group_id": _gid,
+                                  "message_id": _mid},
                         )
                 except Exception as e:
                     print(f"[push] group reminder notify failed for uid={muid}: {e}")
+
+        asyncio.create_task(_send_pushes())
 
     # ── Temporal parsing: LLM extracts time/date for all reminder + recurring captures ──
     # Runs for any personal capture that has reminder keywords or recurring signals.

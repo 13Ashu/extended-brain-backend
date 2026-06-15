@@ -31,6 +31,18 @@ from cerebras_client import CerebrasClient
 _apns_jwt_cache: dict = {}   # {"token": str, "exp": float}
 
 
+async def _cleanup_dead_token(token: str) -> None:
+    """Delete a stale APNs token from the DB (Apple returned 410 or 400/BadDeviceToken)."""
+    try:
+        from sqlalchemy import delete as _sql_delete
+        async with async_session_maker() as session:
+            await session.execute(_sql_delete(DeviceToken).where(DeviceToken.token == token))
+            await session.commit()
+            print(f"[apns] Pruned dead token ...{token[-8:]}")
+    except Exception as exc:
+        print(f"[apns] Failed to prune dead token: {exc}")
+
+
 def _normalize_apns_key(raw: str) -> str:
     """
     Normalize a .p8 APNs private key for reliable PEM loading on all platforms.
@@ -121,6 +133,15 @@ async def send_apns_notification(
             print(f"[apns] ✅ Sent to ...{device_token[-8:]}")
             return True
         print(f"[apns] ❌ {resp.status_code}: {resp.text[:200]}")
+        # 410 = token permanently unregistered (app deleted / device erased)
+        if resp.status_code == 410:
+            asyncio.create_task(_cleanup_dead_token(device_token))
+        elif resp.status_code == 400:
+            try:
+                if resp.json().get("reason") == "BadDeviceToken":
+                    asyncio.create_task(_cleanup_dead_token(device_token))
+            except Exception:
+                pass
         return False
     except Exception as e:
         print(f"[apns] Error: {e}")

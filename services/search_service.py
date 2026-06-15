@@ -42,7 +42,9 @@ BUCKET_ALIASES: Dict[str, str] = {
     "idea": "Ideas", "ideas": "Ideas", "concept": "Ideas",
     "track": "Track", "log": "Track", "habit": "Track",
     "event": "Events", "events": "Events", "appointment": "Events",
-    "meeting": "Events", "schedule": "Events",
+    # "meeting" and "schedule" intentionally excluded — they are content words
+    # (users search FOR something about a meeting, not FOR the Events bucket).
+    # Bucket detection only fires on words that unambiguously name a bucket.
 }
 
 TODO_KEYWORDS = {
@@ -610,22 +612,10 @@ Return ONLY this JSON:
                 text("messages.tags->>'assigned_by' IS NULL"),
             ))
 
-        bucket_filter  = expansion.get("bucket_filter")
-        extra_buckets  = expansion.get("extra_buckets", [])
-        if isinstance(extra_buckets, str):
-            extra_buckets = [extra_buckets]
-        all_target_buckets = list(dict.fromkeys(
-            ([bucket_filter] if bucket_filter and bucket_filter in BUCKET_NAMES else [])
-            + [b for b in extra_buckets if b in BUCKET_NAMES]
-        ))
-
-        if all_target_buckets:
-            bucket_conditions = []
-            for b in all_target_buckets:
-                bucket_conditions.append(Category.name == b)
-                bucket_conditions.append(text(f"messages.tags->'all_buckets' @> '\"{b}\"'::jsonb"))
-            stmt = stmt.where(or_(*bucket_conditions))
-
+        # NOTE: bucket detection is NOT a hard filter. A detected bucket
+        # ("my ideas about X") only boosts ranking in _score() — it never
+        # excludes candidates. This prevents an incidental bucket-ish word in
+        # the query from zeroing out an otherwise-strong keyword/semantic match.
         date_from = expansion.get("date_from")
         date_to   = expansion.get("date_to")
         if date_from and date_to:
@@ -711,12 +701,7 @@ Return ONLY this JSON:
             .where(text("COALESCE(messages.tags->>'primary_bucket', messages.tags->>'intent_bucket', '') != 'To-Do'"))
         )
 
-        if all_target_buckets:
-            bucket_conditions = []
-            for b in all_target_buckets:
-                bucket_conditions.append(Category.name == b)
-                bucket_conditions.append(text(f"messages.tags->'all_buckets' @> '\"{b}\"'::jsonb"))
-            final_stmt = final_stmt.where(or_(*bucket_conditions))
+        # (bucket scoping is applied as a soft boost in _score, not a WHERE here)
 
         if date_from and date_to and use_due_filter:
             final_stmt = final_stmt.where(
@@ -808,7 +793,26 @@ Return ONLY this JSON:
         # we can evaluate the quality + speed of pure semantic search in isolation.
         # Scaled ×100 so 0.40–1.0 cosine → 40–100 (keeps results above _rank's
         # MIN_RELEVANCE=8 floor). Remove this return + uncomment below to restore hybrid.
-        return getattr(message, "_semantic_score", 0.0) * 100.0
+        base = getattr(message, "_semantic_score", 0.0) * 100.0
+
+        # ── Soft bucket boost (never a hard filter) ───────────────────────────
+        # When the query named a bucket ("my ideas about marketing"), rank items
+        # in that bucket higher — but a strongly-relevant item from another bucket
+        # can still win. Multiplicative so a zero-base keyword-tier result stays
+        # zero (avoids spuriously crossing _rank's MIN_RELEVANCE floor and thereby
+        # re-creating a hard filter through the back door).
+        bucket_filter = expansion.get("bucket_filter")
+        if bucket_filter and base > 0:
+            tags = message.tags if isinstance(message.tags, dict) else {}
+            all_buckets = tags.get("all_buckets", [])
+            in_bucket = (
+                (category is not None and category.name == bucket_filter)
+                or (bucket_filter in all_buckets)
+            )
+            if in_bucket:
+                base *= 1.25
+
+        return base
 
         # from rapidfuzz import fuzz
         #

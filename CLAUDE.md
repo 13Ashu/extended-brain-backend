@@ -104,8 +104,9 @@ extended-brain-backend/
 | Redis caching | `services/redis_cache.py` |
 | Pro accounts / groups | `services/group_service.py` |
 | Reminder scheduling | `services/reminder_service.py` |
-| APNs push delivery | `services/reminder_service.py` |
+| APNs push delivery | `services/reminder_service.py` → `send_apns_notification()`. **Self-pruning:** on `410 Unregistered` (app deleted) or `400 BadDeviceToken`, it fires `_cleanup_dead_token()` (background) to delete the stale token row, so the token table doesn't bloat with dead reinstall tokens. Re-registration on next app launch (`POST /api/users/device-token`) makes this self-healing. ⚠️ A misconfigured `APNS_PRODUCTION` would make every token return 400 → mass-prune, but it self-recovers on next launch |
 | App-icon badge count | `services/group_service.py` → `total_unread_for_user(db, user_id)` — total unread group messages (same logic as `GET /api/groups/unread`). **Every** `send_apns_notification(...)` call (assignment / completion / group-reminder in `main.py`, plus `briefing_service`, `recurrence_service`, `reminder_service`) passes `badge=` this value, so the iOS badge means exactly "unread group messages" and is correct before the app opens |
+| Group-capture push fan-out | `main.py` capture route. APNs sends for @mention assignees + group-wide reminders run in a **background task** (`asyncio.create_task(_send_pushes())`) — device tokens are pre-fetched and the DB committed first, so the HTTP response returns immediately instead of blocking on a serial APNs blast (which previously caused iOS-side timeouts → duplicate captures) |
 | **Annotation storage (retraining data)** | **`database.py` → `LabelAnnotation`** |
 | **Write annotation on bucket move** | **`main.py` → `PATCH /api/messages/{id}/bucket`** |
 | **Export annotations for retraining** | **`main.py` → `GET /api/annotations/export`** |
@@ -481,12 +482,9 @@ iOS makes two calls per search query:
 - Tier 3: LLM `_expand_query()` → richer keywords — starts in parallel with Tier 2, skipped if ≤3 words
 - Both run concurrently via `asyncio.create_task()`; results merged and ranked
 
-**Scoring (`_score()` in `search_service.py`):**
-- Primary text: `rapidfuzz.token_set_ratio(query, content) × 0.60` (max +60)
-  - Handles word order, partial words, minor typos — "people call" = "people to call" = 100
-- Semantic: `embedding_similarity × 15.0` (max +15, secondary to text)
-- Secondary fields: subtasks ×0.15, split_from ×0.12, original_dump ×0.12
-- Expansion terms, entities, bucket hints, due-date, recency: unchanged
+**Scoring (`_score()` in `search_service.py`):** currently in **semantic-only mode** — ranking is driven purely by embedding cosine similarity (`_semantic_score × 100`, so 0.40–1.0 cosine → 40–100). The hybrid `rapidfuzz.token_set_ratio` text scoring is present but **commented out** (kept for easy restore; the inline comment shows how). The fast `fast=True` tier-1 preview has no embedding, so its keyword results score 0 and fall through `_rank`'s `MIN_RELEVANCE=8` floor (returned in recency order).
+- **Soft bucket boost (not a filter):** when `_detect_bucket(query)` finds a bucket word ("my **ideas** about X"), matching results are multiplied ×1.25 in `_score` — they rank higher but are **never excluded**. Multiplicative on purpose: a zero-base keyword-tier result stays 0, so the boost can't push it over `MIN_RELEVANCE` and re-create a hard filter. A strongly-relevant item from another bucket still wins.
+- **No hard bucket `WHERE`:** `_retrieve` does **not** restrict candidates by bucket. (Historically it did — a single incidental bucket-ish word like "meeting" would zero out all results. Removed June 2026.) `"meeting"` / `"schedule"` were also dropped from `BUCKET_ALIASES` for the same reason — they are content words, not bucket-scope commands.
 - `natural_response` is always `""` (LLM summary generation commented out, reserved for future)
 
 ### Other LLM Use Cases — all use Gemini 2.5 Flash Lite (paid)
