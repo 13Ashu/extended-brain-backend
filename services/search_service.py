@@ -784,7 +784,7 @@ Return ONLY this JSON:
                 **({"items": list_items} if list_items is not None else {}),
             })
 
-        scored.sort(key=lambda x: (x["relevance"], x["priority"] == "high"), reverse=True)
+        scored.sort(key=lambda x: (x["relevance"], x["priority"] == "high", x["created_at"]), reverse=True)
 
         # Drop results with negligible relevance — pure semantic noise with no keyword overlap.
         # A result that matched only via weak vector similarity scores ≤ ~6; any keyword hit

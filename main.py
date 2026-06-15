@@ -5139,3 +5139,44 @@ async def admin_events(request: Request, user_id: Optional[int] = None,
          "ts": (r.client_ts or r.created_at).isoformat()}
         for r in rows
     ]
+
+
+@app.post("/api/admin/reembed")
+async def admin_reembed(request: Request, user_id: Optional[int] = None,
+                        limit: int = 50, db: AsyncSession = Depends(get_db)):
+    """Re-generate embeddings for messages that have NULL embedding.
+
+    Useful when a transient Gemini error caused embedding generation to fail
+    silently at capture time, leaving the message invisible to semantic search.
+    Pass ?user_id=X to scope to one user; omit to run across all users (capped at limit).
+    """
+    _check_admin(request)
+    from services.embedding_service import embedding_service
+
+    q = select(Message).where(Message.embedding.is_(None)).order_by(Message.created_at.desc()).limit(min(limit, 200))
+    if user_id is not None:
+        q = q.where(Message.user_id == user_id)
+    rows = (await db.execute(q)).scalars().all()
+
+    ok, failed = 0, 0
+    for msg in rows:
+        try:
+            text_to_embed = (msg.content or "").strip()
+            if not text_to_embed:
+                continue
+            tags = msg.tags if isinstance(msg.tags, dict) else {}
+            enriched = " ".join(filter(None, [
+                text_to_embed,
+                tags.get("essence", "") or (msg.summary or ""),
+                " ".join(tags.get("keywords", [])),
+            ])).strip()
+            embedding = await embedding_service.aembed(enriched, task_type="RETRIEVAL_DOCUMENT")
+            await db.execute(
+                update(Message).where(Message.id == msg.id).values(embedding=embedding)
+            )
+            ok += 1
+        except Exception as e:
+            print(f"[reembed] msg {msg.id} failed: {e}")
+            failed += 1
+    await db.commit()
+    return {"reembedded": ok, "failed": failed, "total_found": len(rows)}

@@ -1244,29 +1244,36 @@ Return ONLY this JSON:
     async def _save_embedding(
         self, message_id: int, content: str, analysis: Dict, db: AsyncSession,
     ):
-        try:
-            from services.embedding_service import embedding_service
-            people      = analysis.get("entities", {}).get("people", [])
-            keywords    = analysis.get("keywords", [])
-            essence     = analysis.get("essence", "")
-            buckets     = analysis.get("buckets", [])
-            actionables = analysis.get("actionables", [])
+        import asyncio as _aio
+        from services.embedding_service import embedding_service
+        people      = analysis.get("entities", {}).get("people", [])
+        keywords    = analysis.get("keywords", [])
+        essence     = analysis.get("essence", "")
+        buckets     = analysis.get("buckets", [])
+        actionables = analysis.get("actionables", [])
 
-            enriched = " ".join(filter(None, [
-                content, essence,
-                " ".join(keywords), " ".join(people),
-                " ".join(actionables), " ".join(buckets),
-            ]))
+        enriched = " ".join(filter(None, [
+            content, essence,
+            " ".join(keywords), " ".join(people),
+            " ".join(actionables), " ".join(buckets),
+        ])).strip()
 
-            embedding = await embedding_service.aembed(
-                enriched.strip(), task_type="RETRIEVAL_DOCUMENT"
-            )
-            await db.execute(
-                update(Message).where(Message.id == message_id).values(embedding=embedding)
-            )
-            await db.commit()
-        except Exception as e:
-            print(f"⚠ Embedding failed (non-critical): {e}")
+        for attempt in range(2):
+            try:
+                embedding = await embedding_service.aembed(
+                    enriched, task_type="RETRIEVAL_DOCUMENT"
+                )
+                await db.execute(
+                    update(Message).where(Message.id == message_id).values(embedding=embedding)
+                )
+                await db.commit()
+                return
+            except Exception as e:
+                if attempt == 0:
+                    print(f"⚠ Embedding attempt 1 failed, retrying in 1s: {e}")
+                    await _aio.sleep(1)
+                else:
+                    print(f"⚠ Embedding failed (non-critical): {e}")
 
     async def _process_image(
         self,
