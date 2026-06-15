@@ -577,6 +577,7 @@ Return ONLY this JSON:
                     SELECT m.id, 1 - (m.embedding <=> :emb ::vector) AS similarity
                     FROM messages m
                     WHERE m.user_id = :uid AND m.group_id IS NULL AND m.embedding IS NOT NULL
+                      AND (m.tags->>'assigned_by' IS NULL)
                       AND (1 - (m.embedding <=> :emb ::vector)) > :min_sim
                     ORDER BY m.embedding <=> :emb ::vector
                     LIMIT :lim
@@ -606,7 +607,11 @@ Return ONLY this JSON:
         if group_id:
             stmt = stmt.where(Message.group_id == group_id)
         else:
-            stmt = stmt.where(and_(Message.user_id == user.id, Message.group_id.is_(None)))
+            stmt = stmt.where(and_(
+                Message.user_id == user.id,
+                Message.group_id.is_(None),
+                text("messages.tags->>'assigned_by' IS NULL"),
+            ))
 
         bucket_filter  = expansion.get("bucket_filter")
         extra_buckets  = expansion.get("extra_buckets", [])
