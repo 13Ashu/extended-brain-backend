@@ -3578,6 +3578,8 @@ async def capture_message(
         force_bucket="Track" if message.expense_amount is not None else ("To-Do" if assignments else (message.force_bucket or None)),
         # All group captures: use classifier or rule-based fallback, never LLM
         no_llm_fallback=bool(group_id),
+        # When the task is assigned to someone, skip sender's reminder — assignee gets it instead
+        skip_reminder=bool(assignments),
     )
 
     # ── Tag message with group_id / assignments ───────────────────────
@@ -3643,6 +3645,7 @@ async def capture_message(
         }, exclude_user_id=current_user.id))
 
         # ── Mirror To-Do in each assignee's personal feed ────────────
+        mirror_objects: list[tuple[int, Message]] = []  # (auid, mirror)
         for assignment in assignments:
             auid = assignment["user_id"]
             if auid == current_user.id:
@@ -3665,9 +3668,34 @@ async def capture_message(
                 assigned_to_user_id=auid,
             )
             db.add(mirror)
+            mirror_objects.append((auid, mirror))
 
-        # Flush all mirrors in one shot, then collect device tokens
+        # Flush all mirrors in one shot so mirror IDs are available
         await db.flush()
+
+        # ── Create reminders for assignees (not the sender) ──────────
+        _evt_time = result.get("event_time")
+        _due_date = result.get("due_date")
+        if _evt_time:
+            for auid, mirror in mirror_objects:
+                try:
+                    assignee_user = await db.get(User, auid)
+                    if assignee_user:
+                        await reminder_service.create(
+                            user=assignee_user,
+                            content=content,
+                            analysis={
+                                "event_time":  _evt_time,
+                                "due_date":    _due_date,
+                                "priority":    result.get("priority", "normal"),
+                                "actionables": [content],
+                                "essence":     content,
+                            },
+                            message_id=mirror.id,
+                            db=db,
+                        )
+                except Exception as e:
+                    print(f"[reminder] assignee reminder failed for uid={auid}: {e}")
 
         _push_assign: list[tuple[int, list[str]]] = []
         for assignment in assignments:

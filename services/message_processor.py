@@ -333,6 +333,7 @@ class MessageProcessor:
         group_id: Optional[int] = None,
         force_bucket: Optional[str] = None,
         no_llm_fallback: bool = False,
+        skip_reminder: bool = False,
     ) -> Dict:
         user = await self._get_user(user_phone, db)
         if not user:
@@ -400,13 +401,15 @@ class MessageProcessor:
             if len(tasks) > 1:
                 return await self._process_tasks(
                     user=user, tasks=tasks, parsed=parsed,
-                    original_content=content, db=db
+                    original_content=content, db=db,
+                    skip_reminder=skip_reminder,
                 )
             elif len(tasks) == 1:
                 return await self._process_single_task(
                     user=user, task=tasks[0], parsed=parsed,
                     content=content, message_type=message_type,
-                    media_url=media_url, db=db, ref=ref
+                    media_url=media_url, db=db, ref=ref,
+                    skip_reminder=skip_reminder,
                 )
 
         # ── Track ─────────────────────────────────────────────────
@@ -535,7 +538,8 @@ class MessageProcessor:
 
     async def _process_tasks(
         self, user, tasks: List[Dict], parsed: Dict,
-        original_content: str, db: AsyncSession
+        original_content: str, db: AsyncSession,
+        skip_reminder: bool = False,
     ) -> Dict:
         """
         Save multiple tasks. Each task is its own Message row.
@@ -607,8 +611,8 @@ class MessageProcessor:
         reminder_count = 0
         for saved in saved_items:
             await self._save_embedding(saved["id"], saved["task"], {}, db)
-            # Each task with a time gets its OWN reminder
-            if self.reminder_service and saved["evt_time"]:
+            # Each task with a time gets its OWN reminder (skip for group @mention captures)
+            if self.reminder_service and saved["evt_time"] and not skip_reminder:
                 try:
                     await self.reminder_service.create(
                         user=user,
@@ -646,7 +650,8 @@ class MessageProcessor:
 
     async def _process_single_task(
         self, user, task: Dict, parsed: Dict, content: str,
-        message_type: str, media_url: Optional[str], db: AsyncSession, ref: datetime
+        message_type: str, media_url: Optional[str], db: AsyncSession, ref: datetime,
+        skip_reminder: bool = False,
     ) -> Dict:
         """Save a single task, optionally with reminder and event."""
         due_date  = task.get("due_date") or _today_str()
@@ -717,12 +722,13 @@ class MessageProcessor:
             "essence":     content,
             "connections": [],
             "due_date":    due_date,
+            "event_time":  evt_time,
             "events":      tags["events"],
             "priority":    priority,
         }
 
-        # Reminder — only if set_reminder=true AND time is present
-        if self.reminder_service and actions.get("set_reminder") and evt_time:
+        # Reminder — only if set_reminder=true AND time is present AND not delegated to caller
+        if self.reminder_service and actions.get("set_reminder") and evt_time and not skip_reminder:
             try:
                 rem_data = parsed.get("reminder") or {}
                 reminder = await self.reminder_service.create(

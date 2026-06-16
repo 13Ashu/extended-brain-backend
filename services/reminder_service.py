@@ -226,7 +226,7 @@ class ReminderService:
             content=content,
             task=task,
             remind_at=remind_at,
-            timezone=user.timezone or "UTC",
+            timezone=user.timezone or "Asia/Kolkata",
             telegram_chat_id=user.telegram_chat_id,
         )
         db.add(reminder)
@@ -449,7 +449,7 @@ class ReminderService:
         if not due_date_str and not event_time:
             return None
 
-        tz = ZoneInfo(user_tz or "UTC")
+        tz = ZoneInfo(user_tz or "Asia/Kolkata")
 
         if due_date_str:
             try:
@@ -487,7 +487,7 @@ class ReminderService:
 
     def _to_local_time(self, dt: datetime, tz_str: str) -> str:
         try:
-            tz    = ZoneInfo(tz_str or "UTC")
+            tz    = ZoneInfo(tz_str or "Asia/Kolkata")
             local = dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
             return local.strftime("%a, %d %b %Y at %I:%M %p")
         except Exception:

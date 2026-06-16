@@ -199,6 +199,7 @@ class BriefingService:
                     text("messages.tags->>'due_date' < :today"),
                     text("(messages.tags->>'done')::boolean IS NOT TRUE"),
                     text("messages.tags->'all_buckets' @> '\"To-Do\"'::jsonb"),
+                    text("(messages.tags->>'recurring')::boolean IS NOT TRUE"),
                 )
             )
             .params(today=today)
@@ -207,9 +208,9 @@ class BriefingService:
 
         for msg in overdue:
             tags = dict(msg.tags or {})
+            tags["original_date"] = tags.get("due_date", "unknown")
             tags["due_date"]      = today
             tags["carried_over"]  = True
-            tags["original_date"] = tags.get("due_date", "unknown")
             await session.execute(
                 update(Message)
                 .where(Message.id == msg.id)
