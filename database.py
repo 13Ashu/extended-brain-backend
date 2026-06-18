@@ -272,6 +272,7 @@ class Group(Base):
     name: Mapped[str] = mapped_column(String(100))
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     emoji: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    photo_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     # Shareable join link token (minted at creation). Unique so /join/{token} resolves.
     invite_token: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True, nullable=True)
     # Per-group member cap (includes the creator/admin).
@@ -468,6 +469,8 @@ async def init_db():
             "ALTER TABLE groups ADD COLUMN IF NOT EXISTS invite_token VARCHAR(64)",
             "ALTER TABLE groups ADD COLUMN IF NOT EXISTS max_members INTEGER DEFAULT 10",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_invite_token ON groups(invite_token) WHERE invite_token IS NOT NULL",
+            # Group profile photo (WhatsApp-style avatar)
+            "ALTER TABLE groups ADD COLUMN IF NOT EXISTS photo_url VARCHAR(500)",
         ]
         for stmt in migrations:
             try:

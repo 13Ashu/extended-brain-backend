@@ -4476,6 +4476,10 @@ class CreateGroupRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     description: Optional[str] = None
     emoji: Optional[str] = None
+    photo_url: Optional[str] = None
+
+class UpdateGroupPhotoRequest(BaseModel):
+    photo_url: Optional[str] = None
 
 class AddGroupMemberRequest(BaseModel):
     user_id: int
@@ -4580,13 +4584,34 @@ async def create_group(
     result = await grp_svc.create_group(current_user, req.name, req.description, db)
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["message"])
-    # Optionally store emoji
-    if req.emoji and result.get("group_id"):
+    # Optionally store emoji and/or photo_url
+    if (req.emoji or req.photo_url) and result.get("group_id"):
         grp = await db.get(Group, result["group_id"])
         if grp:
-            grp.emoji = req.emoji
+            if req.emoji:
+                grp.emoji = req.emoji
+            if req.photo_url:
+                grp.photo_url = req.photo_url
             await db.commit()
     return result
+
+
+@app.patch("/api/groups/{group_id}/photo")
+async def update_group_photo(
+    group_id: int,
+    req: UpdateGroupPhotoRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update the group photo (or clear it by passing null). Admin only."""
+    group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found or access denied")
+    if not await grp_svc.is_group_admin(group_id, current_user.id, db):
+        raise HTTPException(status_code=403, detail="Only the group owner can change the group photo.")
+    group.photo_url = req.photo_url
+    await db.commit()
+    return {"success": True, "photo_url": group.photo_url}
 
 
 @app.get("/api/groups/{group_id}/messages")

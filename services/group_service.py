@@ -388,6 +388,7 @@ class GroupService:
                 "name": group.name,
                 "description": group.description,
                 "emoji": group.emoji or "👥",
+                "photo_url": group.photo_url,
                 "role": membership.role,
                 "member_count": member_count,
                 "max_members": group.max_members or 10,

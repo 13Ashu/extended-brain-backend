@@ -191,6 +191,7 @@ extended-brain-backend/
 | DELETE | `/api/groups/{id}/leave` | Leave group |
 | DELETE | `/api/groups/{id}` | Delete group |
 | POST | `/api/groups/{id}/seen` | Mark all group messages as read |
+| PATCH | `/api/groups/{id}/photo` | **Admin only** — set or clear group photo; body: `{photo_url: string\|null}` |
 | GET | `/api/groups/unread` | Unread count per group `{group_id: count}` |
 | WS | `/ws/group/{id}` | WebSocket: live incoming group messages |
 
@@ -290,7 +291,7 @@ All models in `database.py`. Uses SQLAlchemy 2.0 async with `asyncpg`.
 
 **`pro_account_members`** — `account_id`, `user_id` (nullable), `phone_number`, `invite_token`, `status` (pending/active), `invited_at`, `joined_at`. ⚠️ **Defunct** — the old account roster. Table kept (account-deletion logic still references it) but nothing gates group access on it anymore.
 
-**`groups`** — `id`, `account_id` (FK→pro_accounts), `name`, `description`, `emoji`, `invite_token` (unique — the shareable join link), `max_members` (default 10), `created_by`, `created_at`
+**`groups`** — `id`, `account_id` (FK→pro_accounts), `name`, `description`, `emoji`, `photo_url` (nullable — WhatsApp-style group avatar, URL to stored image), `invite_token` (unique — the shareable join link), `max_members` (default 10), `created_by`, `created_at`
 
 **`group_members`** — `group_id`, `user_id`, `role`, `joined_at`
 
