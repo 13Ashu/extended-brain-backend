@@ -3054,7 +3054,14 @@ async def bootstrap(
             raise HTTPException(status_code=403, detail="Not a member of this group")
         base_filter = Message.group_id == group_id
     else:
-        base_filter = and_(Message.user_id == current_user.id, Message.group_id.is_(None))
+        # Exclude mirror messages (assigned_to_user_id IS NOT NULL, group_id NULL) —
+        # those are personal Todo copies created for group @mention assignments and
+        # belong in the assigned feed only, not in the personal dump chat.
+        base_filter = and_(
+            Message.user_id == current_user.id,
+            Message.group_id.is_(None),
+            Message.assigned_to_user_id.is_(None),
+        )
 
     recent_rows = await db.execute(
         select(Message, Category, User)
@@ -3220,7 +3227,11 @@ async def get_recent_messages(
             raise HTTPException(status_code=403, detail="Not a member of this group")
         base_filter = Message.group_id == group_id
     else:
-        base_filter = and_(Message.user_id == current_user.id, Message.group_id.is_(None))
+        base_filter = and_(
+            Message.user_id == current_user.id,
+            Message.group_id.is_(None),
+            Message.assigned_to_user_id.is_(None),
+        )
 
     # Parse optional `after` timestamp for incremental polling
     after_dt = None
