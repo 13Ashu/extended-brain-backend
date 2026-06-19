@@ -148,7 +148,7 @@ extended-brain-backend/
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/messages/capture` | Save message — runs full AI pipeline |
-| GET | `/api/messages/recent` | Recent messages (`?limit=&group_id=&after=`) |
+| GET | `/api/messages/recent` | Recent messages (`?limit=&group_id=&after=`). Personal filter: `user_id == me AND group_id IS NULL AND assigned_to_user_id IS NULL` — mirror messages excluded. |
 | GET | `/api/messages/assigned` | Tasks in the current user's "Assigned to Me" feed. Two cases: **Case 1** — explicitly @mention-assigned (`assigned_to_user_id == me`); **Case 2** — group To-Do with no specific assignee yet (`assigned_to_user_id IS NULL`, `tags.assignments` absent, bucket=To-Do, not done), where the user is a group member. Sender is included in Case 2 (they own the responsibility too). Response includes `sender_id` for iOS grouping. |
 | GET | `/api/messages/assigned-to-others` | Group tasks the current user assigned to others (their delegation dashboard) |
 | PATCH | `/api/messages/{id}/assignments/{idx}/complete` | Assignee marks their slot done; notifies assigner via APNs + WS broadcast |
@@ -174,7 +174,7 @@ extended-brain-backend/
 ### Bootstrap & Analytics
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/bootstrap` | Initial app load (`?limit=&group_id=&refresh=`) — recent + members + assigned + unread. **`refresh=true`** bypasses the 30-second Redis cache (iOS sends this on pull-to-refresh). Cache is busted automatically after every write mutation. `assigned` uses the same dual-case OR query as `GET /api/messages/assigned`. |
+| GET | `/api/bootstrap` | Initial app load (`?limit=&group_id=&refresh=`) — recent + members + assigned + unread. **`refresh=true`** bypasses the 30-second Redis cache (iOS sends this on pull-to-refresh). Cache is busted automatically after every write mutation. `assigned` uses the same dual-case OR query as `GET /api/messages/assigned`. Personal `recent` filter: `user_id == me AND group_id IS NULL AND assigned_to_user_id IS NULL` — the last clause excludes mirror messages. |
 | GET | `/api/analytics` | User usage statistics |
 
 ### Groups
@@ -400,7 +400,7 @@ uvicorn main:app --reload --port 8000
 
 ## Deployment Notes (Railway)
 
-- **Build:** Nixpacks auto-detects Python; runs `pip install -r requirements.txt`
+- **Build:** Nixpacks auto-detects Python; runs `pip install --no-cache-dir -r requirements.txt` (`railway.json`). `--no-cache-dir` prevents `json.decoder.JSONDecodeError` caused by a corrupted Railway build-layer pip cache.
 - **Start:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - **Restart:** `ON_FAILURE`, max 10 retries (`railway.json`)
 - **Railway PostgreSQL:** `pool_size=20` + `max_overflow=10` (30 max connections) set in `database.py`. Increased from 10/5 to support real-time search load.
@@ -528,6 +528,7 @@ Gemini `text-embedding-004` via REST, 1536 dims, stored in pgvector column on `m
 - Never log full JWT tokens or password hashes.
 - Never hardcode the database URL — always use `DATABASE_URL` from env.
 - **Never build new features that route through Telegram or WhatsApp** — these channels are being retired. All new flows must be reachable from the iOS app via the REST API.
+- **Never include mirror messages in the personal `recent` feed.** Mirror messages are personal To-Do copies created for group @mention assignees (`user_id = assignee, group_id = NULL, assigned_to_user_id = assignee`). The personal `base_filter` in both `GET /api/bootstrap` and `GET /api/messages/recent` must include `Message.assigned_to_user_id.is_(None)` to exclude them — they belong in the `assigned` feed only and must never appear in the personal dump chat.
 
 ---
 
