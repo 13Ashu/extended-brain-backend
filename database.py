@@ -32,8 +32,8 @@ engine = create_async_engine(
     echo=False,
     future=True,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=5,
+    pool_size=20,
+    max_overflow=10,
     connect_args={
         "ssl": False,     # Railway internal networking — no SSL needed
         "timeout": 30,
