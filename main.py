@@ -2708,16 +2708,39 @@ async def get_assigned_messages(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return tasks assigned to the current user across all groups."""
+    """Return tasks assigned to the current user across all groups.
+
+    Two cases:
+    1. Explicitly assigned (@mention): assigned_to_user_id == current_user.id
+    2. Group-wide unassigned To-Do: no specific assignee yet, user is a group member
+       (not the sender). Once retroactively assigned, case 2 exits naturally because
+       assigned_to_user_id becomes non-null and tags gains an 'assignments' key.
+    """
+    _user_group_ids = select(GroupMember.group_id).where(GroupMember.user_id == current_user.id)
     result = await db.execute(
         select(Message, Category, User)
         .outerjoin(Category, Message.category_id == Category.id)
         .join(User, User.id == Message.user_id)
         .where(
-            Message.assigned_to_user_id == current_user.id,
-            # Exclude mirror messages: those are created in the assignee's own feed (user_id == assignee).
-            # The original group message (user_id == assigner) is the authoritative record to show.
-            Message.user_id != current_user.id,
+            or_(
+                # Case 1: explicitly assigned to me (original behaviour)
+                and_(
+                    Message.assigned_to_user_id == current_user.id,
+                    Message.user_id != current_user.id,   # exclude mirror messages
+                ),
+                # Case 2: group-wide unassigned To-Do where I'm a member
+                # (includes tasks I posted myself — sender also owns responsibility)
+                and_(
+                    Message.group_id.in_(_user_group_ids),
+                    Message.assigned_to_user_id.is_(None),
+                    text("NOT (messages.tags ? 'assignments')"),
+                    or_(
+                        text("messages.tags->>'primary_bucket' = 'To-Do'"),
+                        text("messages.tags->>'intent_bucket' = 'To-Do'"),
+                    ),
+                    text("COALESCE((messages.tags->>'done')::boolean, false) = false"),
+                ),
+            )
         )
         .order_by(Message.created_at.desc())
         .limit(100)
@@ -2747,6 +2770,7 @@ async def get_assigned_messages(
             "items":          items,
             "group_id":       msg.group_id,
             "sender_name":    sender.name,
+            "sender_id":      msg.user_id,
             "assigned_to_user_id": msg.assigned_to_user_id,
             "assignments":    tags.get("assignments", []),
             "expense_amount":   tags.get("expense_amount"),
@@ -2978,11 +3002,24 @@ async def assign_message(
 
     # Broadcast to group so other clients refresh
     asyncio.create_task(ws_manager.broadcast(msg.group_id, {
-        "type":        "assignment_added",
-        "message_id":  message_id,
-        "assigned_to": assignee_name,
-        "assigned_by": current_user.name,
+        "type":           "assignment_added",
+        "message_id":     message_id,
+        "assigned_to":    assignee_name,
+        "assigned_to_id": assignee_id,
+        "assigned_by":    current_user.name,
     }))
+
+    # Bust personal bootstrap cache for every group member so the task transitions
+    # from "group-wide unassigned" to "assigned to [name]" without waiting for TTL.
+    from services import redis_cache as _rc
+    try:
+        member_rows = await db.execute(
+            select(GroupMember.user_id).where(GroupMember.group_id == msg.group_id)
+        )
+        for (muid,) in member_rows.all():
+            asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(muid, None)))
+    except Exception:
+        pass  # cache bust is best-effort
 
     return {
         "success":     True,
@@ -2996,16 +3033,19 @@ async def assign_message(
 async def bootstrap(
     group_id: Optional[int] = None,
     limit: int = 100,
+    refresh: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Single round-trip that returns everything iOS needs to open a context:
-    recent messages, group members, assigned tasks, and unread counts."""
+    recent messages, group members, assigned tasks, and unread counts.
+    Pass refresh=true to bypass the 30-second Redis cache (e.g. pull-to-refresh)."""
     from services import redis_cache
     bk = redis_cache.bootstrap_key(current_user.id, group_id)
-    cached = await redis_cache.cache_get(bk)
-    if cached:
-        return cached
+    if not refresh:
+        cached = await redis_cache.cache_get(bk)
+        if cached:
+            return cached
 
     # 1. Recent messages ──────────────────────────────────────────────
     if group_id:
@@ -3068,13 +3108,31 @@ async def bootstrap(
         members = await grp_svc.get_group_members(group_id, db)
 
     # 3. Assigned tasks ───────────────────────────────────────────────
+    # Same dual-condition as GET /api/messages/assigned (keep in sync):
+    # Case 1 — explicitly assigned (@mention); Case 2 — group-wide unassigned To-Do.
+    _bstrap_group_ids = select(GroupMember.group_id).where(GroupMember.user_id == current_user.id)
     assigned_rows = await db.execute(
         select(Message, Category, User)
         .outerjoin(Category, Message.category_id == Category.id)
         .join(User, User.id == Message.user_id)
         .where(
-            Message.assigned_to_user_id == current_user.id,
-            Message.user_id != current_user.id,  # exclude mirror messages
+            or_(
+                and_(
+                    Message.assigned_to_user_id == current_user.id,
+                    Message.user_id != current_user.id,
+                ),
+                and_(
+                    Message.group_id.in_(_bstrap_group_ids),
+                    # sender is included — they own the responsibility too
+                    Message.assigned_to_user_id.is_(None),
+                    text("NOT (messages.tags ? 'assignments')"),
+                    or_(
+                        text("messages.tags->>'primary_bucket' = 'To-Do'"),
+                        text("messages.tags->>'intent_bucket' = 'To-Do'"),
+                    ),
+                    text("COALESCE((messages.tags->>'done')::boolean, false) = false"),
+                ),
+            )
         )
         .order_by(Message.created_at.desc())
         .limit(100)
@@ -4003,15 +4061,64 @@ async def mark_message_done(
 ):
     from sqlalchemy import update as sa_update
     done_val = body.done if body is not None else True
+
+    # Fetch the message first so we can:
+    # 1. Allow group members to mark group-wide tasks done (not just the owner)
+    # 2. Bust bootstrap caches for affected users after the update
+    msg_row = await db.execute(
+        select(Message).where(Message.id == message_id)
+    )
+    msg = msg_row.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    # Authorization: owner always allowed; group member allowed for unassigned group-wide tasks
+    is_owner = msg.user_id == current_user.id
+    is_group_member_task = False
+    if not is_owner and msg.group_id and not msg.assigned_to_user_id:
+        member_check = await db.execute(
+            select(GroupMember.id).where(
+                and_(GroupMember.group_id == msg.group_id, GroupMember.user_id == current_user.id)
+            )
+        )
+        is_group_member_task = member_check.scalar_one_or_none() is not None
+
+    if not is_owner and not is_group_member_task:
+        raise HTTPException(status_code=403, detail="Not allowed")
+
     jsonb_expr = f"jsonb_set(COALESCE(tags, '{{}}'), '{{done}}', '{str(done_val).lower()}'::jsonb)"
-    result = await db.execute(
+    await db.execute(
         sa_update(Message)
-        .where(and_(Message.id == message_id, Message.user_id == current_user.id))
+        .where(Message.id == message_id)
         .values(tags=text(jsonb_expr))
     )
     await db.commit()
-    if result.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Message not found")
+
+    from services import redis_cache as _rc
+    # Always bust the owner's bootstrap cache
+    asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(msg.user_id, None)))
+    if msg.group_id:
+        asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(msg.user_id, msg.group_id)))
+
+    # For group-wide tasks, bust all members' personal bootstrap caches and broadcast
+    # so their "Assigned to Me" updates without needing a manual pull-to-refresh.
+    is_group_wide_task = msg.group_id and not msg.assigned_to_user_id
+    if (is_group_member_task) or (is_owner and is_group_wide_task):
+        try:
+            all_members = await db.execute(
+                select(GroupMember.user_id).where(GroupMember.group_id == msg.group_id)
+            )
+            for (muid,) in all_members.all():
+                asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(muid, None)))
+        except Exception:
+            pass
+        asyncio.create_task(ws_manager.broadcast(msg.group_id, {
+            "type":       "todo_completed",
+            "message_id": message_id,
+            "done":       done_val,
+            "done_by":    current_user.name,
+        }))
+
     return {"success": True}
 
 

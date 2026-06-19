@@ -149,12 +149,12 @@ extended-brain-backend/
 |--------|------|-------------|
 | POST | `/api/messages/capture` | Save message — runs full AI pipeline |
 | GET | `/api/messages/recent` | Recent messages (`?limit=&group_id=&after=`) |
-| GET | `/api/messages/assigned` | Tasks @assigned to current user (their "Assigned to Me" feed) |
+| GET | `/api/messages/assigned` | Tasks in the current user's "Assigned to Me" feed. Two cases: **Case 1** — explicitly @mention-assigned (`assigned_to_user_id == me`); **Case 2** — group To-Do with no specific assignee yet (`assigned_to_user_id IS NULL`, `tags.assignments` absent, bucket=To-Do, not done), where the user is a group member. Sender is included in Case 2 (they own the responsibility too). Response includes `sender_id` for iOS grouping. |
 | GET | `/api/messages/assigned-to-others` | Group tasks the current user assigned to others (their delegation dashboard) |
 | PATCH | `/api/messages/{id}/assignments/{idx}/complete` | Assignee marks their slot done; notifies assigner via APNs + WS broadcast |
 | PATCH | `/api/messages/{id}/assign` | Retroactively assign a group To-Do to a member; body: `{user_id, name, phone}`; updates `assigned_to_user_id` + `tags.assignments`, mirrors To-Do in assignee feed, sends APNs; cannot self-assign; 409 if already assigned to same member |
 | GET | `/api/messages/detail/{id}` | Single message detail |
-| PATCH | `/api/messages/{id}/done` | Mark task done/undone `{"done": bool}` |
+| PATCH | `/api/messages/{id}/done` | Mark task done/undone `{"done": bool}`. **Authorization:** message owner always allowed; group members may also mark a group-wide unassigned To-Do done (not just the owner). On completion of a group-wide task: busts bootstrap cache for all group members + broadcasts `todo_completed` WS event so other members' lists update in real-time without a manual refresh. |
 | PATCH | `/api/messages/{id}/content` | Edit message text `{"content": str}` — updates `content` + `summary`; busts bootstrap cache |
 | PATCH | `/api/messages/{id}/items/{idx}/complete` | Check off a list item |
 | DELETE | `/api/messages/{id}` | Delete message |
@@ -174,7 +174,7 @@ extended-brain-backend/
 ### Bootstrap & Analytics
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/bootstrap` | Initial app load (`?limit=&group_id=`) — recent + members + unread |
+| GET | `/api/bootstrap` | Initial app load (`?limit=&group_id=&refresh=`) — recent + members + assigned + unread. **`refresh=true`** bypasses the 30-second Redis cache (iOS sends this on pull-to-refresh). Cache is busted automatically after every write mutation. `assigned` uses the same dual-case OR query as `GET /api/messages/assigned`. |
 | GET | `/api/analytics` | User usage statistics |
 
 ### Groups
@@ -193,7 +193,7 @@ extended-brain-backend/
 | POST | `/api/groups/{id}/seen` | Mark all group messages as read |
 | PATCH | `/api/groups/{id}/photo` | **Admin only** — set or clear group photo; body: `{photo_url: string\|null}` |
 | GET | `/api/groups/unread` | Unread count per group `{group_id: count}` |
-| WS | `/ws/group/{id}` | WebSocket: live incoming group messages |
+| WS | `/ws/group/{id}` | WebSocket: live group events. Events broadcast: `new_message` (incoming capture), `assignment_added` (retroactive assign — includes `assigned_to_id` so the assignee can self-identify), `todo_completed` (any member marks a group-wide task done — includes `message_id`, `done`, `done_by`), `assignment_complete` (assignee marks their slot done) |
 
 ### Pro Account
 | Method | Path | Description |
@@ -510,7 +510,7 @@ Gemini `text-embedding-004` via REST, 1536 dims, stored in pgvector column on `m
 
 - Use `async with get_db() as db:` (or the FastAPI `Depends(get_db)` pattern) — never create a session manually.
 - Run through `cerebras_client` for all LLM calls — it handles retries and uses Gemini 2.5 Flash Lite (paid). Never instantiate `CerebrasClient` without `provider="gemini"`.
-- Invalidate the relevant Redis cache keys when mutating messages or groups.
+- Invalidate the relevant Redis cache keys when mutating messages or groups. For group-wide To-Do mutations (mark-done, retroactive assign), bust the personal bootstrap cache for **all group members** — not just the acting user — so their "Assigned to Me" reflects the change without a manual refresh.
 - Respect the 6 bucket names exactly: `"Remember"`, `"To-Do"`, `"Ideas"`, `"Track"`, `"Events"`, `"Random"`. `"List"` is **not a bucket** — it is a format flag (`tags.is_list=true`).
 - New routes go in `main.py` (that's the current convention, even if undesirable).
 
