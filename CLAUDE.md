@@ -403,7 +403,7 @@ uvicorn main:app --reload --port 8000
 - **Build:** Nixpacks auto-detects Python; runs `pip install -r requirements.txt`
 - **Start:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - **Restart:** `ON_FAILURE`, max 10 retries (`railway.json`)
-- **Railway PostgreSQL:** `pool_size=10` + `max_overflow=5` (15 max connections) set in `database.py`
+- **Railway PostgreSQL:** `pool_size=20` + `max_overflow=10` (30 max connections) set in `database.py`. Increased from 10/5 to support real-time search load.
 - **Telegram webhook:** Set `TELEGRAM_WEBHOOK_URL=https://<app>.up.railway.app/webhook/telegram` — app auto-registers on startup
 - **Single process:** No workers configuration; uvicorn runs one async process (no multiprocessing)
 
@@ -477,19 +477,25 @@ classifier_service.classify(text)        ← ONNX, ~10ms, no network
 
 iOS makes two calls per search query:
 
-**Tier 1 — `fast=True` (~5ms, shown immediately):**
+**Tier 1 — `fast=True` (~10–50ms, shown immediately):**
 - Keyword ILIKE match only — no embedding, no LLM
-- Returns the top text-match result instantly
+- Results sorted by `created_at DESC` (recency) — no relevance scoring needed for keyword preview
+- Also used for real-time search-as-you-type: iOS fires `fast=True` on every keystroke (debounced 300ms, min 2 chars), updating a live preview bubble in place
 
 **Tiers 2+3 — `fast=False` (~300ms, replaces tier-1 result):**
-- Tier 2: `embed(query)` → pgvector cosine similarity — starts immediately
+- Tier 2: `embed(query)` → pgvector cosine similarity via IVFFlat index — starts immediately
 - Tier 3: LLM `_expand_query()` → richer keywords — starts in parallel with Tier 2, skipped if ≤3 words
 - Both run concurrently via `asyncio.create_task()`; results merged and ranked
 
-**Scoring (`_score()` in `search_service.py`):** currently in **semantic-only mode** — ranking is driven purely by embedding cosine similarity (`_semantic_score × 100`, so 0.40–1.0 cosine → 40–100). The hybrid `rapidfuzz.token_set_ratio` text scoring is present but **commented out** (kept for easy restore; the inline comment shows how). The fast `fast=True` tier-1 preview has no embedding, so its keyword results score 0 and fall through `_rank`'s `MIN_RELEVANCE=8` floor (returned in recency order).
+**Scoring (`_score()` in `search_service.py`):** semantic similarity + recency decay:
+- Base: `_semantic_score × 100` (0.40–1.0 cosine → 40–100)
+- Recency decay: `base × exp(-age_days / 365)` — half-life ~253 days. Recent captures rank above older ones of equal similarity; uniquely relevant old notes still surface when no newer competitor exists.
+- The hybrid `rapidfuzz.token_set_ratio` text scoring is **commented out** (kept for easy restore).
 - **Soft bucket boost (not a filter):** when `_detect_bucket(query)` finds a bucket word ("my **ideas** about X"), matching results are multiplied ×1.25 in `_score` — they rank higher but are **never excluded**. Multiplicative on purpose: a zero-base keyword-tier result stays 0, so the boost can't push it over `MIN_RELEVANCE` and re-create a hard filter. A strongly-relevant item from another bucket still wins.
 - **No hard bucket `WHERE`:** `_retrieve` does **not** restrict candidates by bucket. (Historically it did — a single incidental bucket-ish word like "meeting" would zero out all results. Removed June 2026.) `"meeting"` / `"schedule"` were also dropped from `BUCKET_ALIASES` for the same reason — they are content words, not bucket-scope commands.
 - `natural_response` is always `""` (LLM summary generation commented out, reserved for future)
+
+**pgvector index:** `idx_messages_embedding` — `ivfflat (embedding vector_cosine_ops) WITH (lists=100)`. Created June 2026. Keeps semantic search O(log n) as message count grows; without it, every query was a full sequential scan.
 
 ### Other LLM Use Cases — all use Gemini 2.5 Flash Lite (paid)
 1. Reminder + recurrence temporal parsing (`recurrence_service.parse_temporal`) — one LLM call extracts time, date, recurrence rule, multi-day patterns
