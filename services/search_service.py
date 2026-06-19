@@ -17,6 +17,7 @@ FIX (v3.1):
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -267,7 +268,7 @@ class SearchService:
                 group_id=group_id, skip_semantic=True,
             )
             ranked = self._rank(messages=messages, query=query, expansion=base_expansion,
-                                use_due_filter=bool(date_from))[:limit]
+                                use_due_filter=bool(date_from), fast=True)[:limit]
             print(f"[search] tier1 keyword → {_time.monotonic()-_t0:.2f}s ({len(ranked)} results)")
             result = {"results": ranked, "natural_response": ""}
             if ck:
@@ -732,6 +733,7 @@ Return ONLY this JSON:
     def _rank(
         self, messages: List[tuple], query: str,
         expansion: Dict, use_due_filter: bool,
+        fast: bool = False,
     ) -> List[Dict]:
         scored = []
 
@@ -772,6 +774,12 @@ Return ONLY this JSON:
                 **({"items": list_items} if list_items is not None else {}),
             })
 
+        # Fast tier-1 (keyword-only): no semantic scores — sort purely by recency
+        # and skip the MIN_RELEVANCE filter (keyword hits all score 0 without embeddings).
+        if fast:
+            scored.sort(key=lambda x: x["created_at"], reverse=True)
+            return scored
+
         scored.sort(key=lambda x: (x["relevance"], x["priority"] == "high", x["created_at"]), reverse=True)
 
         # Drop results with negligible relevance — pure semantic noise with no keyword overlap.
@@ -794,6 +802,14 @@ Return ONLY this JSON:
         # Scaled ×100 so 0.40–1.0 cosine → 40–100 (keeps results above _rank's
         # MIN_RELEVANCE=8 floor). Remove this return + uncomment below to restore hybrid.
         base = getattr(message, "_semantic_score", 0.0) * 100.0
+
+        # Recency decay: among equally relevant results, newer captures rank higher.
+        # tau=365 gives a half-life of ~253 days — soft enough that a highly relevant
+        # old capture still surfaces, strong enough that the latest grocery list beats
+        # one from 3 months ago when their embeddings are similar.
+        if base > 0:
+            age_days = (datetime.utcnow() - message.created_at).days
+            base *= math.exp(-age_days / 365)
 
         # ── Soft bucket boost (never a hard filter) ───────────────────────────
         # When the query named a bucket ("my ideas about marketing"), rank items
