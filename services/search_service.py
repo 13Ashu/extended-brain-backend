@@ -560,6 +560,9 @@ Return ONLY this JSON:
             from services.embedding_service import embedding_service
             query_embedding = precomputed_embedding or await embedding_service.aembed_query(query)
             embedding_str   = f"[{','.join(map(str, query_embedding))}]"
+            # probes=10 = sqrt(lists=100): searches 10% of clusters instead of the default 1%.
+            # SET LOCAL scopes it to this transaction only — no global session pollution.
+            await db.execute(text("SET LOCAL ivfflat.probes = 10"))
             if group_id:
                 sem_sql = text("""
                     SELECT m.id, 1 - (m.embedding <=> :emb ::vector) AS similarity
