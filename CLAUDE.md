@@ -140,7 +140,7 @@ extended-brain-backend/
 ### Users
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/users/me` | Current user profile |
+| GET | `/api/users/me` | Current user profile; includes `last_capture_at` (ISO8601, most recent personal message, excludes group + mirror messages) |
 | POST | `/api/users/register` | Create account (OTP must be verified if ENABLE_OTP=true) |
 | POST | `/api/users/device-token` | Register APNs device token |
 
@@ -264,6 +264,7 @@ All models in `database.py`. Uses SQLAlchemy 2.0 async with `asyncpg`.
   - `expense_category`: `string` — one of the 12 bank-style categories (Food & Dining, Transport, etc.)
   - `expense_payer_id`: `int` — user ID of who paid; defaults to capturing user when not supplied
   - `expense_payer_name`: `string` — display name of payer; used in group expense summary and payer chip
+  - `expense_context`: `string` — optional free-text note for an expense ("lunch with team"); omitted when empty; displayed in TimelineCard and Expenses sheet ENTRIES instead of category when present
 - `entities` (JSONB): `{people, locations, dates, numbers}`
 - `embedding` (pgvector, 1536 dims)
 - `created_at`

@@ -862,6 +862,13 @@ async def get_me(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    last_capture = await db.scalar(
+        select(func.max(Message.created_at)).where(
+            Message.user_id == current_user.id,
+            Message.group_id.is_(None),
+            Message.assigned_to_user_id.is_(None),
+        )
+    )
     return {
         "success": True,
         "data": {
@@ -872,6 +879,7 @@ async def get_me(
             "timezone": current_user.timezone,
             "is_pro": current_user.is_pro,
             "briefing_time": current_user.briefing_time,
+            "last_capture_at": last_capture.isoformat() if last_capture else None,
         }
     }
 
