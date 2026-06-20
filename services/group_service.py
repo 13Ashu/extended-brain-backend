@@ -372,14 +372,20 @@ class GroupService:
         return {"success": True, "added": True, "user_exists": True, "name": target.name}
 
     async def get_user_groups(self, user_id: int, db: AsyncSession) -> List[Dict]:
+        last_msg_subq = (
+            select(func.max(Message.created_at))
+            .where(Message.group_id == Group.id)
+            .correlate(Group)
+            .scalar_subquery()
+        )
         rows = await db.execute(
-            select(Group, GroupMember)
+            select(Group, GroupMember, last_msg_subq.label("last_message_at"))
             .join(GroupMember, GroupMember.group_id == Group.id)
             .where(GroupMember.user_id == user_id)
-            .order_by(Group.created_at.desc())
+            .order_by(last_msg_subq.desc().nullslast(), Group.created_at.desc())
         )
         groups = []
-        for group, membership in rows:
+        for group, membership, last_message_at in rows:
             member_count = await db.scalar(
                 select(func.count()).select_from(GroupMember).where(GroupMember.group_id == group.id)
             ) or 0
@@ -394,6 +400,7 @@ class GroupService:
                 "max_members": group.max_members or 10,
                 "invite_token": group.invite_token,
                 "created_at": group.created_at.isoformat(),
+                "last_message_at": last_message_at.isoformat() if last_message_at else None,
             })
         return groups
 
