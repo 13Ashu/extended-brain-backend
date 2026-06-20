@@ -299,6 +299,7 @@ class MessageCreate(BaseModel):
     expense_category: Optional[str]   = None
     expense_payer_id:   Optional[int] = None
     expense_payer_name: Optional[str] = None
+    expense_context:  Optional[str]   = None
     force_bucket:     Optional[str]   = None
 
 
@@ -3975,6 +3976,8 @@ async def capture_message(
             "expense_payer_id":   payer_id,
             "expense_payer_name": payer_name,
         }
+        if message.expense_context:
+            expense_tags["expense_context"] = message.expense_context
         await db.execute(
             text("UPDATE messages SET tags = tags || CAST(:extra AS jsonb) WHERE id = :mid")
             .bindparams(extra=_json_exp.dumps(expense_tags), mid=result["message_id"])
@@ -3984,6 +3987,8 @@ async def capture_message(
         result["expense_category"] = message.expense_category or "Others"
         result["expense_payer_id"]   = payer_id
         result["expense_payer_name"] = payer_name
+        if message.expense_context:
+            result["expense_context"] = message.expense_context
 
     return {"success": True, "message": "Content captured successfully", "data": result}
 
@@ -4599,6 +4604,9 @@ class CreateGroupRequest(BaseModel):
 class UpdateGroupPhotoRequest(BaseModel):
     photo_url: Optional[str] = None
 
+class UpdateGroupNameRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+
 class AddGroupMemberRequest(BaseModel):
     user_id: int
 
@@ -4730,6 +4738,24 @@ async def update_group_photo(
     group.photo_url = req.photo_url
     await db.commit()
     return {"success": True, "photo_url": group.photo_url}
+
+
+@app.patch("/api/groups/{group_id}/name")
+async def update_group_name(
+    group_id: int,
+    req: UpdateGroupNameRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update the group name. Admin only."""
+    group = await grp_svc.get_group_by_id(group_id, current_user.id, db)
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found or access denied")
+    if not await grp_svc.is_group_admin(group_id, current_user.id, db):
+        raise HTTPException(status_code=403, detail="Only the group owner can change the group name.")
+    group.name = req.name
+    await db.commit()
+    return {"success": True, "name": group.name}
 
 
 @app.get("/api/groups/{group_id}/messages")
