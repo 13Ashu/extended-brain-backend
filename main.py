@@ -2786,6 +2786,7 @@ async def get_assigned_messages(
             "expense_category": tags.get("expense_category"),
             "expense_payer_id":   tags.get("expense_payer_id"),
             "expense_payer_name": tags.get("expense_payer_name"),
+            "expense_context":  tags.get("expense_context"),
         })
     return {"success": True, "results": messages, "total": len(messages)}
 
@@ -3113,6 +3114,7 @@ async def bootstrap(
             "expense_category":    tags.get("expense_category"),
             "expense_payer_id":    tags.get("expense_payer_id"),
             "expense_payer_name":  tags.get("expense_payer_name"),
+            "expense_context":     tags.get("expense_context"),
             "assignments":         tags.get("assignments", []),
         }
 
@@ -3305,6 +3307,7 @@ async def get_recent_messages(
             "expense_category":      tags.get("expense_category"),
             "expense_payer_id":      tags.get("expense_payer_id"),
             "expense_payer_name":    tags.get("expense_payer_name"),
+            "expense_context":       tags.get("expense_context"),
             "assignments":           tags.get("assignments", []),
         })
 
