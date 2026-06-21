@@ -4218,12 +4218,51 @@ async def update_message_bucket(
 
     # Python-side tag manipulation: update bucket and set due_date when
     # promoting to To-Do so the task surfaces under TODAY/SOMEDAY rather
-    # than being invisible (tags.due_date is None for Remember/Ideas/etc.)
+    # than being invisible (tags.due_date is None for Remember/Ideas/etc.).
+    # For Events: extract a date from the message text and set auto_notify_date
+    # (day-before silent APNs push) so the scheduler can fire correctly.
     updated_tags = dict(msg.tags or {})
     updated_tags["primary_bucket"] = bucket
     updated_tags["all_buckets"]    = [bucket]
     if bucket == "To-Do" and not updated_tags.get("due_date"):
         updated_tags["due_date"] = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+    elif bucket == "Events" and not updated_tags.get("due_date"):
+        # Extract calendar date from content using the same regex as _build_from_bucket
+        import re as _re
+        from datetime import date as _date, timedelta as _td
+        _lc = msg.content.lower()
+        _MONTHS = {
+            "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
+            "june": 6, "july": 7, "august": 8, "september": 9, "october": 10,
+            "november": 11, "december": 12, "jan": 1, "feb": 2, "mar": 3,
+            "apr": 4, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "sept": 9,
+            "oct": 10, "nov": 11, "dec": 12,
+        }
+        _month_pat = (
+            r"january|february|march|april|may|june|july|august|september|"
+            r"october|november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec"
+        )
+        _m_dm = _re.search(rf"\b(\d{{1,2}})(?:-\d{{1,2}})?(?:st|nd|rd|th)?\s?({_month_pat})\b", _lc)
+        _m_md = _re.search(rf"\b({_month_pat})\s?(\d{{1,2}})(?:st|nd|rd|th)?\b", _lc)
+        _day, _mon = 0, 0
+        if _m_dm:
+            _day = int(_m_dm.group(1))
+            _mon = _MONTHS.get(_m_dm.group(2), 0)
+        elif _m_md:
+            _mon = _MONTHS.get(_m_md.group(1), 0)
+            _day = int(_m_md.group(2))
+        if _mon and 1 <= _day <= 31:
+            _today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+            try:
+                _candidate = _date(_today.year, _mon, _day)
+                if _candidate < _today:
+                    _candidate = _date(_today.year + 1, _mon, _day)
+                updated_tags["due_date"] = _candidate.isoformat()
+                _notify = _candidate - _td(days=1)
+                if _notify >= _today:
+                    updated_tags["auto_notify_date"] = _notify.isoformat()
+            except ValueError:
+                pass  # invalid date (e.g. Feb 30) — leave due_date unset
 
     await db.execute(
         sa_update(Message)

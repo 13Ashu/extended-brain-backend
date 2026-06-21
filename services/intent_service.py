@@ -261,6 +261,7 @@ class IntentService:
             return await self._llm_parse(
                 content, user_name, now_str, today, tomorrow, day_map,
                 check_query=check_query,
+                classifier_bucket="Events" if bucket == "Events" else None,
             )
         except Exception as e:
             print(f"[intent] LLM parse failed: {e}")
@@ -686,6 +687,7 @@ class IntentService:
         tomorrow: str,
         day_map: Dict,
         check_query: bool = True,
+        classifier_bucket: Optional[str] = None,
     ) -> Dict:
 
         header = (
@@ -702,6 +704,20 @@ class IntentService:
             "  → Track it over time            = save_as_track\n"
             "Users often dump bare words, document names, or facts with zero elaboration. That is deliberate — they are filing a reference, not creating a task. Default to save_as_note for anything that lacks a clear action signal.\n\n"
         )
+
+        if classifier_bucket:
+            _bucket_action = {
+                "Events":   "save_as_event",
+                "To-Do":    "save_as_todo",
+                "Remember": "save_as_note",
+                "Ideas":    "save_as_idea",
+                "Track":    "save_as_track",
+                "Random":   "save_as_note",
+            }.get(classifier_bucket, "save_as_note")
+            header += (
+                f"CLASSIFIER HINT: The on-device model classified this as '{classifier_bucket}' with high confidence. "
+                f"Trust this bucket; set {_bucket_action}=true and focus on extracting the event date and time accurately.\n\n"
+            )
 
         if check_query:
             action_flags = (
