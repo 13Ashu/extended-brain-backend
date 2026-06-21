@@ -6,7 +6,7 @@ Multi-platform messaging support (WhatsApp/Telegram)
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, UploadFile, File, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, UploadFile, File, WebSocket, WebSocketDisconnect, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List, Dict, Any
@@ -2876,16 +2876,23 @@ async def get_assigned_to_others(
     return {"success": True, "results": messages, "total": len(messages)}
 
 
+class AssignmentCompleteBody(BaseModel):
+    done: bool = True
+
 @app.patch("/api/messages/{message_id}/assignments/{assignment_idx}/complete")
 async def complete_assignment(
     message_id: int,
     assignment_idx: int,
+    body: Optional[AssignmentCompleteBody] = Body(default=None),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Mark a specific assignee's slot as done.
-    Callable by the assignee themselves. Notifies the assigner (message owner) via APNs."""
+    """Mark or unmark a specific assignee's slot as done.
+    Callable by the assignee themselves OR the message owner (assigner).
+    Pass {"done": false} to undo completion. Omit body to mark done (backward compat)."""
     import json as _json
+
+    done = body.done if body is not None else True
 
     msg = await db.get(Message, message_id)
     if not msg:
@@ -2898,11 +2905,16 @@ async def complete_assignment(
         raise HTTPException(status_code=400, detail="Invalid assignment index")
 
     slot = assignments[assignment_idx]
-    if slot.get("user_id") != current_user.id:
-        raise HTTPException(status_code=403, detail="You are not the assignee for this slot")
+    is_assignee = slot.get("user_id") == current_user.id
+    is_assigner = msg.user_id == current_user.id
+    if not is_assignee and not is_assigner:
+        raise HTTPException(status_code=403, detail="Only the assignee or assigner can update this slot")
 
-    slot["done"]    = True
-    slot["done_at"] = datetime.utcnow().isoformat()
+    slot["done"] = done
+    if done:
+        slot["done_at"] = datetime.utcnow().isoformat()
+    else:
+        slot.pop("done_at", None)
     assignments[assignment_idx] = slot
 
     await db.execute(
@@ -2924,8 +2936,8 @@ async def complete_assignment(
             "completed_by":   current_user.name,
         }))
 
-    # ── Notify the assigner (message owner) ──────────────────────────
-    if msg.user_id != current_user.id:
+    # ── Notify the assigner only when completing (not undoing) ──────────────────────────
+    if done and msg.user_id != current_user.id:
         try:
             tokens_rows = await db.execute(
                 select(DeviceToken.token).where(DeviceToken.user_id == msg.user_id)
