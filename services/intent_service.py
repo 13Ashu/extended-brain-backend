@@ -860,9 +860,6 @@ class IntentService:
         # If set_reminder=true, save_as_todo must also be true
         if result["actions"]["set_reminder"]:
             result["actions"]["save_as_todo"] = True
-        # If save_as_event=true, save_as_todo must also be true
-        if result["actions"]["save_as_event"]:
-            result["actions"]["save_as_todo"] = True
 
         # Tasks
         tasks_raw = raw.get("tasks", [])

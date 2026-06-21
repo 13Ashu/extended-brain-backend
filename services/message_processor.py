@@ -441,17 +441,16 @@ class MessageProcessor:
                 message_type=message_type, media_url=media_url, db=db, ref=ref
             )
 
-        # ── Pure Event (no To-Do) ─────────────────────────────────
-        # Fires when classifier said "Events" + LLM failed.
-        # _build_from_bucket("Events") sets save_as_event=True and populates
-        # result["event"] with the regex-extracted date — we land here and
-        # save it directly to the Events bucket without touching To-Do.
+        # ── Pure Event (no To-Do, no explicit reminder) ───────────
+        # Fires for both LLM-parsed events (save_as_event=True, save_as_todo=False)
+        # and the LLM-failure fallback (_build_from_bucket("Events")).
         if actions.get("save_as_event") and not actions.get("save_as_todo"):
             evt = parsed.get("event") or {}
             return await self._save_single_event(
                 user=user, content=content,
                 due_date=evt.get("due_date"), event_time=evt.get("time"),
                 message_type=message_type, media_url=media_url, db=db, ref=ref,
+                skip_reminder=skip_reminder,
             )
 
         # ── Fallback ──────────────────────────────────────────────
@@ -830,7 +829,8 @@ class MessageProcessor:
     async def _save_single_event(
         self, user, content: str, due_date: Optional[str],
         event_time: Optional[str], message_type: str,
-        media_url: Optional[str], db: AsyncSession, ref: datetime
+        media_url: Optional[str], db: AsyncSession, ref: datetime,
+        skip_reminder: bool = False,
     ) -> Dict:
         if not due_date:
             due_date = ref.strftime("%Y-%m-%d")
@@ -849,6 +849,20 @@ class MessageProcessor:
             "event_time":     event_time,
             "events":         events,
         }
+
+        # Schedule a silent day-before push (no Reminder row — won't appear in Reminders section).
+        # Store the notification date in tags; the scheduler fires APNs when date matches today.
+        if not skip_reminder:
+            from datetime import date as _date
+            try:
+                event_date = _date.fromisoformat(due_date)
+                notify_date = event_date - timedelta(days=1)
+                from zoneinfo import ZoneInfo
+                today_in_tz = datetime.now(ZoneInfo(user.timezone or "Asia/Kolkata")).date()
+                if notify_date >= today_in_tz:
+                    tags["auto_notify_date"] = notify_date.isoformat()
+            except Exception:
+                pass
 
         msg = Message(
             user_id=user.id, category_id=category.id,

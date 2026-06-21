@@ -120,6 +120,51 @@ async def _cleanup_stale_data():
             print(f"[cleanup] Deleted {fired_count} fired one-time reminders older than 7 days")
 
 
+async def _send_event_auto_notifications():
+    """
+    Fire a silent day-before push for Events that have auto_notify_date == today.
+    These are NOT Reminder rows — they never appear in the Reminders section.
+    """
+    from zoneinfo import ZoneInfo
+    today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(Message.id, Message.content, Message.user_id, Message.tags).where(
+                Message.tags["auto_notify_date"].astext == today_ist,
+                Message.tags["auto_notified"].astext.is_(None),
+                Message.tags["primary_bucket"].astext == "Events",
+            )
+        )
+        rows = result.all()
+        if not rows:
+            return
+
+        for msg_id, content, user_id, tags in rows:
+            try:
+                tokens_result = await db.execute(
+                    select(DeviceToken.token).where(DeviceToken.user_id == user_id)
+                )
+                badge = await total_unread_for_user(db, user_id)
+                body = (content or "")[:100]
+                for (token,) in tokens_result.all():
+                    await send_apns_notification(
+                        device_token=token,
+                        title="📅 Tomorrow",
+                        body=body,
+                        badge=badge,
+                        data={"type": "event_reminder", "message_id": msg_id},
+                    )
+                # Mark notified so it doesn't fire again
+                updated_tags = {**(tags or {}), "auto_notified": "true"}
+                await db.execute(
+                    update(Message).where(Message.id == msg_id).values(tags=updated_tags)
+                )
+                await db.commit()
+                print(f"[event_notify] Sent day-before push for event {msg_id}")
+            except Exception as e:
+                print(f"[event_notify] Failed for event {msg_id}: {e}")
+
+
 async def _master_scheduler():
     """Single scheduler loop — runs every 60 seconds."""
     print("[scheduler] Master scheduler started")
@@ -131,6 +176,7 @@ async def _master_scheduler():
             await reminder_service.run_scheduler_tick()
             await recurrence_service.run()
             await briefing_service.run()
+            await _send_event_auto_notifications()
 
             if tick % 30 == 0:
                 await nudge_service.run_idle_nudges()
