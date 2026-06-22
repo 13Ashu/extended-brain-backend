@@ -199,7 +199,7 @@ class BriefingService:
                     Message.group_id.is_(None),   # exclude group-captured tasks
                     text("messages.tags->>'due_date' < :today"),
                     text("(messages.tags->>'done')::boolean IS NOT TRUE"),
-                    text("messages.tags->'all_buckets' @> '\"To-Do\"'::jsonb"),
+                    text("(messages.tags->'all_buckets' @> '\"To-Do\"'::jsonb OR messages.tags->>'primary_bucket' = 'To-Do')"),
                     text("(messages.tags->>'recurring')::boolean IS NOT TRUE"),
                 )
             )
@@ -234,7 +234,7 @@ class BriefingService:
                     Message.group_id.is_(None),   # exclude group-captured tasks
                     text("messages.tags->>'due_date' = :d"),
                     text("(messages.tags->>'done')::boolean IS NOT TRUE"),
-                    text("messages.tags->'all_buckets' @> '\"To-Do\"'::jsonb"),
+                    text("(messages.tags->'all_buckets' @> '\"To-Do\"'::jsonb OR messages.tags->>'primary_bucket' = 'To-Do')"),
                 )
             )
             .params(d=date_str)
