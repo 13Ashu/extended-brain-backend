@@ -511,6 +511,10 @@ classifier_service.classify(text)        ← ONNX, ~10ms, no network
 - Returns `(bucket: str, confidence: float)`; threshold `CONF_THRESHOLD = 0.50`
 - If model files are absent, `is_ready` stays `False` → falls through to Gemini silently
 
+**`message_processor.process()`** applies two rule-based overrides before any AI runs:
+1. **Media override** — if `message_type == "image"` or (`message_type == "text"` and `media_url` is set), `force_bucket = "Remember"` before list detection or classification. Link captures and photos always land in Remember; the user can re-bucket afterwards.
+2. **Regex list fast path** — `list_service._regex_detect(content)` runs (skipped when `force_bucket` is already set). If it returns a list, `_handle_list_save_direct()` is called immediately and the function returns — no LLM call. `_LIST_DATE_RE` guard: if the content contains date words (today/tomorrow/weekday names), this fast path is skipped so the LLM can extract a proper `due_date`.
+
 **`_build_from_bucket()`** in `intent_service.py`:
 - Constructs the full actions dict from the classifier bucket + regex-extracted time/date/reminder flags
 - Bypasses LLM entirely for routine captures; still runs rule-based extraction for `event_time`, `due_date`, `is_reminder`
@@ -522,6 +526,9 @@ classifier_service.classify(text)        ← ONNX, ~10ms, no network
 2. Colon at end of header line (`Header:\nitem1\nitem2`)
 3. Bare short lines ≤5 words each (requires named header — filters prose)
 4. Single-line inline (`Header: item1, item2, item3`) — 2+ items required
+
+**`list_service._regex_detect()` — bullet override for neutral names:**
+The CREATE pattern (`"Header:\n- item1\n- item2"`) normally gates on `_name_blocked(raw_name)` — headers whose non-stopword words are all neutral (e.g. "tasks", "items", "things") are blocked to prevent plain todo sentences being misread as named lists. However, explicit bullet markers (`\n- `) unambiguously signal list intent and now **override** the name block: `has_bullets=True` is checked before applying `_name_blocked`, so "my tasks:\n- item" saves as a single list message rather than falling through to the LLM and being split into individual To-Do rows. No-bullet content still respects `_name_blocked` as before.
 
 **Slow path** (Gemini 2.5 Flash Lite, paid):
 - `CerebrasClient(provider="gemini", model="gemini-2.5-flash-lite")` — default provider and model
