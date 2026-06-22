@@ -109,7 +109,7 @@ extended-brain-backend/
 | Group-capture push fan-out | `main.py` capture route. APNs sends for @mention assignees + group-wide reminders run in a **background task** (`asyncio.create_task(_send_pushes())`) — device tokens are pre-fetched and the DB committed first, so the HTTP response returns immediately instead of blocking on a serial APNs blast (which previously caused iOS-side timeouts → duplicate captures) |
 | Group @mention reminder routing | `main.py` capture route. When a capture has `@mention` assignments and a time, `message_processor.process()` is called with `skip_reminder=True` — **no Reminder row is created for the sender**. After mirrors are created and flushed, a `Reminder` row is created per assignee, linked to their mirror message and using their `User.timezone`. The scheduler fires at the specified time to each assignee's devices only. |
 | Event day-before push | `main.py` → `_send_event_auto_notifications()`. Runs every scheduler tick. Fires a silent APNs ("📅 Tomorrow …") for any Events message where `tags.auto_notify_date == today` and `tags.auto_notified` is unset. Sets `auto_notified = true` after sending. **No Reminder row created** — never appears in the Reminders section. |
-| Morning briefing carry-forward | `services/briefing_service.py` → `_carry_forward()`. Bumps overdue To-Do `due_date` to today. **Excludes tasks with `tags.recurring = true`** — recurring tasks are recreated daily by `recurrence_service`; carrying them over caused N duplicates after N days. `original_date` is now stamped with the real previous `due_date` before it is overwritten. |
+| Morning briefing carry-forward | `services/briefing_service.py` → `_carry_forward()`. Bumps overdue To-Do `due_date` to today. **Scope:** `group_id IS NULL` only — personal tasks and mirror (assigned-to-me) messages; group-captured tasks are excluded so counts match the iOS Today tab. **Bucket filter:** `all_buckets @> 'To-Do' OR primary_bucket = 'To-Do'` — mirror messages have `all_buckets = NULL` (only `primary_bucket` set), so the fallback is required. **Excludes:** `tags.recurring = true` — recurring tasks are recreated daily by `recurrence_service`. `original_date` stamped with previous `due_date` before overwrite. |
 | Reminder timezone fallback | `services/reminder_service.py`. All three fallback sites (`_resolve_remind_at`, `create()`, `_to_local_time()`) use `"Asia/Kolkata"` when `user.timezone` is null. `User.timezone` already defaults to `"Asia/Kolkata"` at the ORM and API level, so this only matters for edge cases. |
 | **Annotation storage (retraining data)** | **`database.py` → `LabelAnnotation`** |
 | **Write annotation on bucket move** | **`main.py` → `PATCH /api/messages/{id}/bucket`** |
@@ -401,6 +401,57 @@ uvicorn main:app --reload --port 8000
 **Telegram webhook (local dev):** Use `ngrok http 8000` to expose locally, then POST to `/api/webhook/info` or set `TELEGRAM_WEBHOOK_URL` manually.
 
 ---
+
+## Running DB Queries Against Production (Railway)
+
+The Railway PostgreSQL instance is only accessible from within Railway's internal network (`postgres.railway.internal`) — you cannot connect from a local machine with a plain `psql` or `psycopg2` call. The correct approach is to SSH into the backend service container (which has the venv + all packages) and run Python scripts from there.
+
+### One-time setup (do this once per machine)
+
+```bash
+# 1. Register your local SSH public key with Railway
+railway ssh keys add -k ~/.ssh/id_ed25519.pub -n "macbook"
+
+# 2. Write the SSH config block for the backend service
+railway ssh config --service extended-brain-backend -i ~/.ssh/id_ed25519
+
+# 3. Trust Railway's SSH host key
+ssh-keyscan ssh.railway.com >> ~/.ssh/known_hosts
+```
+
+After this, `railway-extended-brain-backend` is a usable SSH host alias.
+
+### Running a query
+
+Write your script locally (use `asyncpg`, not `psycopg2` — only asyncpg is in the venv):
+
+```python
+# query.py
+import os, asyncio, asyncpg
+
+async def main():
+    url = os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://")
+    conn = await asyncpg.connect(url)
+    rows = await conn.fetch("SELECT id, name FROM users LIMIT 5")
+    for r in rows: print(r)
+    await conn.close()
+
+asyncio.run(main())
+```
+
+Then copy and run it:
+
+```bash
+scp -i ~/.ssh/id_ed25519 query.py railway-extended-brain-backend:/tmp/query.py
+ssh -i ~/.ssh/id_ed25519 railway-extended-brain-backend "/opt/venv/bin/python3 /tmp/query.py"
+```
+
+### Key facts
+- **Python venv:** `/opt/venv/bin/python3` — use this, not the system `python3` (which has no packages)
+- **DATABASE_URL:** injected automatically as an env var — no hardcoding needed
+- **`asyncpg` params:** use `$1`, `$2` positional placeholders (not `%s`)
+- **`railway run`** injects env vars but runs processes **locally** — useless for internal DB access
+- **`railway connect postgres`** needs `psql` installed locally; skip it
 
 ## Deployment Notes (Railway)
 
