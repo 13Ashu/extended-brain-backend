@@ -341,6 +341,18 @@ class MessageProcessor:
 
         ref = _ist_now()
 
+        # ── Media override: images and link captures → always Remember ────────
+        # Applies when no higher-priority override (expense=Track, @mention=To-Do)
+        # is already in effect. Images (message_type="image") and share-extension
+        # link captures (message_type="text" + media_url) skip AI classification
+        # entirely; the user can move the bucket manually afterward.
+        if not force_bucket and (
+            message_type == "image"
+            or (message_type == "text" and media_url)
+        ):
+            force_bucket = "Remember"
+            print(f"[processor] media override → Remember (type={message_type}, has_url={bool(media_url)})")
+
         # ── FAST PATH: Regex list detection — skip when force_bucket is set ──
         # When force_bucket is set (e.g. group @mention → always To-Do) we skip
         # list detection to honour the caller's intent directly.

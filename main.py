@@ -4276,10 +4276,34 @@ async def update_message_bucket(
             except ValueError:
                 pass  # invalid date (e.g. Feb 30) — leave due_date unset
 
+    # Resolve the Category row for the new bucket so category_id stays in sync.
+    # The search service reads category.name (not tags.primary_bucket) to build
+    # the displayed category label, so both must agree after a bucket change.
+    _bucket_desc = {
+        "Remember": "Recall a fact, location, credential, or piece of information for later.",
+        "To-Do":    "A task or action item the user must act on.",
+        "Ideas":    "A new idea, thought, concept, or creative spark.",
+        "Track":    "Log or monitor something — health, habits, progress, mood.",
+        "Events":   "A time-anchored event or appointment with a specific date/time.",
+        "Random":   "Casual, venting, conversational, or unclear.",
+    }
+    _cat_result = await db.execute(
+        select(Category).where(Category.user_id == current_user.id, Category.name == bucket)
+    )
+    _category = _cat_result.scalar_one_or_none()
+    if not _category:
+        _category = Category(
+            user_id=current_user.id,
+            name=bucket,
+            description=_bucket_desc.get(bucket, ""),
+        )
+        db.add(_category)
+        await db.flush()
+
     await db.execute(
         sa_update(Message)
         .where(and_(Message.id == message_id, Message.user_id == current_user.id))
-        .values(tags=updated_tags)
+        .values(tags=updated_tags, category_id=_category.id)
     )
 
     # Store as training annotation — user corrections are ground truth
