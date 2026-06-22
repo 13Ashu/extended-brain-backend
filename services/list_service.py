@@ -417,11 +417,15 @@ class ListService:
         # "Japan trip:\\n- book flights\\n- get visa"
         m = re.search(r"^([\w][\w\s\-]+?):\s*\n(.+)", content, re.MULTILINE | re.DOTALL)
         if m:
-            raw_name = m.group(1).strip().lower()
-            if not _name_blocked(raw_name):
+            raw_name  = m.group(1).strip().lower()
+            has_bullets = bool(re.search(r"\n\s*[-*•]|\n\s*\d+[.)]", content))
+            # Explicit bullet markers override name-blocking: "tasks:\n- item" is
+            # unambiguously a list regardless of how neutral the header is.
+            # Without this, the List chip with names like "my tasks" or "work items"
+            # falls through to the LLM, which splits it into individual To-Do rows.
+            if not _name_blocked(raw_name) or has_bullets:
                 items = _extract_items_from_content(content)
                 if items:
-                    has_bullets = bool(re.search(r"\n\s*[-*•]|\n\s*\d+[.)]", content))
                     if _has_list_signal(raw_name) or has_bullets:
                         return _make("create_or_add", raw_name, items)
 
