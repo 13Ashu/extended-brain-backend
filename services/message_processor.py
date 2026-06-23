@@ -581,6 +581,7 @@ class MessageProcessor:
             if evt_time:
                 buckets.append("Events")
 
+            _task_will_remind = bool(evt_time and not skip_reminder)
             msg = Message(
                 user_id=user.id,
                 category_id=category.id,
@@ -603,6 +604,7 @@ class MessageProcessor:
                         if evt_time else []
                     ),
                     "split_from": original_content[:200],
+                    **({"is_reminder": True} if _task_will_remind else {}),
                 },
                 created_at=ref,
             )
@@ -625,7 +627,7 @@ class MessageProcessor:
             # Each task with a time gets its OWN reminder (skip for group @mention captures)
             if self.reminder_service and saved["evt_time"] and not skip_reminder:
                 try:
-                    await self.reminder_service.create(
+                    reminder = await self.reminder_service.create(
                         user=user,
                         content=saved["task"],
                         analysis={
@@ -638,7 +640,16 @@ class MessageProcessor:
                         message_id=saved["id"],
                         db=db,
                     )
-                    reminder_count += 1
+                    if reminder:
+                        reminder_count += 1
+                        from sqlalchemy import text as _text
+                        await db.execute(
+                            _text("UPDATE messages SET tags = tags || CAST(:extra AS jsonb) WHERE id = :mid")
+                            .bindparams(extra=json.dumps({"remind_at": reminder.remind_at.isoformat()}), mid=saved["id"])
+                        )
+                        await db.commit()
+                    else:
+                        reminder_count += 1
                 except Exception as e:
                     print(f"⚠ Reminder failed for '{saved['task']}': {e}")
 
@@ -687,6 +698,7 @@ class MessageProcessor:
             auto_description=INTENT_BUCKETS.get(primary_bucket, INTENT_BUCKETS["To-Do"]), db=db,
         )
 
+        will_remind = bool(actions.get("set_reminder") and evt_time and not skip_reminder)
         tags = {
             "keywords":       [content],
             "entities":       {"people": people},
@@ -702,6 +714,7 @@ class MessageProcessor:
                 [{"date": due_date, "time": evt_time, "label": content[:40]}]
                 if evt_time else []
             ),
+            **({"is_reminder": True} if will_remind else {}),
         }
 
         # Always store the user's original text — never the LLM-rewritten task description.
@@ -758,6 +771,12 @@ class MessageProcessor:
                 if reminder:
                     result["reminder_id"] = reminder.id
                     result["remind_at"]   = reminder.remind_at.isoformat()
+                    from sqlalchemy import text as _text
+                    await db.execute(
+                        _text("UPDATE messages SET tags = tags || CAST(:extra AS jsonb) WHERE id = :mid")
+                        .bindparams(extra=json.dumps({"remind_at": reminder.remind_at.isoformat()}), mid=msg.id)
+                    )
+                    await db.commit()
             except Exception as e:
                 print(f"⚠ Reminder failed: {e}")
 
@@ -928,6 +947,10 @@ class MessageProcessor:
         if not due_date and analysis.get("event_time"):
             due_date = _today_str()
 
+        _will_remind_fallback = bool(
+            ("To-Do" in buckets or "Events" in buckets)
+            and analysis.get("event_time") and due_date
+        )
         tags = {
             "keywords":       analysis.get("keywords", []),
             "entities":       analysis.get("entities", {}),
@@ -941,6 +964,7 @@ class MessageProcessor:
             "primary_bucket": primary_bucket,
             "due_date":       due_date,
             "events":         analysis.get("events", []),
+            **({"is_reminder": True} if _will_remind_fallback else {}),
         }
 
         msg = Message(
@@ -973,6 +997,12 @@ class MessageProcessor:
                     if reminder:
                         result["reminder_id"] = reminder.id
                         result["remind_at"]   = reminder.remind_at.isoformat()
+                        from sqlalchemy import text as _text
+                        await db.execute(
+                            _text("UPDATE messages SET tags = tags || CAST(:extra AS jsonb) WHERE id = :mid")
+                            .bindparams(extra=json.dumps({"remind_at": reminder.remind_at.isoformat()}), mid=msg.id)
+                        )
+                        await db.commit()
                 except Exception as e:
                     print(f"⚠ Reminder failed: {e}")
 
@@ -1189,6 +1219,7 @@ Return ONLY this JSON:
                         if "Events" in item_buckets else []
                     ),
                     "split_from": original_content[:200],
+                    **({"is_reminder": True} if evt_time else {}),
                 },
                 created_at=ref,
             )
@@ -1215,10 +1246,17 @@ Return ONLY this JSON:
                     "priority":   saved["priority"],
                 }
                 try:
-                    await self.reminder_service.create(
+                    reminder = await self.reminder_service.create(
                         user=user, content=saved["task"],
                         analysis=item_analysis, message_id=saved["id"], db=db,
                     )
+                    if reminder:
+                        from sqlalchemy import text as _text
+                        await db.execute(
+                            _text("UPDATE messages SET tags = tags || CAST(:extra AS jsonb) WHERE id = :mid")
+                            .bindparams(extra=json.dumps({"remind_at": reminder.remind_at.isoformat()}), mid=saved["id"])
+                        )
+                        await db.commit()
                 except Exception as e:
                     print(f"⚠ Reminder failed for '{saved['task']}': {e}")
 
