@@ -3352,6 +3352,7 @@ async def get_recent_messages(
             "due_date":              due_date_val,
             "is_done":               bool(tags.get("done", False)),
             "is_list":               bool(tags.get("is_list", False)),
+            "has_reminder":          bool(tags.get("is_reminder") or tags.get("remind_at") is not None),
             "settlement_marker":     bool(tags.get("settlement_marker", False)),
             "items":                 items,
             "event_time":            tags.get("event_time"),
