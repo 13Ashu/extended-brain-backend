@@ -196,7 +196,8 @@ class BriefingService:
             .where(
                 and_(
                     Message.user_id == user_id,
-                    Message.group_id.is_(None),   # exclude group-captured tasks
+                    Message.group_id.is_(None),          # exclude group-captured tasks
+                    Message.assigned_to_user_id.is_(None),  # exclude mirror messages
                     text("messages.tags->>'due_date' < :today"),
                     text("(messages.tags->>'done')::boolean IS NOT TRUE"),
                     text("(messages.tags->'all_buckets' @> '\"To-Do\"'::jsonb OR messages.tags->>'primary_bucket' = 'To-Do')"),
@@ -231,7 +232,8 @@ class BriefingService:
             .where(
                 and_(
                     Message.user_id == user_id,
-                    Message.group_id.is_(None),   # exclude group-captured tasks
+                    Message.group_id.is_(None),          # exclude group-captured tasks
+                    Message.assigned_to_user_id.is_(None),  # exclude mirror messages
                     text("messages.tags->>'due_date' = :d"),
                     text("(messages.tags->>'done')::boolean IS NOT TRUE"),
                     text("(messages.tags->'all_buckets' @> '\"To-Do\"'::jsonb OR messages.tags->>'primary_bucket' = 'To-Do')"),

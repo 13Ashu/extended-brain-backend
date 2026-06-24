@@ -4103,13 +4103,11 @@ async def serve_image(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Serve a stored image by ID. Auth-gated to the owning user."""
+    """Serve a stored image by ID. Auth-gated — any authenticated user can view (needed for group photos)."""
     from fastapi.responses import Response
     img = await db.get(StoredImage, image_id)
     if not img:
         raise HTTPException(status_code=404, detail="Image not found")
-    if img.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not your image")
     return Response(content=img.data, media_type=img.mime_type)
 
 
