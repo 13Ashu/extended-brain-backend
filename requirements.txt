@@ -21,7 +21,7 @@ dnspython
 python-dotenv
 
 # PDF Processing (for document extraction)
-pypdf2
+pypdf
 python-docx
 
 # Audio Processing (optional - for transcription)

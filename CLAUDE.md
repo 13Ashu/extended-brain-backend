@@ -99,6 +99,8 @@ extended-brain-backend/
 | **Intent classifier (ONNX fast path)** | **`services/classifier_service.py`** |
 | **Intent parse orchestrator** | **`services/intent_service.py`** — routes to ONNX or Gemini |
 | Rule-based time/entity extraction | `services/message_processor.py` |
+| **Document (PDF/DOCX) capture** | `services/message_processor.py` → `process()` document branch + `_load_stored_bytes()`. When `message_type == "document"` and `media_url`, loads the stored bytes straight from the `StoredImage` row (the `/api/images/{id}` route is auth-gated, so an HTTP fetch would 401), runs `document_processor.extract_text_from_bytes()` (magic-byte PDF/DOCX detection), folds the **full text into `content`** (keyword-searchable, capped 10k) and forces bucket = Remember. Embedding uses only a **focused lead** (`embed_text` = caption + first ~1.5k chars) via the new `embed_text` param on `_save_single` — embedding the whole document averages many pages into a diffuse vector that under-scores the 0.40 similarity floor. The capture route (`main.py`) also folds the filename into `content` (so `"pdf"`/filename keyword-match) and stamps `tags.file_name` + `is_document`. |
+| Document text extraction | `services/document_processor.py` — `extract_text_from_bytes(bytes, hint)` (preferred, bytes already in hand) + `extract_document_text(url)` (legacy external-URL path). `detect_doc_kind()` uses magic bytes (`%PDF`, `PK\x03\x04`) with a filename fallback, since `/api/images/{id}` URLs carry no extension. Uses `pypdf` (falls back to `PyPDF2`) + `python-docx`. No OCR — scanned image-only PDFs yield no text. |
 | Semantic search + fuzzy text ranking | `services/search_service.py` |
 | Embeddings | `services/embedding_service.py` |
 | Redis caching | `services/redis_cache.py` |
@@ -164,7 +166,7 @@ extended-brain-backend/
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/search` | Two-tier search: `fast=true` = keyword-only (~5ms); `fast=false` = embed + optional LLM expand in parallel |
-| POST | `/api/upload` | Upload image (multipart) → returns URL |
+| POST | `/api/upload` | Upload **any file** (multipart) → stores raw bytes + MIME in `stored_images`, returns `/api/images/{id}`. Format-agnostic (images, PDFs, docs); 10 MB cap. |
 | GET | `/api/images/{id}` | Download stored image |
 
 ### Categories

@@ -3702,6 +3702,14 @@ async def capture_message(
     group_id = message.group_id
     content  = message.content
 
+    # ── Document: fold the filename into the searchable content ──────
+    # Keeps the ".pdf"/".docx" suffix + filename in `content` (the keyword-search
+    # field), so typing "pdf" or the file's name naturally surfaces the document.
+    if message.message_type == MessageTypeEnum.DOCUMENT:
+        _fn = (message.metadata or {}).get("file_name")
+        if _fn and _fn not in content:
+            content = f"{_fn}\n{content}".strip()
+
     # ── Group context: parse ALL @mentions before AI processing ─────
     assignments: list[dict] = []
     members: list[dict] = []
@@ -4060,6 +4068,23 @@ async def capture_message(
         if message.expense_context:
             result["expense_context"] = message.expense_context
 
+    # ── Document metadata ────────────────────────────────────────────
+    # Stamp the original filename + a flag so iOS renders a file card (and the
+    # raw extracted text never shows in the bubble). media_url already points at
+    # the stored file via the standard media_url column.
+    if message.message_type == MessageTypeEnum.DOCUMENT and result.get("message_id"):
+        import json as _json_doc
+        file_name = (message.metadata or {}).get("file_name") or "Document"
+        doc_tags = {"is_document": True, "file_name": file_name}
+        await db.execute(
+            text("UPDATE messages SET tags = tags || CAST(:extra AS jsonb) WHERE id = :mid")
+            .bindparams(extra=_json_doc.dumps(doc_tags), mid=result["message_id"])
+        )
+        await db.commit()
+        result["is_document"] = True
+        result["file_name"]   = file_name
+        result["media_url"]   = message.media_url
+
     return {"success": True, "message": "Content captured successfully", "data": result}
 
 
@@ -4080,7 +4105,7 @@ async def upload_image(
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
     if len(data) > 10 * 1024 * 1024:   # 10 MB hard cap
-        raise HTTPException(status_code=413, detail="Image too large (max 10 MB)")
+        raise HTTPException(status_code=413, detail="File too large (max 10 MB)")
 
     img = StoredImage(user_id=current_user.id, data=data, mime_type=mime_type)
     db.add(img)

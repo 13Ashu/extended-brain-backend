@@ -341,6 +341,35 @@ class MessageProcessor:
 
         ref = _ist_now()
 
+        # ── Document capture: extract text so the PDF/Doc is searchable ───────
+        # A "document" message carries a media_url pointing at the stored file.
+        # We pull the bytes straight from the DB (the /api/images/{id} route is
+        # auth-gated, so an HTTP fetch would 401), extract the text, and fold it
+        # into `content` — that's what gets embedded, making the document show up
+        # in semantic search. iOS renders documents as a file card, so the long
+        # extracted text never appears raw in the chat bubble.
+        doc_embed_text: Optional[str] = None
+        if message_type == "document" and media_url:
+            force_bucket = force_bucket or "Remember"
+            try:
+                raw = await self._load_stored_bytes(media_url, db)
+                if raw:
+                    from services.document_processor import extract_text_from_bytes
+                    extracted = (await extract_text_from_bytes(raw, hint=content or media_url) or "").strip()
+                    if extracted and not extracted.startswith("["):
+                        caption = (content or "").strip()
+                        # Full text → content: keyword (ILIKE) search can find ANY phrase,
+                        # even one buried deep in the document.
+                        content = (f"{caption}\n\n{extracted}" if caption else extracted)[:10000]
+                        # Embedding → only the topical lead (title/abstract/intro) + caption.
+                        # Embedding the whole document averages many pages into one diffuse
+                        # vector that under-scores the 0.40 similarity floor for the very
+                        # queries it should match. A focused lead keeps the vector sharp.
+                        lead = extracted[:1500]
+                        doc_embed_text = (f"{caption}\n\n{lead}" if caption else lead).strip()
+            except Exception as e:
+                print(f"[processor] document extraction failed: {e}")
+
         # ── Media override: images and link captures → always Remember ────────
         # Applies when no higher-priority override (expense=Track, @mention=To-Do)
         # is already in effect. Images (message_type="image") and share-extension
@@ -441,7 +470,8 @@ class MessageProcessor:
             return await self._save_single(
                 user=user, content=content, bucket="Remember",
                 keywords=note_data.get("keywords", []),
-                message_type=message_type, media_url=media_url, db=db, ref=ref
+                message_type=message_type, media_url=media_url, db=db, ref=ref,
+                embed_text=doc_embed_text,
             )
 
         # ── Idea ──────────────────────────────────────────────────
@@ -824,7 +854,8 @@ class MessageProcessor:
 
     async def _save_single(
         self, user, content: str, bucket: str, keywords: List[str],
-        message_type: str, media_url: Optional[str], db: AsyncSession, ref: datetime
+        message_type: str, media_url: Optional[str], db: AsyncSession, ref: datetime,
+        embed_text: Optional[str] = None,
     ) -> Dict:
         category = await self._get_or_create_category(
             user_id=user.id, name=bucket,
@@ -848,7 +879,8 @@ class MessageProcessor:
         db.add(msg)
         await db.commit()
         await db.refresh(msg)
-        await self._save_embedding(msg.id, content, {"keywords": keywords}, db)
+        # For documents, embed_text is the focused lead; otherwise embed the content.
+        await self._save_embedding(msg.id, embed_text or content, {"keywords": keywords}, db)
 
         return {
             "message_id": msg.id, "category": bucket,
@@ -1303,6 +1335,15 @@ Return ONLY this JSON:
     async def _get_user(self, phone: str, db: AsyncSession) -> Optional[User]:
         result = await db.execute(select(User).where(User.phone_number == phone))
         return result.scalar_one_or_none()
+
+    async def _load_stored_bytes(self, media_url: str, db: AsyncSession) -> Optional[bytes]:
+        """Load raw bytes for a /api/images/{id} media_url straight from the DB."""
+        m = re.search(r"/api/images/(\d+)", media_url or "")
+        if not m:
+            return None
+        from database import StoredImage
+        img = await db.get(StoredImage, int(m.group(1)))
+        return img.data if img else None
 
     async def _get_recent_topics(self, user_id: int, db: AsyncSession) -> List[str]:
         result = await db.execute(
