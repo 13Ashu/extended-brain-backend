@@ -15,6 +15,19 @@ hint, because our internal media urls (/api/images/{id}) carry no file extension
 
 import httpx
 import io
+import re
+
+# Control chars that must not reach Postgres. 0x00 is invalid in UTF-8 text
+# columns (asyncpg raises CharacterNotInRepertoireError); other C0 controls
+# (except tab/newline/carriage-return) are valid but garbage in extracted text.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _sanitize(text: str) -> str:
+    """Strip NUL + other control bytes so extracted text is safe to store/embed."""
+    if not text:
+        return text
+    return _CONTROL_RE.sub(" ", text)
 
 
 def detect_doc_kind(content: bytes, hint: str = "") -> str:
@@ -42,9 +55,9 @@ async def extract_text_from_bytes(content: bytes, hint: str = "") -> str:
         return "[Empty document]"
     kind = detect_doc_kind(content, hint)
     if kind == "pdf":
-        return await extract_pdf_text(content)
+        return _sanitize(await extract_pdf_text(content))
     if kind == "docx":
-        return await extract_docx_text(content)
+        return _sanitize(await extract_docx_text(content))
     return "[Document content - unsupported format]"
 
 
