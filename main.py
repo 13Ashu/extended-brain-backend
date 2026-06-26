@@ -4084,6 +4084,9 @@ async def capture_message(
         result["is_document"] = True
         result["file_name"]   = file_name
         result["media_url"]   = message.media_url
+        # Show the filename in the capture-confirmation bubble, not a fragment of the
+        # extracted text (content leads with the full document body for search).
+        result["essence"]     = file_name
 
     return {"success": True, "message": "Content captured successfully", "data": result}
 

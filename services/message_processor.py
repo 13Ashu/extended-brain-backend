@@ -341,34 +341,39 @@ class MessageProcessor:
 
         ref = _ist_now()
 
-        # ── Document capture: extract text so the PDF/Doc is searchable ───────
+        # ── Document capture: extract text, save directly, bypass intent ─────
         # A "document" message carries a media_url pointing at the stored file.
         # We pull the bytes straight from the DB (the /api/images/{id} route is
-        # auth-gated, so an HTTP fetch would 401), extract the text, and fold it
-        # into `content` — that's what gets embedded, making the document show up
-        # in semantic search. iOS renders documents as a file card, so the long
-        # extracted text never appears raw in the chat bubble.
-        doc_embed_text: Optional[str] = None
+        # auth-gated, so an HTTP fetch would 401), extract the text, and save it as
+        # a Remember note RIGHT HERE — returning early so it never reaches intent
+        # parsing or list detection. A PDF's many short lines (e.g. a lab report:
+        # "RBC", "H", "5 - 5.5", …) would otherwise be mistaken for a 500-item list.
         if message_type == "document" and media_url:
-            force_bucket = force_bucket or "Remember"
+            caption = (content or "").strip()
+            full_content = caption or "Document"
+            embed_text   = full_content
             try:
                 raw = await self._load_stored_bytes(media_url, db)
                 if raw:
                     from services.document_processor import extract_text_from_bytes
                     extracted = (await extract_text_from_bytes(raw, hint=content or media_url) or "").strip()
                     if extracted and not extracted.startswith("["):
-                        caption = (content or "").strip()
-                        # Full text → content: keyword (ILIKE) search can find ANY phrase,
+                        # Full text → content: keyword (ILIKE) search finds ANY phrase,
                         # even one buried deep in the document.
-                        content = (f"{caption}\n\n{extracted}" if caption else extracted)[:10000]
+                        full_content = (f"{caption}\n\n{extracted}" if caption else extracted)[:10000]
                         # Embedding → only the topical lead (title/abstract/intro) + caption.
                         # Embedding the whole document averages many pages into one diffuse
-                        # vector that under-scores the 0.40 similarity floor for the very
-                        # queries it should match. A focused lead keeps the vector sharp.
+                        # vector that under-scores the 0.40 similarity floor. A focused lead
+                        # keeps the vector sharp.
                         lead = extracted[:1500]
-                        doc_embed_text = (f"{caption}\n\n{lead}" if caption else lead).strip()
+                        embed_text = (f"{caption}\n\n{lead}" if caption else lead).strip()
             except Exception as e:
                 print(f"[processor] document extraction failed: {e}")
+            return await self._save_single(
+                user=user, content=full_content, bucket="Remember", keywords=[],
+                message_type=message_type, media_url=media_url, db=db, ref=ref,
+                embed_text=embed_text,
+            )
 
         # ── Media override: images and link captures → always Remember ────────
         # Applies when no higher-priority override (expense=Track, @mention=To-Do)
@@ -471,7 +476,6 @@ class MessageProcessor:
                 user=user, content=content, bucket="Remember",
                 keywords=note_data.get("keywords", []),
                 message_type=message_type, media_url=media_url, db=db, ref=ref,
-                embed_text=doc_embed_text,
             )
 
         # ── Idea ──────────────────────────────────────────────────
