@@ -3180,6 +3180,31 @@ async def bootstrap(
 
     recent = [_serialize(m, c, s) for m, c, s in recent_rows.all()]
 
+    # 1b. All open personal To-Dos (any age) ──────────────────────────
+    # `recent` above is capped and ordered by creation date, so an old task that keeps
+    # getting carried forward (e.g. an unfinished todo from weeks ago) falls out of it
+    # and disappears from the iOS To-Do tab even though it's still due. This returns
+    # EVERY still-open personal todo regardless of age so the app can surface them all.
+    # Personal context only (group todos are scoped separately).
+    open_todos: list = []
+    if not group_id:
+        open_rows = await db.execute(
+            select(Message, Category, User)
+            .outerjoin(Category, Message.category_id == Category.id)
+            .outerjoin(User, Message.user_id == User.id)
+            .where(
+                and_(
+                    Message.user_id == current_user.id,
+                    Message.group_id.is_(None),
+                    Message.assigned_to_user_id.is_(None),
+                    text("COALESCE((messages.tags->>'done')::boolean, false) = false"),
+                    text("(messages.tags->>'primary_bucket' = 'To-Do' OR (messages.tags->>'is_list')::boolean IS TRUE)"),
+                )
+            )
+            .order_by(Message.created_at.desc())
+        )
+        open_todos = [_serialize(m, c, s) for m, c, s in open_rows.all()]
+
     # 2. Group members ────────────────────────────────────────────────
     members: list = []
     if group_id:
@@ -3272,6 +3297,7 @@ async def bootstrap(
     payload = {
         "success":       True,
         "recent":        recent,
+        "open_todos":    open_todos,
         "members":       members,
         "assigned":      assigned,
         "unread_counts": unread_counts,

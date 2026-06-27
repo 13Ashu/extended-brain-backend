@@ -14,10 +14,10 @@ from typing import List, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import and_, select, update, text
+from sqlalchemy import and_, or_, select, update, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import async_session_maker, Message, User, Category, DeviceToken
+from database import async_session_maker, Message, User, Category, DeviceToken, GroupMember
 from services.reminder_service import send_apns_notification
 from services.group_service import total_unread_for_user
 
@@ -86,6 +86,9 @@ class BriefingService:
             # ── Fetch today's todos ───────────────────────────────
             todos = await self._fetch_todos(user.id, today, session)
 
+            # ── Fetch tasks others assigned to me (shown in the iOS Today tab) ──
+            assigned = await self._fetch_assigned_to_me(user.id, today, session)
+
             # ── Fetch today's events ──────────────────────────────
             events = await self._fetch_events(user.id, today, session)
 
@@ -111,8 +114,16 @@ class BriefingService:
             if len(todos) > 8:
                 text += f"_...and {len(todos) - 8} more_\n"
             text += "\n"
-        else:
+        elif not assigned:
             text += "✨ *No tasks for today!*\n\n"
+
+        if assigned:
+            text += f"🤝 *Assigned to you ({len(assigned)})*\n"
+            for t in assigned[:5]:
+                text += f"• {t.content[:50]}\n"
+            if len(assigned) > 5:
+                text += f"_...and {len(assigned) - 5} more_\n"
+            text += "\n"
 
         if events:
             text += f"📅 *Today's Events ({len(events)})*\n"
@@ -149,21 +160,35 @@ class BriefingService:
                 # not the task count — keeps the icon consistent across all push types.
                 unread_badge = await total_unread_for_user(apns_db, user.id)
 
-            task_count = len(todos)
-            event_count = len(events)
+            personal_count = len(todos)
+            assigned_count = len(assigned)
+            event_count    = len(events)
             first_name = user.name.split()[0] if user.name else "there"
 
-            if task_count == 0 and event_count == 0:
-                apns_body = "No tasks due today. Have a great day!"
-            elif task_count > 0 and event_count > 0:
-                apns_body = f"{task_count} task{'s' if task_count != 1 else ''} • {event_count} event{'s' if event_count != 1 else ''} today. Tap to see your plan."
-            elif task_count > 0:
-                apns_body = f"{task_count} task{'s' if task_count != 1 else ''} due today. Tap to see your plan."
+            # Clear, at-a-glance split so the user knows exactly what's pending and from
+            # where: e.g. "4 personal · 3 assigned tasks today. Tap to see your plan."
+            if personal_count and assigned_count:
+                task_phrase = f"{personal_count} personal · {assigned_count} assigned tasks today"
+            elif personal_count:
+                task_phrase = f"{personal_count} personal task{'s' if personal_count != 1 else ''} today"
+            elif assigned_count:
+                task_phrase = f"{assigned_count} task{'s' if assigned_count != 1 else ''} assigned to you today"
             else:
-                apns_body = f"{event_count} event{'s' if event_count != 1 else ''} on your schedule today."
+                task_phrase = ""
 
-            if carried:
-                apns_body = f"⏪ {len(carried)} carried over. " + apns_body
+            event_phrase = (
+                f"{event_count} event{'s' if event_count != 1 else ''} today"
+                if event_count else ""
+            )
+
+            if task_phrase and event_phrase:
+                apns_body = f"{task_phrase} · {event_phrase}. Tap to see your plan."
+            elif task_phrase:
+                apns_body = f"{task_phrase}. Tap to see your plan."
+            elif event_phrase:
+                apns_body = f"{event_phrase}. Tap to see your schedule."
+            else:
+                apns_body = "Nothing due today. Have a great day!"
 
             for dt in device_tokens:
                 await send_apns_notification(
@@ -256,6 +281,58 @@ class BriefingService:
             .order_by(Message.created_at.asc())
         )
         return result.scalars().all()
+
+    async def _fetch_assigned_to_me(
+        self, user_id: int, today: str, session: AsyncSession
+    ) -> List[Message]:
+        """Tasks others assigned to me that the iOS Today tab shows — so the briefing
+        count matches the app. Same dual-case logic as GET /api/messages/assigned:
+          Case 1 — explicit @mention (mirror row excluded via user_id != me), and MY
+                   assignment slot is not already ticked off.
+          Case 2 — group-wide unassigned To-Do where I'm a member.
+        Non-future only (due is null or <= today): future-dated assignments live in the
+        Upcoming tab, not Today. Done tasks excluded.
+        """
+        my_groups = select(GroupMember.group_id).where(GroupMember.user_id == user_id)
+        result = await session.execute(
+            select(Message)
+            .where(
+                and_(
+                    or_(
+                        and_(
+                            Message.assigned_to_user_id == user_id,
+                            Message.user_id != user_id,
+                            text(
+                                "NOT EXISTS (SELECT 1 FROM jsonb_array_elements("
+                                "COALESCE(messages.tags->'assignments','[]'::jsonb)) a "
+                                "WHERE (a->>'user_id')::int = :uid "
+                                "AND COALESCE((a->>'done')::boolean,false) = true)"
+                            ),
+                        ),
+                        and_(
+                            Message.group_id.in_(my_groups),
+                            Message.assigned_to_user_id.is_(None),
+                            text("NOT (messages.tags ? 'assignments')"),
+                            or_(
+                                text("messages.tags->>'primary_bucket' = 'To-Do'"),
+                                text("messages.tags->>'intent_bucket' = 'To-Do'"),
+                            ),
+                        ),
+                    ),
+                    text("COALESCE((messages.tags->>'done')::boolean, false) = false"),
+                    text("(messages.tags->>'due_date' IS NULL OR messages.tags->>'due_date' <= :today)"),
+                )
+            )
+            .params(uid=user_id, today=today)
+        )
+        # Dedup by id (the OR can surface a row via either branch).
+        seen: set[int] = set()
+        out: List[Message] = []
+        for m in result.scalars().all():
+            if m.id not in seen:
+                seen.add(m.id)
+                out.append(m)
+        return out
 
     async def _fetch_events(
         self, user_id: int, date_str: str, session: AsyncSession
