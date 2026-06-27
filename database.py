@@ -197,7 +197,11 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text)
     message_type: Mapped[MessageType] = mapped_column(SQLEnum(MessageType))
     media_url: Mapped[Optional[str]] = mapped_column(String(500))
-    
+    # Client-generated idempotency key (UUID). Lets a retried capture (e.g. the iOS offline
+    # outbox re-sending after a lost response) resolve to the same message instead of a
+    # duplicate. Unique per user via a partial index added in init_db.
+    client_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+
     # AI-generated metadata
     summary: Mapped[Optional[str]] = mapped_column(Text)
     tags: Mapped[Optional[dict]] = mapped_column(JSONB)  # List of tags
@@ -444,9 +448,28 @@ async def init_db():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS active_group_id INTEGER",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS group_id INTEGER",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS assigned_to_user_id INTEGER",
+            # Idempotency key for capture retries (iOS offline outbox). Partial unique index
+            # so a retried capture maps to the same message instead of duplicating.
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_id VARCHAR(64)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_user_client ON messages(user_id, client_id) WHERE client_id IS NOT NULL",
             "CREATE TABLE IF NOT EXISTS group_last_seen (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id), group_id INTEGER, last_seen_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, group_id))",
             # Performance indexes
             "CREATE INDEX IF NOT EXISTS idx_messages_user_created ON messages(user_id, created_at DESC)",
+            # Trigram GIN indexes accelerate the fast-search ILIKE (lower(col) LIKE '%term%'),
+            # which otherwise can't use a btree because of the leading wildcard. Matches the
+            # expression used in search_service (`func.lower(Message.content).contains(...)`).
+            #
+            # Built inline (plain CREATE INDEX, not CONCURRENTLY) on purpose: at this scale the
+            # messages table is tiny, so the build is ~instant and the one-time SHARE lock (it
+            # blocks writes, allows reads, only on the deploy that first creates it — IF NOT
+            # EXISTS makes every later startup a no-op) is a non-event. CONCURRENTLY can't run
+            # inside init_db's transaction and can leave an INVALID index on failure, so it'd
+            # only add ops risk here. TRIPWIRE: if `messages` grows to ~hundreds of thousands of
+            # rows (build would stall writes > a second or two), drop these from this loop and
+            # build them out-of-band with CREATE INDEX CONCURRENTLY.
+            "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+            "CREATE INDEX IF NOT EXISTS idx_messages_content_trgm ON messages USING gin (lower(content) gin_trgm_ops)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_summary_trgm ON messages USING gin (lower(summary) gin_trgm_ops)",
             "CREATE INDEX IF NOT EXISTS idx_messages_group_created ON messages(group_id, created_at DESC) WHERE group_id IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_messages_assigned ON messages(assigned_to_user_id) WHERE assigned_to_user_id IS NOT NULL",
             "CREATE INDEX IF NOT EXISTS idx_group_last_seen_lookup ON group_last_seen(user_id, group_id)",

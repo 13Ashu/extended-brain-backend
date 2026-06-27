@@ -20,6 +20,7 @@ import secrets
 import asyncio
 import httpx
 from sqlalchemy import and_, or_, select, update, func, text, delete as sql_delete
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from loguru import logger
@@ -347,6 +348,7 @@ class MessageCreate(BaseModel):
     expense_payer_name: Optional[str] = None
     expense_context:  Optional[str]   = None
     force_bucket:     Optional[str]   = None
+    client_id:        Optional[str]   = None   # idempotency key for capture retries
 
 
 class SearchQuery(BaseModel):
@@ -3693,6 +3695,44 @@ async def set_remind_at(
     }
 
 
+def _capture_data_from_message(msg: Message) -> dict:
+    """Reconstruct a capture `data` payload from a stored message — used by the idempotency
+    short-circuit so a retried capture gets the same shape the original response had."""
+    tags = msg.tags or {}
+    data: dict = {
+        "message_id": msg.id,
+        "category":   tags.get("primary_bucket") or tags.get("intent_bucket") or "Random",
+        "essence":    msg.summary or msg.content,
+        "due_date":   tags.get("due_date"),
+        "remind_at":  tags.get("remind_at"),
+        "priority":   tags.get("priority"),
+    }
+    if tags.get("list_name"):
+        data["list_name"] = tags.get("list_name")
+        data["list_type"] = tags.get("list_type")
+    if tags.get("assignments"):
+        data["assignments"] = tags.get("assignments")
+        if tags["assignments"]:
+            data["assigned_to"] = tags["assignments"][0].get("name")
+    if tags.get("expense_amount") is not None:
+        data["expense_amount"]     = tags.get("expense_amount")
+        data["expense_category"]   = tags.get("expense_category")
+        data["expense_payer_id"]   = tags.get("expense_payer_id")
+        data["expense_payer_name"] = tags.get("expense_payer_name")
+        if tags.get("expense_context"):
+            data["expense_context"] = tags.get("expense_context")
+    if tags.get("is_document"):
+        data["is_document"] = True
+        data["file_name"]   = tags.get("file_name")
+        data["media_url"]   = msg.media_url
+        data["essence"]     = tags.get("file_name") or data["essence"]
+    if tags.get("needs_time"):
+        data["needs_time"] = True
+    if msg.group_id:
+        data["group_id"] = msg.group_id
+    return data
+
+
 @app.post("/api/messages/capture")
 async def capture_message(
     message: MessageCreate,
@@ -3701,6 +3741,20 @@ async def capture_message(
 ):
     group_id = message.group_id
     content  = message.content
+
+    # ── Idempotency: a retried capture (offline outbox re-send after a lost response)
+    #    carries the same client_id. If we already have that message, return it instead
+    #    of creating a duplicate. ──────────────────────────────────────
+    if message.client_id:
+        existing = (await db.execute(
+            select(Message).where(
+                Message.user_id == current_user.id,
+                Message.client_id == message.client_id,
+            )
+        )).scalar_one_or_none()
+        if existing is not None:
+            return {"success": True, "message": "Already captured",
+                    "data": _capture_data_from_message(existing)}
 
     # ── Document: fold the filename into the searchable content ──────
     # Keeps the ".pdf"/".docx" suffix + filename in `content` (the keyword-search
@@ -3729,6 +3783,21 @@ async def capture_message(
         # When the task is assigned to someone, skip sender's reminder — assignee gets it instead
         skip_reminder=bool(assignments),
     )
+
+    # ── Stamp the idempotency key on the new row (so a retry resolves here) ──
+    if message.client_id and result.get("message_id"):
+        try:
+            await db.execute(
+                update(Message)
+                .where(Message.id == result["message_id"])
+                .values(client_id=message.client_id)
+            )
+            await db.commit()
+        except IntegrityError:
+            # A concurrent request already claimed this client_id — harmless; the row we
+            # just created stays (without the key). Sequential retries (the real case)
+            # never reach here because the early existence check catches them first.
+            await db.rollback()
 
     # ── Tag message with group_id / assignments ───────────────────────
     if group_id and result.get("message_id"):
