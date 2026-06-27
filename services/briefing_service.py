@@ -200,7 +200,13 @@ class BriefingService:
                     Message.assigned_to_user_id.is_(None),  # exclude mirror messages
                     text("messages.tags->>'due_date' < :today"),
                     text("(messages.tags->>'done')::boolean IS NOT TRUE"),
-                    text("(messages.tags->'all_buckets' @> '\"To-Do\"'::jsonb OR messages.tags->>'primary_bucket' = 'To-Do')"),
+                    # Match the iOS To-Do tab exactly: a card counts as a task only when
+                    # its PRIMARY bucket is To-Do, or it's a list. Using all_buckets @>
+                    # 'To-Do' also swept in Events/Track items that merely had a secondary
+                    # To-Do tag (e.g. "Dentist on Friday at 3pm") — iOS shows those as
+                    # Events/Track, so the briefing over-counted and carry-forward also
+                    # corrupted their real due dates by bumping them to today.
+                    text("(messages.tags->>'primary_bucket' = 'To-Do' OR (messages.tags->>'is_list')::boolean IS TRUE)"),
                     text("(messages.tags->>'recurring')::boolean IS NOT TRUE"),
                 )
             )
@@ -234,9 +240,16 @@ class BriefingService:
                     Message.user_id == user_id,
                     Message.group_id.is_(None),          # exclude group-captured tasks
                     Message.assigned_to_user_id.is_(None),  # exclude mirror messages
-                    text("messages.tags->>'due_date' = :d"),
+                    # Due today, or earlier and still open. Non-recurring overdue tasks
+                    # were just bumped to today by _carry_forward, so the only `< today`
+                    # rows left are the current occurrence of a recurring task (carry-
+                    # forward leaves those alone). iOS shows that occurrence under Today
+                    # too, so counting it here keeps the briefing == the Today tab.
+                    text("messages.tags->>'due_date' <= :d"),
                     text("(messages.tags->>'done')::boolean IS NOT TRUE"),
-                    text("(messages.tags->'all_buckets' @> '\"To-Do\"'::jsonb OR messages.tags->>'primary_bucket' = 'To-Do')"),
+                    # Same iOS-aligned bucket filter as _carry_forward (see note there):
+                    # primary bucket To-Do, or a list — not a mere secondary To-Do tag.
+                    text("(messages.tags->>'primary_bucket' = 'To-Do' OR (messages.tags->>'is_list')::boolean IS TRUE)"),
                 )
             )
             .params(d=date_str)
