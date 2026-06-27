@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import and_, select, update, text
+from sqlalchemy import and_, select, update, text, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import String, Boolean, Integer, DateTime, ForeignKey, Text
@@ -217,16 +217,31 @@ Examples:
         db: AsyncSession,
     ) -> Optional[Recurrence]:
         try:
+            rule = parsed["rule"]
+            dow  = parsed.get("day_of_week")
+
+            # A multi-day rule is meant to be split by the caller into one weekly
+            # recurrence per day (see the multi-weekly loop in main.py). If a raw
+            # "multi-weekly" still reaches here — the parser returned the rule but no
+            # recurrence_days for the caller to split on — normalize it to a concrete
+            # weekly. Otherwise _compute_next_fire has no matching branch and falls to
+            # its daily default, so the reminder would fire EVERY day instead of weekly.
+            # Same guard for a weekly with no day: pin it to the capture-day weekday.
+            if rule == "multi-weekly":
+                rule = "weekly"
+            if rule == "weekly" and dow is None:
+                dow = datetime.now(IST).weekday()
+
             next_fire = self._compute_next_fire(
-                rule=parsed["rule"],
-                day_of_week=parsed.get("day_of_week"),
+                rule=rule,
+                day_of_week=dow,
                 time_of_day=parsed.get("time_of_day", "09:00"),
             )
 
             rec = Recurrence(
                 user_id=user_id,
-                rule=parsed["rule"],
-                day_of_week=parsed.get("day_of_week"),
+                rule=rule,
+                day_of_week=dow,
                 time_of_day=parsed.get("time_of_day", "09:00"),
                 next_fire=next_fire,
                 template_content=parsed.get("task", original_content),
@@ -285,6 +300,25 @@ Examples:
 
             now_ist = datetime.now(IST)
             today   = now_ist.strftime("%Y-%m-%d")
+
+            # Drop the previous un-done occurrence(s) of this same recurring task before
+            # creating today's. Otherwise a daily reminder the user never ticks off piles
+            # up one overdue To-Do per day forever (a 13-deep "take iron supplement" stack).
+            # The user always sees at most one open occurrence — today's. A genuinely
+            # completed past occurrence (done=true) is left intact as history.
+            # Matched by content (every fired instance has content = template_content);
+            # runs before the new row is added below, so it can't delete today's.
+            await session.execute(
+                delete(Message).where(
+                    and_(
+                        Message.user_id == user.id,
+                        Message.group_id.is_(None),
+                        Message.content == rec.template_content,
+                        text("(messages.tags->>'recurring')::boolean IS TRUE"),
+                        text("(messages.tags->>'done')::boolean IS NOT TRUE"),
+                    )
+                )
+            )
 
             # Create the recurring todo
             msg = Message(
