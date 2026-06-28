@@ -541,6 +541,12 @@ The CREATE pattern (`"Header:\n- item1\n- item2"`) normally gates on `_name_bloc
 
 iOS makes two calls per search query:
 
+**Bucket-browse fast path (single-word bucket alias — runs before Tier 1):**
+- Triggered in `search()` when the query is a single word matching `BUCKET_ALIASES` (e.g. `"idea"` → `"Ideas"`, `"todo"` → `"To-Do"`, `"remember"`, `"track"`, `"event"`, `"random"` + aliases). Checked before any keyword or embedding logic.
+- Calls `_bucket_browse()`: queries `messages.tags->>'primary_bucket'` (or `all_buckets @> [bucket]`) for the canonical bucket name, `ORDER BY created_at DESC LIMIT N`, ranks with `_rank(fast=True)` (recency-sorted, no embedding).
+- Returns `{"results": [...], "natural_response": ""}` immediately — no ILIKE, no vector, no LLM.
+- iOS skips its local search index for single-word bucket queries so it doesn't flood results with unrelated cached items before the server responds.
+
 **Tier 1 — `fast=True` (~10–50ms, shown immediately):**
 - Keyword ILIKE match only — no embedding, no LLM
 - Results sorted by `created_at DESC` (recency) — no relevance scoring needed for keyword preview
@@ -557,6 +563,7 @@ iOS makes two calls per search query:
 - The hybrid `rapidfuzz.token_set_ratio` text scoring is **commented out** (kept for easy restore).
 - **Soft bucket boost (not a filter):** when `_detect_bucket(query)` finds a bucket word ("my **ideas** about X"), matching results are multiplied ×1.25 in `_score` — they rank higher but are **never excluded**. Multiplicative on purpose: a zero-base keyword-tier result stays 0, so the boost can't push it over `MIN_RELEVANCE` and re-create a hard filter. A strongly-relevant item from another bucket still wins.
 - **No hard bucket `WHERE`:** `_retrieve` does **not** restrict candidates by bucket. (Historically it did — a single incidental bucket-ish word like "meeting" would zero out all results. Removed June 2026.) `"meeting"` / `"schedule"` were also dropped from `BUCKET_ALIASES` for the same reason — they are content words, not bucket-scope commands.
+- **`BUCKET_ALIASES` is also used as the bucket-browse trigger** — any key in this dict that is the entire query causes `_bucket_browse()` to short-circuit before any keyword/embed path. Do not add generic content words (e.g. `"note"`, `"log"`) to this dict or they will bypass semantic search for those words.
 - `natural_response` is always `""` (LLM summary generation commented out, reserved for future)
 
 **pgvector index:** `idx_messages_embedding` — `ivfflat (embedding vector_cosine_ops) WITH (lists=100)`. Created June 2026. Keeps semantic search O(log n) as message count grows; without it, every query was a full sequential scan.
