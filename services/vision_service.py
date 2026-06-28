@@ -21,24 +21,19 @@ import httpx
 
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-VISION_PROMPT = """Analyze this image and extract the following in JSON format.
-Be thorough with OCR — extract ALL visible text exactly as written.
+VISION_PROMPT = """You are a search indexer for a personal knowledge base. Analyze this image.
+
+Your goal: extract every piece of information that would help the user find this image later by typing words into a search box.
+
+Think from the user's recall perspective: "What word, name, number, place, brand, or phrase would I type to find this?"
 
 Return ONLY this JSON, no markdown:
 {
-  "document_type": "id_card|receipt|handwritten_note|screenshot|photo|business_card|certificate|other",
-  "title": "short descriptive title (e.g. 'Aadhaar Card - Rahul Sharma')",
-  "extracted_text": "ALL text visible in the image, verbatim",
-  "key_fields": {
-    "name": "person name if visible",
-    "number": "ID/receipt/reference number if visible",
-    "date": "any date visible",
-    "organization": "issuing org or brand",
-    "address": "address if visible"
-  },
-  "description": "one sentence describing what this image shows",
-  "keywords": ["5-10 searchable keywords"],
-  "language": "english|hindi|mixed|other"
+  "document_type": "id_card|receipt|bill|photo|screenshot|handwritten_note|business_card|certificate|menu|ticket|other",
+  "title": "Short descriptive title (e.g. 'Aadhaar Card - Rahul Sharma', 'Zara Receipt ₹4544', 'Handwritten To-Do List')",
+  "extracted_text": "ALL text visible in the image, verbatim and complete. This is the most important field — it powers keyword search. Include every word, number, date, and symbol exactly as written.",
+  "recall_terms": "Space-separated search terms a user might type to find this image. Think broadly: document type synonyms, names, amounts, organizations, places, topics, colors, context. E.g. for an Aadhaar card: 'aadhaar aadhar identity id card uid government india biometric'",
+  "description": "One sentence describing what this image shows — used for semantic search."
 }"""
 
 
@@ -47,9 +42,9 @@ async def _analyze_with_gemini(
     mime_type: str,
     model: str = "gemini-2.5-flash-lite",
 ) -> Dict:
-    api_key = os.getenv("GOOGLE_AI_STUDIO_API_KEY", "")
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_AI_STUDIO_API_KEY", "")
     if not api_key:
-        raise ValueError("GOOGLE_AI_STUDIO_API_KEY not set")
+        raise ValueError("GEMINI_API_KEY not set")
 
     url        = GEMINI_API_URL.format(model=model)
     image_b64  = base64.b64encode(image_data).decode("utf-8")
@@ -121,10 +116,8 @@ class VisionService:
             result.setdefault("document_type", "other")
             result.setdefault("title", "Image")
             result.setdefault("extracted_text", "")
-            result.setdefault("key_fields", {})
+            result.setdefault("recall_terms", "")
             result.setdefault("description", "")
-            result.setdefault("keywords", [])
-            result.setdefault("language", "english")
             return result
 
         except Exception as e:
@@ -133,10 +126,8 @@ class VisionService:
                 "document_type":  "other",
                 "title":          "Image",
                 "extracted_text": "",
-                "key_fields":     {},
+                "recall_terms":   "",
                 "description":    "Image analysis failed",
-                "keywords":       [],
-                "language":       "english",
             }
 
 

@@ -378,11 +378,27 @@ class MessageProcessor:
                 summary=caption[:100] if caption else None,
             )
 
-        # ── Media override: images and link captures → always Remember ────────
-        # Applies when no higher-priority override (expense=Track, @mention=To-Do)
-        # is already in effect. Images (message_type="image") and share-extension
-        # link captures (message_type="text" + media_url) skip AI classification
-        # entirely; the user can move the bucket manually afterward.
+        # ── Image capture → vision analysis + search-optimised content ──────────
+        # Runs Gemini vision to extract OCR text, recall terms, and description.
+        # Stored content = caption + doc-type + full OCR + recall terms (keyword search).
+        # Embed text = caption + description + recall terms (focused semantic vector).
+        # Returns early like the document path — never reaches AI intent classification.
+        if message_type == "image" and media_url and not force_bucket:
+            caption_text = (content or "").strip()
+            raw = await self._load_stored_bytes(media_url, db)
+            if raw:
+                mime = (metadata or {}).get("mime_type", "image/jpeg") if metadata else "image/jpeg"
+                print(f"[processor] image capture → running vision analysis ({len(raw)//1024} KB)")
+                return await self._process_image(
+                    user=user, caption=caption_text, image_data=raw,
+                    mime_type=mime, db=db, ref=ref, media_url=media_url,
+                )
+            # Bytes not available (e.g. external URL) — fall through to Remember bucket.
+            print("[processor] image capture — bytes unavailable, skipping vision analysis")
+
+        # ── Media override: link captures → always Remember ──────────────────
+        # Share-extension URL captures (message_type="text" + http media_url) skip
+        # AI classification entirely; the user can move the bucket manually afterward.
         if not force_bucket and (
             message_type == "image"
             or (message_type == "text" and media_url)
@@ -1405,12 +1421,12 @@ Return ONLY this JSON:
     async def _process_image(
         self,
         user: User,
-        file_id: str,
         caption: str,
-        image_data: bytes,      # ADD
-        mime_type: str,         # ADD
+        image_data: bytes,
+        mime_type: str,
         db: AsyncSession,
         ref: datetime,
+        media_url: Optional[str] = None,
     ) -> Dict:
         from services.vision_service import vision_service
 
@@ -1422,18 +1438,40 @@ Return ONLY this JSON:
                 "document_type":  "other",
                 "title":          caption or "Image",
                 "extracted_text": "",
-                "key_fields":     {},
+                "recall_terms":   "",
                 "description":    "",
-                "keywords":       [],
             }
 
-        extracted = analysis.get("extracted_text", "")
-        title     = analysis.get("title") or caption or "Image"
+        extracted     = (analysis.get("extracted_text") or "").strip()
+        recall_terms  = (analysis.get("recall_terms")   or "").strip()
+        description   = (analysis.get("description")    or "").strip()
+        title         = (analysis.get("title") or caption or "Image").strip()
+        doc_type_label = analysis.get("document_type", "other").replace("_", " ")
 
-        content_parts = [caption] if caption and caption != "[Image]" else []
+        # ── Keyword-search content (ILIKE) ──────────────────────────────────
+        # Ordered for maximum recall: caption first (user's own words), then the
+        # document-type label, then all verbatim OCR text, then recall terms.
+        keyword_parts: list[str] = []
+        if caption and caption != "[Image]":
+            keyword_parts.append(caption)
+        keyword_parts.append(doc_type_label)
         if extracted:
-            content_parts.append(extracted[:500])
-        content = " | ".join(content_parts) if content_parts else title
+            keyword_parts.append(extracted[:5000])   # full OCR, capped to avoid bloat
+        if recall_terms:
+            keyword_parts.append(recall_terms)
+        content = "\n".join(keyword_parts)
+
+        # ── Semantic-search embed text ───────────────────────────────────────
+        # Focused on what the image IS, not the raw OCR wall of text.
+        # Keeps the vector sharp — avoids diluting it across OCR noise.
+        embed_parts: list[str] = []
+        if caption and caption != "[Image]":
+            embed_parts.append(caption)
+        if description:
+            embed_parts.append(description)
+        if recall_terms:
+            embed_parts.append(recall_terms)
+        embed_text = " ".join(embed_parts) or content[:500]
 
         category = await self._get_or_create_category(
             user_id=user.id, name="Remember",
@@ -1445,24 +1483,20 @@ Return ONLY this JSON:
             "primary_bucket": "Remember",
             "priority":       "normal",
             "due_date":       None,
-            "is_image":       True,
-            "file_id":        file_id,
-            "mime_type":      mime_type,
-            "caption":        caption,
             "document_type":  analysis.get("document_type", "other"),
             "image_title":    title,
-            "extracted_text": extracted,
-            "key_fields":     analysis.get("key_fields", {}),
-            "description":    analysis.get("description", ""),
-            "keywords":       analysis.get("keywords", []),
-            "language":       analysis.get("language", "english"),
+            "description":    description,
+            "recall_terms":   recall_terms,
         }
+        if caption:
+            tags["caption"] = caption
 
         msg = Message(
             user_id=user.id,
             category_id=category.id,
             content=content,
             message_type=MessageType("image"),
+            media_url=media_url,
             summary=title,
             tags=tags,
             created_at=ref,
@@ -1471,20 +1505,17 @@ Return ONLY this JSON:
         await db.commit()
         await db.refresh(msg)
 
-        await self._save_embedding(
-            msg.id, content, {"keywords": analysis.get("keywords", [])}, db
-        )
+        await self._save_embedding(msg.id, embed_text, {}, db)
 
         return {
-            "message_id":     msg.id,
-            "category":       "Remember",
-            "all_buckets":    ["Remember"],
-            "tags":           analysis.get("keywords", []),
-            "essence":        title,
-            "document_type":  analysis.get("document_type", "other"),
-            "extracted_text": extracted[:100] if extracted else "",
-            "connections":    [],
-            "due_date":       None,
-            "events":         [],
-            "priority":       "normal",
+            "message_id":  msg.id,
+            "category":    "Remember",
+            "all_buckets": ["Remember"],
+            "tags":        recall_terms.split() if recall_terms else [],
+            "essence":     title,
+            "connections": [],
+            "due_date":    None,
+            "events":      [],
+            "priority":    "normal",
+            "media_url":   media_url,
         }
