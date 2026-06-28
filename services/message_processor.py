@@ -341,60 +341,32 @@ class MessageProcessor:
 
         ref = _ist_now()
 
-        # ── Document capture: extract text, save directly, bypass intent ─────
-        # A "document" message carries a media_url pointing at the stored file.
-        # We pull the bytes straight from the DB (the /api/images/{id} route is
-        # auth-gated, so an HTTP fetch would 401), extract the text, and save it as
-        # a Remember note RIGHT HERE — returning early so it never reaches intent
-        # parsing or list detection. A PDF's many short lines (e.g. a lab report:
-        # "RBC", "H", "5 - 5.5", …) would otherwise be mistaken for a 500-item list.
+        # ── Document capture: save immediately, extract text in background ──────
+        # Returns instantly with caption + filename; a background asyncio task then
+        # extracts the PDF/DOCX text and re-generates the embedding so the document
+        # becomes keyword-searchable within a few seconds. main.py fires the background
+        # task AFTER stamping file_name/is_document tags (to avoid a write race).
         if message_type == "document" and media_url:
             caption = (content or "").strip()
-            full_content = caption or "Document"
-            embed_text   = full_content
-            try:
-                raw = await self._load_stored_bytes(media_url, db)
-                if raw:
-                    from services.document_processor import extract_text_from_bytes
-                    extracted = (await extract_text_from_bytes(raw, hint=content or media_url) or "").strip()
-                    if extracted and not extracted.startswith("["):
-                        # Full text → content: keyword (ILIKE) search finds ANY phrase,
-                        # even one buried deep in the document.
-                        full_content = (f"{caption}\n\n{extracted}" if caption else extracted)[:10000]
-                        # Embedding → only the topical lead (title/abstract/intro) + caption.
-                        # Embedding the whole document averages many pages into one diffuse
-                        # vector that under-scores the 0.40 similarity floor. A focused lead
-                        # keeps the vector sharp.
-                        lead = extracted[:1500]
-                        embed_text = (f"{caption}\n\n{lead}" if caption else lead).strip()
-            except Exception as e:
-                print(f"[processor] document extraction failed: {e}")
-            return await self._save_single(
-                user=user, content=full_content, bucket="Remember", keywords=[],
-                message_type=message_type, media_url=media_url, db=db, ref=ref,
-                embed_text=embed_text,
-                # Store only the user's caption as the summary (not extracted text),
-                # so brain view can show the caption cleanly without PDF body text.
-                summary=caption[:100] if caption else None,
+            return await self._save_document_minimal(
+                user=user, caption=caption, media_url=media_url, db=db, ref=ref,
             )
 
-        # ── Image capture → vision analysis + search-optimised content ──────────
-        # Runs Gemini vision to extract OCR text, recall terms, and description.
-        # Stored content = caption + doc-type + full OCR + recall terms (keyword search).
-        # Embed text = caption + description + recall terms (focused semantic vector).
-        # Returns early like the document path — never reaches AI intent classification.
+        # ── Image capture: save immediately, run vision analysis in background ────
+        # Returns instantly with caption + media_url; a background asyncio task then
+        # runs Gemini Vision (OCR + recall keywords) and re-generates the embedding
+        # so the image becomes keyword-searchable within a few seconds. The task is
+        # fired by main.py immediately after this return (no write race since main.py
+        # does no DB updates for images — just echoes media_url in the response).
         if message_type == "image" and media_url and not force_bucket:
             caption_text = (content or "").strip()
-            raw = await self._load_stored_bytes(media_url, db)
-            if raw:
-                mime = (metadata or {}).get("mime_type", "image/jpeg") if metadata else "image/jpeg"
-                print(f"[processor] image capture → running vision analysis ({len(raw)//1024} KB)")
-                return await self._process_image(
-                    user=user, caption=caption_text, image_data=raw,
-                    mime_type=mime, db=db, ref=ref, media_url=media_url,
-                )
-            # Bytes not available (e.g. external URL) — fall through to Remember bucket.
-            print("[processor] image capture — bytes unavailable, skipping vision analysis")
+            mime = (metadata or {}).get("mime_type", "image/jpeg") if metadata else "image/jpeg"
+            result = await self._save_image_minimal(
+                user=user, caption=caption_text, media_url=media_url, db=db, ref=ref,
+            )
+            # Stash mime for the background task (main.py picks it up via result["_mime"])
+            result["_mime"] = mime
+            return result
 
         # ── Media override: link captures → always Remember ──────────────────
         # Share-extension URL captures (message_type="text" + http media_url) skip
@@ -1418,85 +1390,37 @@ Return ONLY this JSON:
                 else:
                     print(f"⚠ Embedding failed (non-critical): {e}")
 
-    async def _process_image(
+    # ─────────────────────────────────────────────────────────────────────────
+    # Background-enrichment helpers (image + document)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _save_image_minimal(
         self,
         user: User,
         caption: str,
-        image_data: bytes,
-        mime_type: str,
+        media_url: str,
         db: AsyncSession,
         ref: datetime,
-        media_url: Optional[str] = None,
     ) -> Dict:
-        from services.vision_service import vision_service
-
-        try:
-            analysis = await vision_service.analyze_image(image_data, mime_type)
-        except Exception as e:
-            print(f"[processor] Image analysis failed: {e}")
-            analysis = {
-                "document_type":  "other",
-                "title":          caption or "Image",
-                "extracted_text": "",
-                "recall_terms":   "",
-                "description":    "",
-            }
-
-        extracted     = (analysis.get("extracted_text") or "").strip()
-        recall_terms  = (analysis.get("recall_terms")   or "").strip()
-        description   = (analysis.get("description")    or "").strip()
-        title         = (analysis.get("title") or caption or "Image").strip()
-        doc_type_label = analysis.get("document_type", "other").replace("_", " ")
-
-        # ── Keyword-search content (ILIKE) ──────────────────────────────────
-        # Ordered for maximum recall: caption first (user's own words), then the
-        # document-type label, then all verbatim OCR text, then recall terms.
-        keyword_parts: list[str] = []
-        if caption and caption != "[Image]":
-            keyword_parts.append(caption)
-        keyword_parts.append(doc_type_label)
-        if extracted:
-            keyword_parts.append(extracted[:5000])   # full OCR, capped to avoid bloat
-        if recall_terms:
-            keyword_parts.append(recall_terms)
-        content = "\n".join(keyword_parts)
-
-        # ── Semantic-search embed text ───────────────────────────────────────
-        # Focused on what the image IS, not the raw OCR wall of text.
-        # Keeps the vector sharp — avoids diluting it across OCR noise.
-        embed_parts: list[str] = []
-        if caption and caption != "[Image]":
-            embed_parts.append(caption)
-        if description:
-            embed_parts.append(description)
-        if recall_terms:
-            embed_parts.append(recall_terms)
-        embed_text = " ".join(embed_parts) or content[:500]
-
+        """Save an image message immediately with just the caption (no vision I/O).
+        The vision analysis background task enriches the record seconds later."""
         category = await self._get_or_create_category(
             user_id=user.id, name="Remember",
             auto_description=INTENT_BUCKETS["Remember"], db=db,
         )
-
-        tags = {
+        tags: Dict = {
             "all_buckets":    ["Remember"],
             "primary_bucket": "Remember",
             "priority":       "normal",
             "due_date":       None,
-            "document_type":  analysis.get("document_type", "other"),
-            "image_title":    title,
-            "description":    description,
-            "recall_terms":   recall_terms,
         }
         if caption:
             tags["caption"] = caption
 
-        # summary = user's caption (what the iOS bot bubble and brain view show).
-        # The AI-generated title is kept in tags.image_title for internal reference only.
         msg = Message(
             user_id=user.id,
             category_id=category.id,
-            content=content,
+            content=caption or "",
             message_type=MessageType("image"),
             media_url=media_url,
             summary=caption[:100] if caption else None,
@@ -1507,17 +1431,202 @@ Return ONLY this JSON:
         await db.commit()
         await db.refresh(msg)
 
-        await self._save_embedding(msg.id, embed_text, {}, db)
+        # Seed embedding from caption so the message is searchable immediately;
+        # background task replaces this with a richer vector once vision runs.
+        if caption:
+            await self._save_embedding(msg.id, caption, {}, db)
 
         return {
             "message_id":  msg.id,
             "category":    "Remember",
             "all_buckets": ["Remember"],
             "tags":        [],
-            "essence":     caption or "",   # user's caption only — never the AI title
+            "essence":     caption or "",
             "connections": [],
             "due_date":    None,
             "events":      [],
             "priority":    "normal",
             "media_url":   media_url,
         }
+
+    async def _save_document_minimal(
+        self,
+        user: User,
+        caption: str,
+        media_url: str,
+        db: AsyncSession,
+        ref: datetime,
+    ) -> Dict:
+        """Save a document message immediately with just the caption (no text extraction).
+        main.py stamps file_name/is_document tags after this returns, then fires the
+        background extraction task."""
+        category = await self._get_or_create_category(
+            user_id=user.id, name="Remember",
+            auto_description=INTENT_BUCKETS["Remember"], db=db,
+        )
+        tags: Dict = {
+            "all_buckets":    ["Remember"],
+            "primary_bucket": "Remember",
+            "priority":       "normal",
+            "due_date":       None,
+        }
+
+        msg = Message(
+            user_id=user.id,
+            category_id=category.id,
+            content=caption or "",
+            message_type=MessageType("document"),
+            media_url=media_url,
+            summary=caption[:100] if caption else None,
+            tags=tags,
+            created_at=ref,
+        )
+        db.add(msg)
+        await db.commit()
+        await db.refresh(msg)
+
+        if caption:
+            await self._save_embedding(msg.id, caption, {}, db)
+
+        return {
+            "message_id":  msg.id,
+            "category":    "Remember",
+            "all_buckets": ["Remember"],
+            "tags":        [],
+            "essence":     caption or "",
+            "connections": [],
+            "due_date":    None,
+            "events":      [],
+            "priority":    "normal",
+            "media_url":   media_url,
+        }
+
+    async def _enrich_image_background(
+        self,
+        message_id: int,
+        user_id: int,
+        media_url: str,
+        caption: str,
+        mime_type: str,
+    ) -> None:
+        """Background task: run Gemini Vision then update content, tags, and embedding."""
+        import asyncio as _aio
+        from database import async_session_maker
+        from sqlalchemy.ext.asyncio import AsyncSession as _AS
+        from services.vision_service import vision_service
+        from services.redis_cache import cache_del, bootstrap_key
+
+        try:
+            async with async_session_maker() as db:
+                raw = await self._load_stored_bytes(media_url, db)
+                if not raw:
+                    print(f"[enrich] image {message_id}: bytes not found, skipping")
+                    return
+
+                print(f"[enrich] image {message_id}: running vision ({len(raw)//1024} KB)")
+                try:
+                    analysis = await vision_service.analyze_image(raw, mime_type)
+                except Exception as e:
+                    print(f"[enrich] image {message_id} vision failed: {e}")
+                    analysis = {
+                        "document_type": "other", "title": caption or "Image",
+                        "extracted_text": "", "recall_terms": "", "description": "",
+                    }
+
+                extracted    = (analysis.get("extracted_text") or "").strip()
+                recall_terms = (analysis.get("recall_terms")   or "").strip()
+                description  = (analysis.get("description")    or "").strip()
+                title        = (analysis.get("title") or caption or "Image").strip()
+                doc_type     = analysis.get("document_type", "other")
+                doc_label    = doc_type.replace("_", " ")
+
+                # Keyword-searchable content (ILIKE hits on any term)
+                kw: list[str] = []
+                if caption:
+                    kw.append(caption)
+                kw.append(doc_label)
+                if extracted:
+                    kw.append(extracted[:5000])
+                if recall_terms:
+                    kw.append(recall_terms)
+                content = "\n".join(kw)
+
+                # Focused embed text (sharp semantic vector, not diluted by OCR noise)
+                em: list[str] = []
+                if caption:
+                    em.append(caption)
+                if description:
+                    em.append(description)
+                if recall_terms:
+                    em.append(recall_terms)
+                embed_text = " ".join(em) or content[:500]
+
+                msg = await db.get(Message, message_id)
+                if not msg:
+                    return
+
+                msg.content = content or caption or ""
+                new_tags = dict(msg.tags or {})
+                new_tags["image_title"]   = title
+                new_tags["description"]   = description
+                new_tags["recall_terms"]  = recall_terms
+                new_tags["document_type"] = doc_type
+                msg.tags = new_tags
+                await db.commit()
+
+                await self._save_embedding(message_id, embed_text, {}, db)
+
+                # Bust personal bootstrap so brain view gets fresh content
+                await cache_del(bootstrap_key(user_id, None))
+                print(f"[enrich] image {message_id}: done (OCR {len(extracted)} chars, recall_terms {len(recall_terms)} chars)")
+
+        except Exception as e:
+            print(f"[enrich] image {message_id} error: {e}")
+
+    async def _enrich_document_background(
+        self,
+        message_id: int,
+        user_id: int,
+        media_url: str,
+        caption: str,
+    ) -> None:
+        """Background task: extract PDF/DOCX text then update content and embedding.
+        Does NOT touch tags — main.py already stamped file_name/is_document/caption."""
+        from database import async_session_maker
+        from services.document_processor import extract_text_from_bytes
+        from services.redis_cache import cache_del, bootstrap_key
+
+        try:
+            async with async_session_maker() as db:
+                raw = await self._load_stored_bytes(media_url, db)
+                if not raw:
+                    print(f"[enrich] doc {message_id}: bytes not found, skipping")
+                    return
+
+                print(f"[enrich] doc {message_id}: extracting text ({len(raw)//1024} KB)")
+                try:
+                    extracted = (await extract_text_from_bytes(raw, hint=caption or media_url) or "").strip()
+                except Exception as e:
+                    print(f"[enrich] doc {message_id} extraction error: {e}")
+                    return
+
+                if not extracted or extracted.startswith("["):
+                    print(f"[enrich] doc {message_id}: no extractable text (image-only PDF?)")
+                    return
+
+                full_content = (f"{caption}\n\n{extracted}" if caption else extracted)[:10000]
+                lead         = extracted[:1500]
+                embed_text   = (f"{caption}\n\n{lead}" if caption else lead).strip()
+
+                msg = await db.get(Message, message_id)
+                if not msg:
+                    return
+                msg.content = full_content
+                await db.commit()
+
+                await self._save_embedding(message_id, embed_text, {}, db)
+                await cache_del(bootstrap_key(user_id, None))
+                print(f"[enrich] doc {message_id}: done ({len(extracted)} chars extracted)")
+
+        except Exception as e:
+            print(f"[enrich] doc {message_id} error: {e}")

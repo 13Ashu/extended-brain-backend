@@ -2040,52 +2040,6 @@ async def process_webhook_message(webhook_data: Dict):
                     except Exception as e:
                         print(f"Error extracting document: {e}")
 
-                # ── Image message — vision processing ─────────────────────────
-                if message_type == "image" and file_id:
-                    try:
-                        from services.vision_service import vision_service
-
-                        # Use existing client — get URL then download bytes
-                        media_url  = await messaging_client.get_media_url(file_id)
-                        image_data = await messaging_client.download_media(media_url)
-
-                        # Infer mime type from URL extension
-                        ext      = media_url.rsplit(".", 1)[-1].lower()
-                        mime_map = {
-                            "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                            "png": "image/png",  "webp": "image/webp",
-                            "gif": "image/gif",
-                        }
-                        mime_type = mime_map.get(ext, "image/jpeg")
-
-                        ref    = datetime.utcnow()
-                        result = await message_processor._process_image(
-                            user=user,
-                            file_id=file_id,
-                            caption=content,
-                            image_data=image_data,
-                            mime_type=mime_type,
-                            db=db,
-                            ref=ref,
-                        )
-
-                        title             = result.get("essence", "Image")
-                        extracted_preview = result.get("extracted_text", "")[:60]
-                        extracted_line    = f"\n📄 _{extracted_preview}..._" if extracted_preview else ""
-
-                        response = (
-                            f"✓ Got it! Image saved.\n\n"
-                            f"🖼 *{title}*{extracted_line}\n\n"
-                            f"_Just ask me to find it anytime._"
-                        )
-                    except Exception as e:
-                        print(f"[image] Processing failed: {e}")
-                        import traceback; traceback.print_exc()
-                        response = "⚠ Couldn't process the image. Please try again."
-
-                    await messaging_client.send_message(chat_id, response)
-                    continue
-
                 # ── Audio transcription (existing) ────────────────────────────
                 if message_type == "audio" and file_id:
                     try:
@@ -4167,8 +4121,20 @@ async def capture_message(
     # Echo media_url back in the capture response so the iOS chat bubble can
     # render a thumbnail of the uploaded photo (the upload URL is not otherwise
     # included in the standard result dict that intent_service builds).
+    # Fire vision-analysis enrichment in background AFTER all sync work is done —
+    # the background task creates its own DB session so there is no write race.
     if message.message_type == MessageTypeEnum.IMAGE and message.media_url and result.get("message_id"):
         result["media_url"] = message.media_url
+        mime = (message.metadata or {}).get("mime_type", "image/jpeg") if message.metadata else "image/jpeg"
+        # Pop the internal _mime sentinel that process() stashed (not for the client)
+        result.pop("_mime", None)
+        img_caption = (message.content or "").strip()
+        asyncio.create_task(
+            message_processor._enrich_image_background(
+                result["message_id"], current_user.id,
+                message.media_url, img_caption, mime,
+            )
+        )
 
     # ── Link metadata ────────────────────────────────────────────────
     # Share-extension URL captures arrive as message_type="text" with media_url = the external
@@ -4182,6 +4148,8 @@ async def capture_message(
     # Stamp the original filename + a flag so iOS renders a file card (and the
     # raw extracted text never shows in the bubble). media_url already points at
     # the stored file via the standard media_url column.
+    # After tagging, fire PDF text extraction in background so the document
+    # becomes keyword-searchable within a few seconds of capture.
     if message.message_type == MessageTypeEnum.DOCUMENT and result.get("message_id"):
         import json as _json_doc
         file_name = (message.metadata or {}).get("file_name") or "Document"
@@ -4201,6 +4169,13 @@ async def capture_message(
         # when no caption was provided. The filename is already visible on the
         # DocumentChip, so showing it as essence text would be redundant.
         result["essence"]     = doc_caption or file_name
+        # Tags stamped ↑ — now safe to fire background extraction (no write race)
+        asyncio.create_task(
+            message_processor._enrich_document_background(
+                result["message_id"], current_user.id,
+                message.media_url, doc_caption,
+            )
+        )
 
     return {"success": True, "message": "Content captured successfully", "data": result}
 
