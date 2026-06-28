@@ -360,12 +360,9 @@ class MessageProcessor:
         # does no DB updates for images — just echoes media_url in the response).
         if message_type == "image" and media_url and not force_bucket:
             caption_text = (content or "").strip()
-            mime = (metadata or {}).get("mime_type", "image/jpeg") if metadata else "image/jpeg"
             result = await self._save_image_minimal(
                 user=user, caption=caption_text, media_url=media_url, db=db, ref=ref,
             )
-            # Stash mime for the background task (main.py picks it up via result["_mime"])
-            result["_mime"] = mime
             return result
 
         # ── Media override: link captures → always Remember ──────────────────

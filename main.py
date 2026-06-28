@@ -2440,8 +2440,6 @@ async def capture_message(
     if message.message_type == MessageTypeEnum.IMAGE and message.media_url and result.get("message_id"):
         result["media_url"] = message.media_url
         mime = (message.metadata or {}).get("mime_type", "image/jpeg") if message.metadata else "image/jpeg"
-        # Pop the internal _mime sentinel that process() stashed (not for the client)
-        result.pop("_mime", None)
         img_caption = (message.content or "").strip()
         asyncio.create_task(
             message_processor._enrich_image_background(
