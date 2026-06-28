@@ -1,7 +1,6 @@
 """
 Authentication Service
 Handles OTP generation, verification, and user authentication
-Updated for multi-platform support (WhatsApp/Telegram)
 """
 
 import random
@@ -17,7 +16,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
 from database import User, OTPVerification, get_db
-from messaging_interface import MessagingClient
 from config import Config
 from services.sms_service import sms_service
 
@@ -40,8 +38,8 @@ class AuthService:
     RESEND_COOLDOWN_SECONDS = Config.OTP_RESEND_COOLDOWN_SECONDS
     MAX_OTP_PER_DAY = Config.OTP_MAX_PER_DAY
 
-    def __init__(self, messaging_client: MessagingClient):
-        self.messaging_client = messaging_client
+    def __init__(self):
+        pass
 
     @staticmethod
     def generate_otp(length: int = 6) -> str:
@@ -159,9 +157,7 @@ class AuthService:
             db.add(otp_record)
             await db.commit()
 
-            # Deliver. Prefer MSG91 SMS when configured (production OTP transport);
-            # otherwise fall back to the legacy messaging client (Telegram) so the
-            # existing /send-otp path keeps working until MSG91 is switched on.
+            # Deliver via MSG91 SMS (production OTP transport).
             if sms_service.is_configured:
                 # On failure, roll back the stored code so a user who never
                 # received an SMS can't be left with a "valid" OTP.
@@ -176,17 +172,7 @@ class AuthService:
                         "message": "Could not send verification code. Please try again.",
                     }
             else:
-                # Legacy fallback — kept ready; lenient (matches prior behaviour).
-                message = (
-                    f"Extended Minds verification\n\n"
-                    f"Your OTP code is: {otp_code}\n\n"
-                    f"This code expires in {self.OTP_EXPIRY_MINUTES} minutes.\n"
-                    f"Do not share it with anyone."
-                )
-                try:
-                    await self.messaging_client.send_message(phone_number, message)
-                except Exception as e:
-                    logger.warning(f"Failed to send OTP via messaging client: {e}")
+                logger.warning(f"MSG91 not configured — OTP generated but not delivered for {phone_number[-4:]}")
 
             return {
                 "success": True,

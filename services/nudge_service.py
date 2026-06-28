@@ -1,20 +1,16 @@
 """
 Nudge Service
 ─────────────────────────────────────────────────────────────
-• Idle nudges  — todos not acted on since yesterday get daily pings
-                 with Snooze / Done inline buttons
-• Follow-up tracking — messages with people + action verbs get a
-                       follow-up ping after 48hrs if not marked done
+• Idle nudges  — tracks overdue todos (APNs delivery not yet implemented)
+• Follow-up tracking — messages with people + action verbs tracked after 48hrs
 """
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timedelta
 from typing import List
 from zoneinfo import ZoneInfo
 
-import httpx
 from sqlalchemy import and_, select, update, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,20 +22,6 @@ UTC = ZoneInfo("UTC")
 FOLLOWUP_HOURS = 48
 
 
-async def _send_telegram(chat_id: str, text_: str, reply_markup: dict):
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        await client.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={
-                "chat_id":      chat_id,
-                "text":         text_,
-                "parse_mode":   "Markdown",
-                "reply_markup": reply_markup,
-            },
-        )
-
-
 class NudgeService:
 
     # ──────────────────────────────────────────────────────────────
@@ -48,7 +30,7 @@ class NudgeService:
 
     async def run_idle_nudges(self):
         """
-        Called once per day (at briefing time + 1 min from scheduler).
+        Called once per day from scheduler.
         Finds todos created/due before today, not done, not snoozed until tomorrow.
         """
         now_utc = datetime.utcnow()
@@ -56,12 +38,7 @@ class NudgeService:
 
         async with async_session_maker() as session:
             users = await session.execute(
-                select(User).where(
-                    and_(
-                        User.is_active == True,
-                        User.telegram_chat_id.isnot(None),
-                    )
-                )
+                select(User).where(User.is_active == True)
             )
             users = users.scalars().all()
 
@@ -99,26 +76,7 @@ class NudgeService:
                 .limit(5)
             )
             todos = result.scalars().all()
-
-    async def _send_nudge(self, chat_id: str, message: Message):
-        tags     = message.tags if isinstance(message.tags, dict) else {}
-        due      = tags.get("due_date", "")
-        due_str  = f" _(due {due})_" if due else ""
-        priority = tags.get("priority", "normal")
-        prefix   = "🔴" if priority in ("high", "urgent") else "📌"
-
-        text_ = (
-            f"{prefix} *Pending task reminder*\n\n"
-            f"{message.content[:100]}{due_str}\n\n"
-            f"_What do you want to do with this?_"
-        )
-        reply_markup = {
-            "inline_keyboard": [[
-                {"text": "✅ Done",        "callback_data": f"done:{message.id}"},
-                {"text": "⏰ Snooze 1 day", "callback_data": f"snooze:{message.id}:1440"},
-            ]]
-        }
-        await _send_telegram(chat_id, text_, reply_markup)
+            # APNs nudge delivery not yet implemented; todos tracked in DB only.
 
     # ──────────────────────────────────────────────────────────────
     # Snooze handler (called from main.py callback router)
@@ -160,6 +118,8 @@ class NudgeService:
         - Have actionables
         - Were saved > FOLLOWUP_HOURS ago
         - Not done, not followed up already
+        Marks follow_up_sent to avoid re-processing.
+        APNs delivery not yet implemented.
         """
         cutoff = datetime.utcnow() - timedelta(hours=FOLLOWUP_HOURS)
 
@@ -170,7 +130,6 @@ class NudgeService:
                 .where(
                     and_(
                         User.is_active == True,
-                        User.telegram_chat_id.isnot(None),
                         Message.created_at <= cutoff,
                         text("(messages.tags->>'done')::boolean IS NOT TRUE"),
                         text("(messages.tags->>'follow_up_sent')::boolean IS NOT TRUE"),
@@ -184,47 +143,17 @@ class NudgeService:
                 .limit(20)
             )
             rows = result.all()
-
-        for message, user in rows:
-            try:
-                await self._send_followup(user, message)
-            except Exception as e:
-                print(f"[nudge] Follow-up failed for message {message.id}: {e}")
-
-    async def _send_followup(self, user: User, message: Message):
-        tags    = message.tags if isinstance(message.tags, dict) else {}
-        people  = tags.get("entities", {}).get("people", [])
-        actions = tags.get("actionables", [])
-
-        if not people:
-            return
-
-        person      = people[0]
-        action_hint = actions[0] if actions else message.content[:50]
-
-        text_ = (
-            f"🔔 *Follow-up check*\n\n"
-            f"Did you connect with *{person}*?\n"
-            f"_{action_hint}_\n\n"
-            f"_Saved {message.created_at.strftime('%d %b at %I:%M %p')}_"
-        )
-        reply_markup = {
-            "inline_keyboard": [[
-                {"text": "✅ Yes, done",      "callback_data": f"done:{message.id}"},
-                {"text": "⏰ Remind tomorrow", "callback_data": f"snooze:{message.id}:1440"},
-            ]]
-        }
-
-        await _send_telegram(user.telegram_chat_id, text_, reply_markup)
-
-        # Mark follow_up_sent so we don't spam
-        async with async_session_maker() as session:
-            tags["follow_up_sent"] = True
-            await session.execute(
-                update(Message)
-                .where(Message.id == message.id)
-                .values(tags=tags)
-            )
+            for message, user in rows:
+                try:
+                    tags = message.tags if isinstance(message.tags, dict) else {}
+                    tags["follow_up_sent"] = True
+                    await session.execute(
+                        update(Message)
+                        .where(Message.id == message.id)
+                        .values(tags=tags)
+                    )
+                except Exception as e:
+                    print(f"[nudge] Follow-up mark failed for message {message.id}: {e}")
             await session.commit()
 
 

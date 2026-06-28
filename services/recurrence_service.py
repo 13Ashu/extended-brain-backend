@@ -9,13 +9,11 @@ Recurrence Service
 
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-import httpx
 from sqlalchemy import and_, select, update, text, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -376,29 +374,6 @@ Examples:
                 )
         except Exception as e:
             print(f"[recurrence] APNs failed for rec {rec.id}: {e}")
-
-        # ── Telegram (legacy path) ─────────────────────────────────
-        if user.telegram_chat_id:
-            token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                await client.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={
-                        "chat_id":    user.telegram_chat_id,
-                        "text":       (
-                            f"🔁 *Recurring task*\n\n"
-                            f"{rec.template_content}\n\n"
-                            f"_{rule_str}_"
-                        ),
-                        "parse_mode": "Markdown",
-                        "reply_markup": {
-                            "inline_keyboard": [[
-                                {"text": "✅ Done",   "callback_data": f"done:{msg.id}"},
-                                {"text": "⏸ Pause",  "callback_data": f"pause_rec:{rec.id}"},
-                            ]]
-                        }
-                    },
-                )
 
         print(f"[recurrence] Fired rec {rec.id} for user {user.id}")
 

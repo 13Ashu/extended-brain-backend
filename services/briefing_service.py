@@ -8,12 +8,10 @@ Briefing Service
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timedelta
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
-import httpx
 from sqlalchemy import and_, or_, select, update, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,23 +24,6 @@ IST = ZoneInfo("Asia/Kolkata")
 UTC = ZoneInfo("UTC")
 
 BRIEFING_TIME_KEY = "briefing_time"  # stored as "HH:MM" in user row
-
-
-async def _send_telegram(chat_id: str, text: str, reply_markup: Optional[dict] = None):
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    payload = {
-        "chat_id":    chat_id,
-        "text":       text,
-        "parse_mode": "Markdown",
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        await client.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json=payload,
-        )
 
 
 class BriefingService:
@@ -77,7 +58,6 @@ class BriefingService:
         """Build and send the morning briefing for one user."""
         now_ist  = datetime.now(IST)
         today    = now_ist.strftime("%Y-%m-%d")
-        tomorrow = (now_ist + timedelta(days=1)).strftime("%Y-%m-%d")
 
         async with async_session_maker() as session:
             # ── Carry forward overdue todos ───────────────────────
@@ -92,64 +72,7 @@ class BriefingService:
             # ── Fetch today's events ──────────────────────────────
             events = await self._fetch_events(user.id, today, session)
 
-            # ── Fetch tomorrow's events (preview) ────────────────
-            tomorrow_events = await self._fetch_events(user.id, tomorrow, session)
-
-        # ── Build message ─────────────────────────────────────────
-        greeting = self._greeting(now_ist.hour, user.name)
-        text = f"{greeting}\n\n"
-
-        if carried:
-            text += f"⏪ *{len(carried)} task(s) carried over from yesterday*\n\n"
-
-        if todos:
-            text += f"📋 *Today's Tasks ({len(todos)})*\n"
-            for t in todos[:8]:
-                tags     = t.tags if isinstance(t.tags, dict) else {}
-                priority = tags.get("priority", "normal")
-                prefix   = "🔴" if priority == "high" else "🟡" if priority == "urgent" else "•"
-                evt_time = tags.get("event_time", "")
-                time_str = f" _{evt_time}_" if evt_time else ""
-                text += f"{prefix} {t.content[:50]}{time_str}\n"
-            if len(todos) > 8:
-                text += f"_...and {len(todos) - 8} more_\n"
-            text += "\n"
-        elif not assigned:
-            text += "✨ *No tasks for today!*\n\n"
-
-        if assigned:
-            text += f"🤝 *Assigned to you ({len(assigned)})*\n"
-            for t in assigned[:5]:
-                text += f"• {t.content[:50]}\n"
-            if len(assigned) > 5:
-                text += f"_...and {len(assigned) - 5} more_\n"
-            text += "\n"
-
-        if events:
-            text += f"📅 *Today's Events ({len(events)})*\n"
-            for e in events[:5]:
-                tags     = e.tags if isinstance(e.tags, dict) else {}
-                evt_time = tags.get("event_time", "")
-                time_str = f" at _{evt_time}_" if evt_time else ""
-                text += f"• {e.content[:50]}{time_str}\n"
-            text += "\n"
-
-        if tomorrow_events:
-            text += f"👀 *Tomorrow: {len(tomorrow_events)} event(s)*\n"
-            for e in tomorrow_events[:3]:
-                text += f"• {e.content[:40]}\n"
-            text += "\n"
-
-        text += "_Reply 'search: your query' to find anything_"
-
-        # Inline button to change briefing time
-        reply_markup = {
-            "inline_keyboard": [[
-                {"text": "⏰ Change briefing time", "callback_data": "set_briefing_time"}
-            ]]
-        }
-
-        # ── APNs delivery (iOS primary surface) ───────────────────
+        # ── APNs delivery ─────────────────────────────────────────
         try:
             async with async_session_maker() as apns_db:
                 result = await apns_db.execute(
@@ -202,12 +125,6 @@ class BriefingService:
         except Exception as e:
             print(f"[briefing] APNs delivery failed for user {user.id}: {e}")
 
-        # ── Telegram delivery (legacy) ─────────────────────────────
-        if not user.telegram_chat_id:
-            return
-
-        await _send_telegram(user.telegram_chat_id, text, reply_markup)
-        print(f"[briefing] Sent to {user.name} ({user.telegram_chat_id})")
 
     async def _carry_forward(
         self, user_id: int, today: str, session: AsyncSession

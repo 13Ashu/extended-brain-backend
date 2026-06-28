@@ -1,7 +1,7 @@
 """
 Reminder Service
 ────────────────────────────────────────────────────────────────────────────
-Handles creation, scheduling, and delivery of reminders via Telegram + APNs.
+Handles creation, scheduling, and delivery of reminders via APNs.
 """
 
 from __future__ import annotations
@@ -175,30 +175,12 @@ class Reminder(Base):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Telegram sender
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def send_telegram(chat_id: str, text: str, token: str, parse_mode: str = "Markdown") -> bool:
-    url     = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            return True
-    except Exception as e:
-        print(f"[telegram] Failed to send to {chat_id}: {e}")
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Reminder Service
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ReminderService:
     def __init__(self, cerebras_client: CerebrasClient):
-        self.cerebras         = cerebras_client
-        self.telegram_token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        self.cerebras           = cerebras_client
         self._scheduler_running = False
 
     # ──────────────────────────────────────────────────────────────
@@ -227,7 +209,6 @@ class ReminderService:
             task=task,
             remind_at=remind_at,
             timezone=user.timezone or "Asia/Kolkata",
-            telegram_chat_id=user.telegram_chat_id,
         )
         db.add(reminder)
         await db.commit()
@@ -282,7 +263,7 @@ class ReminderService:
                 print(f"[reminder] DB error in scheduler: {e}")
 
     async def _send_reminder(self, reminder: Reminder, db: AsyncSession):
-        # ── APNs push (works even without Telegram) ───────────────
+        # ── APNs push ─────────────────────────────────────────────
         try:
             async with async_session_maker() as apns_db:
                 result = await apns_db.execute(
@@ -304,99 +285,30 @@ class ReminderService:
         except Exception as e:
             print(f"[apns] Failed for reminder #{reminder.id}: {e}")
 
-        # ── Telegram (existing path) ──────────────────────────────
-        if not reminder.telegram_chat_id or not self.telegram_token:
-            print(f"[reminder] No telegram config for reminder #{reminder.id}")
-            # Mark sent if we sent via APNs
-            async with async_session_maker() as s:
-                await s.execute(
-                    update(Reminder).where(Reminder.id == reminder.id)
-                    .values(is_sent=True, sent_at=datetime.utcnow())
-                )
-                await s.commit()
-            return
-
-        local_time = self._to_local_time(reminder.remind_at, reminder.timezone)
-        priority   = getattr(reminder, "priority", "normal") or "normal"
-        alarm_icon = "🚨" if priority in ("high", "urgent") else "⏰"
-
-        text = (
-            f"{alarm_icon} *Reminder*\n\n"
-            f"{reminder.task}\n\n"
-            f"_Scheduled for {local_time}_"
-        )
-
-        reply_markup = {
-            "inline_keyboard": [[
-                {
-                    "text":          "✅ Done",
-                    "callback_data": f"done:{reminder.message_id}",
-                },
-                {
-                    "text":          "⏰ 30 min",
-                    "callback_data": f"snooze:{reminder.message_id}:30",
-                },
-                {
-                    "text":          "⏰ 1 hr",
-                    "callback_data": f"snooze:{reminder.message_id}:60",
-                },
-            ]]
-        }
-
-        token = self.telegram_token
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id":              reminder.telegram_chat_id,
-                    "text":                 text,
-                    "parse_mode":           "Markdown",
-                    "disable_notification": False,
-                    "reply_markup":         reply_markup,
-                },
+        # Mark reminder as sent and update linked message tags
+        async with async_session_maker() as session:
+            await session.execute(
+                update(Reminder)
+                .where(Reminder.id == reminder.id)
+                .values(is_sent=True, sent_at=datetime.utcnow())
             )
-            data      = resp.json()
-            tg_msg_id = data.get("result", {}).get("message_id")
-
-            # Pin high priority reminders for extra visibility
-            if priority in ("high", "urgent") and tg_msg_id:
-                await client.post(
-                    f"https://api.telegram.org/bot{token}/pinChatMessage",
-                    json={
-                        "chat_id":              reminder.telegram_chat_id,
-                        "message_id":           tg_msg_id,
-                        "disable_notification": False,
-                    },
-                )
-
-        if data.get("ok"):
-            async with async_session_maker() as session:
-                await session.execute(
-                    update(Reminder)
-                    .where(Reminder.id == reminder.id)
-                    .values(is_sent=True, sent_at=datetime.utcnow())
-                )
-                # Mark linked todo done only for non-recurring reminders
-                if reminder.message_id and not reminder.recurrence:
-                    try:
-                        msg = await session.scalar(
-                            select(Message).where(Message.id == reminder.message_id)
+            if reminder.message_id and not reminder.recurrence:
+                try:
+                    msg = await session.scalar(
+                        select(Message).where(Message.id == reminder.message_id)
+                    )
+                    if msg:
+                        tags = dict(msg.tags or {})
+                        tags["reminded_at"] = datetime.utcnow().isoformat()
+                        await session.execute(
+                            update(Message)
+                            .where(Message.id == reminder.message_id)
+                            .values(tags=tags)
                         )
-                        if msg:
-                            tags = dict(msg.tags or {})
-                            tags["reminded_at"] = datetime.utcnow().isoformat()
-                            # Don't auto-mark done — let user tap the Done button
-                            await session.execute(
-                                update(Message)
-                                .where(Message.id == reminder.message_id)
-                                .values(tags=tags)
-                            )
-                    except Exception as e:
-                        print(f"[reminder] Could not update todo tags: {e}")
-                await session.commit()
-            print(f"[reminder] ✅ Sent #{reminder.id} — {reminder.task}")
-        else:
-            print(f"[reminder] ❌ Failed to send #{reminder.id}: {data}")
+                except Exception as e:
+                    print(f"[reminder] Could not update todo tags: {e}")
+            await session.commit()
+        print(f"[reminder] ✅ Sent #{reminder.id} — {reminder.task}")
     # ──────────────────────────────────────────────────────────────
     # Snooze / Cancel / List
     # ──────────────────────────────────────────────────────────────
