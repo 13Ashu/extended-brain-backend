@@ -1491,13 +1491,15 @@ Return ONLY this JSON:
         if caption:
             tags["caption"] = caption
 
+        # summary = user's caption (what the iOS bot bubble and brain view show).
+        # The AI-generated title is kept in tags.image_title for internal reference only.
         msg = Message(
             user_id=user.id,
             category_id=category.id,
             content=content,
             message_type=MessageType("image"),
             media_url=media_url,
-            summary=title,
+            summary=caption[:100] if caption else None,
             tags=tags,
             created_at=ref,
         )
@@ -1511,8 +1513,8 @@ Return ONLY this JSON:
             "message_id":  msg.id,
             "category":    "Remember",
             "all_buckets": ["Remember"],
-            "tags":        recall_terms.split() if recall_terms else [],
-            "essence":     title,
+            "tags":        [],
+            "essence":     caption or "",   # user's caption only — never the AI title
             "connections": [],
             "due_date":    None,
             "events":      [],
