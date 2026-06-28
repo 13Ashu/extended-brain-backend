@@ -60,23 +60,33 @@ class ClassifierService:
         print(f"[classifier] backbone.onnx absent — downloading from BACKBONE_ONNX_URL (~86 MB, may take 10–30s) ...")
         os.makedirs(self._model_dir, exist_ok=True)
         tmp_path = onnx_path + ".tmp"
-        t0 = time.time()
 
         def _progress(block_count, block_size, total_size):
             if total_size > 0 and block_count % 500 == 0:
                 pct = min(100, int(block_count * block_size * 100 / total_size))
                 print(f"[classifier] downloading... {pct}%", flush=True)
 
-        try:
-            urllib.request.urlretrieve(url, tmp_path, reporthook=_progress)
-            os.rename(tmp_path, onnx_path)
-            elapsed = time.time() - t0
-            size_mb = os.path.getsize(onnx_path) // 1_000_000
-            print(f"[classifier] backbone.onnx downloaded ({size_mb} MB in {elapsed:.1f}s)")
-        except Exception as e:
-            print(f"[classifier] backbone.onnx download failed: {e}", flush=True)
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            t0 = time.time()
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                urllib.request.urlretrieve(url, tmp_path, reporthook=_progress)
+                os.rename(tmp_path, onnx_path)
+                elapsed = time.time() - t0
+                size_mb = os.path.getsize(onnx_path) // 1_000_000
+                print(f"[classifier] backbone.onnx downloaded ({size_mb} MB in {elapsed:.1f}s)")
+                break
+            except Exception as e:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                if attempt < max_attempts:
+                    wait = attempt * 5
+                    print(f"[classifier] download attempt {attempt} failed: {e} — retrying in {wait}s ...", flush=True)
+                    time.sleep(wait)
+                else:
+                    print(f"[classifier] backbone.onnx download failed after {max_attempts} attempts: {e}", flush=True)
 
     def load(self) -> bool:
         """Load ONNX model + head weights. Called once at startup. Returns True on success."""
