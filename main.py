@@ -4163,6 +4163,21 @@ async def capture_message(
         if message.expense_context:
             result["expense_context"] = message.expense_context
 
+    # ── Image metadata ───────────────────────────────────────────────
+    # Echo media_url back in the capture response so the iOS chat bubble can
+    # render a thumbnail of the uploaded photo (the upload URL is not otherwise
+    # included in the standard result dict that intent_service builds).
+    if message.message_type == MessageTypeEnum.IMAGE and message.media_url and result.get("message_id"):
+        result["media_url"] = message.media_url
+
+    # ── Link metadata ────────────────────────────────────────────────
+    # Share-extension URL captures arrive as message_type="text" with media_url = the external
+    # link. Echo it back so iOS can render a LinkChip in the capture-confirmation bubble.
+    if (message.message_type == MessageTypeEnum.TEXT and message.media_url
+            and (message.media_url.startswith("http://") or message.media_url.startswith("https://"))
+            and result.get("message_id")):
+        result["media_url"] = message.media_url
+
     # ── Document metadata ────────────────────────────────────────────
     # Stamp the original filename + a flag so iOS renders a file card (and the
     # raw extracted text never shows in the bubble). media_url already points at
