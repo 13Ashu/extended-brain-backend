@@ -373,6 +373,9 @@ class MessageProcessor:
                 user=user, content=full_content, bucket="Remember", keywords=[],
                 message_type=message_type, media_url=media_url, db=db, ref=ref,
                 embed_text=embed_text,
+                # Store only the user's caption as the summary (not extracted text),
+                # so brain view can show the caption cleanly without PDF body text.
+                summary=caption[:100] if caption else None,
             )
 
         # ── Media override: images and link captures → always Remember ────────
@@ -860,6 +863,7 @@ class MessageProcessor:
         self, user, content: str, bucket: str, keywords: List[str],
         message_type: str, media_url: Optional[str], db: AsyncSession, ref: datetime,
         embed_text: Optional[str] = None,
+        summary: Optional[str] = None,
     ) -> Dict:
         category = await self._get_or_create_category(
             user_id=user.id, name=bucket,
@@ -878,7 +882,8 @@ class MessageProcessor:
         msg = Message(
             user_id=user.id, category_id=category.id,
             content=content, message_type=MessageType(message_type),
-            media_url=media_url, summary=content[:100], tags=tags, created_at=ref,
+            media_url=media_url, summary=summary if summary is not None else content[:100],
+            tags=tags, created_at=ref,
         )
         db.add(msg)
         await db.commit()

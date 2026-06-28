@@ -4185,7 +4185,10 @@ async def capture_message(
     if message.message_type == MessageTypeEnum.DOCUMENT and result.get("message_id"):
         import json as _json_doc
         file_name = (message.metadata or {}).get("file_name") or "Document"
+        doc_caption = (message.content or "").strip()
         doc_tags = {"is_document": True, "file_name": file_name}
+        if doc_caption:
+            doc_tags["caption"] = doc_caption
         await db.execute(
             text("UPDATE messages SET tags = tags || CAST(:extra AS jsonb) WHERE id = :mid")
             .bindparams(extra=_json_doc.dumps(doc_tags), mid=result["message_id"])
@@ -4194,9 +4197,10 @@ async def capture_message(
         result["is_document"] = True
         result["file_name"]   = file_name
         result["media_url"]   = message.media_url
-        # Show the filename in the capture-confirmation bubble, not a fragment of the
-        # extracted text (content leads with the full document body for search).
-        result["essence"]     = file_name
+        # essence = user's caption (shown in bot bubble); falls back to filename
+        # when no caption was provided. The filename is already visible on the
+        # DocumentChip, so showing it as essence text would be redundant.
+        result["essence"]     = doc_caption or file_name
 
     return {"success": True, "message": "Content captured successfully", "data": result}
 
