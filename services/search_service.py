@@ -49,6 +49,18 @@ BUCKET_ALIASES: Dict[str, str] = {
     # Bucket detection only fires on words that unambiguously name a bucket.
 }
 
+# Single-word queries that browse by message_type rather than bucket.
+# "image" → most recent image captures; "pdf" → most recent documents.
+# Link captures are message_type="text" with media_url, so not trivially filterable here.
+TYPE_ALIASES: Dict[str, str] = {
+    "image": "image", "images": "image",
+    "photo": "image", "photos": "image", "pic": "image", "pics": "image",
+    "pdf": "document", "pdfs": "document",
+    "doc": "document", "docs": "document",
+    "document": "document", "documents": "document",
+    "file": "document", "files": "document",
+}
+
 TODO_KEYWORDS = {
     "todo", "to-do", "to do", "task", "tasks", "pending",
     "checklist", "check list",
@@ -253,6 +265,15 @@ class SearchService:
                 group_id=group_id, db=db,
             )
             print(f"[search] bucket-browse '{_canonical}' → {len(results)} results")
+            return {"results": results, "natural_response": ""}
+
+        if len(query.strip().split()) == 1 and _query_word in TYPE_ALIASES:
+            _msg_type = TYPE_ALIASES[_query_word]
+            results = await self._type_browse(
+                user=user, message_type=_msg_type, limit=limit,
+                group_id=group_id, db=db,
+            )
+            print(f"[search] type-browse '{_msg_type}' → {len(results)} results")
             return {"results": results, "natural_response": ""}
 
         import time as _time
@@ -590,6 +611,34 @@ Return ONLY this JSON:
             expansion={"keywords": [], "core_concepts": [], "entities": [], "bucket_filter": bucket},
             use_due_filter=False,
             fast=True,  # sort by recency, no scoring threshold
+        )
+
+    async def _type_browse(
+        self, user: User, message_type: str, limit: int,
+        group_id: Optional[int], db: AsyncSession,
+    ) -> List[Dict]:
+        stmt = (
+            select(Message, Category)
+            .join(Category, Message.category_id == Category.id, isouter=True)
+        )
+        if group_id:
+            stmt = stmt.where(Message.group_id == group_id)
+        else:
+            stmt = stmt.where(and_(
+                Message.user_id == user.id,
+                Message.group_id.is_(None),
+                Message.assigned_to_user_id.is_(None),
+            ))
+        stmt = stmt.where(Message.message_type == message_type)
+        stmt = stmt.order_by(Message.created_at.desc()).limit(limit)
+        result = await db.execute(stmt)
+        rows = result.fetchall()
+        return self._rank(
+            messages=rows,
+            query=message_type,
+            expansion={"keywords": [], "core_concepts": [], "entities": [], "bucket_filter": ""},
+            use_due_filter=False,
+            fast=True,
         )
 
     # ──────────────────────────────────────────────────────────────
