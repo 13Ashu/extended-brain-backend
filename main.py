@@ -3198,7 +3198,7 @@ async def bootstrap(
                     Message.group_id.is_(None),
                     Message.assigned_to_user_id.is_(None),
                     text("COALESCE((messages.tags->>'done')::boolean, false) = false"),
-                    text("(messages.tags->>'primary_bucket' = 'To-Do' OR (messages.tags->>'is_list')::boolean IS TRUE)"),
+                    text("messages.tags->>'primary_bucket' = 'To-Do'"),
                 )
             )
             .order_by(Message.created_at.desc())
