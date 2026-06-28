@@ -4,8 +4,7 @@ SMS Service — MSG91 transactional SMS for OTP delivery (India).
 OTP generation, storage, expiry and verification all stay in `auth_service` +
 the `otp_verifications` table. This module is purely the SMS *transport*: it
 hands a code to MSG91's Flow API (v5), which renders it into a DLT-approved
-template and sends the SMS. It is deliberately separate from the conversational
-`MessagingClient` (Telegram/WhatsApp), which is being retired.
+template and sends the SMS. It is deliberately separate from any messaging channel.
 
 Required env (see config.py):
     MSG91_AUTH_KEY          MSG91 account auth key

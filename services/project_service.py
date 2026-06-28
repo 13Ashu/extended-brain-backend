@@ -8,31 +8,13 @@ Project Service
 
 from __future__ import annotations
 
-import os
 from typing import Dict, List, Optional
 
-import httpx
 from sqlalchemy import and_, select, update, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import async_session_maker, Message, User
 from cerebras_client import CerebrasClient
-
-
-async def _send_telegram(chat_id: str, text_: str, reply_markup: Optional[dict] = None):
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    payload = {
-        "chat_id":    chat_id,
-        "text":       text_,
-        "parse_mode": "Markdown",
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        await client.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json=payload,
-        )
 
 
 class ProjectService:
@@ -182,7 +164,7 @@ Return ONLY this JSON:
         return [{"name": row[0], "count": row[1]} for row in result.all()]
 
     # ──────────────────────────────────────────────────────────────
-    # Format project summary for Telegram
+    # Format project summary
     # ──────────────────────────────────────────────────────────────
 
     def format_project_summary(

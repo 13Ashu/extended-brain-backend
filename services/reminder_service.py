@@ -162,7 +162,7 @@ class Reminder(Base):
     task:             Mapped[str]           = mapped_column(Text)
     remind_at:        Mapped[datetime]      = mapped_column(DateTime, index=True)
     timezone:         Mapped[str]           = mapped_column(String(50), default="UTC")
-    telegram_chat_id: Mapped[Optional[str]] = mapped_column(String(50))
+    # telegram_chat_id column removed from ORM (column stays in DB for now)
     is_sent:          Mapped[bool]          = mapped_column(Boolean, default=False)
     is_cancelled:     Mapped[bool]          = mapped_column(Boolean, default=False)
     snooze_count:     Mapped[int]           = mapped_column(Integer, default=0)

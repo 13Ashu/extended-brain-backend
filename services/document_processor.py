@@ -5,9 +5,9 @@ Extract text from PDFs and Word docs.
 Two entry points:
   - extract_text_from_bytes(content, hint)  ← preferred; works on raw bytes already
     in hand (e.g. loaded from the StoredImage table on the iOS capture path).
-  - extract_document_text(url)              ← legacy; downloads an EXTERNAL url first
-    (Telegram/WhatsApp media). Internal /api/images/{id} urls are auth-gated, so the
-    capture path should use the bytes-based function instead of this one.
+  - extract_document_text(url)              ← legacy; downloads an external URL first.
+    Internal /api/images/{id} urls are auth-gated, so the capture path should use
+    the bytes-based function instead of this one.
 
 File type is detected by magic bytes (reliable) and falls back to a filename/url
 hint, because our internal media urls (/api/images/{id}) carry no file extension.

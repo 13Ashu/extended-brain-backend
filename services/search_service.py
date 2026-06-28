@@ -1021,7 +1021,6 @@ Return ONLY this JSON:
     ) -> Dict:
         """
         Search saved images by keyword match on content, summary, and tags.
-        Returns file_id in results for Telegram re-send.
         Zero LLM — pure DB search.
         """
         # Extract search terms — strip "image:" prefix
@@ -1077,8 +1076,7 @@ Return ONLY this JSON:
                 "essence":       msg.summary or tags.get("image_title", "Image"),
                 "message_type":  "image",
                 "media_url":     msg.media_url,
-                "file_id":       tags.get("file_id"),
-                "caption":       tags.get("caption", ""),
+"caption":       tags.get("caption", ""),
                 "document_type": tags.get("document_type", "other"),
                 "description":   tags.get("description", ""),
                 "created_at":    msg.created_at.isoformat(),

@@ -37,7 +37,7 @@ class BriefingService:
         current_hhmm = now_ist.strftime("%H:%M")
 
         async with async_session_maker() as session:
-            # Find all active users whose briefing_time matches now (regardless of Telegram)
+            # Find all active users whose briefing_time matches now
             users = await session.execute(
                 select(User).where(
                     and_(

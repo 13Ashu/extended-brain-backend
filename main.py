@@ -1,6 +1,5 @@
 """
 Extended Brain - Main FastAPI Application
-Multi-platform messaging support (WhatsApp/Telegram)
 """
 
 from dotenv import load_dotenv
@@ -68,9 +67,6 @@ async def lifespan(app: FastAPI):
 
     scheduler_task = asyncio.create_task(_master_scheduler())
     print("✅ Master scheduler running")
-
-    # Telegram bot is legacy/retired — we no longer register its webhook on startup.
-    # (To fully stop an already-registered webhook, call deleteWebhook on the bot once.)
 
     print("✓ Extended Brain API started successfully")
     yield
@@ -1030,8 +1026,6 @@ async def register_user(user_data: UserRegistrationRequest, db: AsyncSession = D
 
 
 # ================== REST API Endpoints (continued below) ==================
-# Telegram webhook removed — iOS APNs is the only notification channel.
-
 # ================== REST API Endpoints ==================
 
 @app.get("/api/messages/assigned")
@@ -3133,7 +3127,7 @@ async def get_user_analytics(
 
 @app.get("/api/webhook/info")
 async def get_webhook_info():
-    """Returns active webhook info. Only WhatsApp webhook is active; Telegram is retired."""
+    """Returns active webhook info."""
     return {"platform": "whatsapp", "webhook_endpoint": "/webhook/whatsapp"}
 
 

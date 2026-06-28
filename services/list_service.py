@@ -758,41 +758,6 @@ class ListService:
     # Display — zero LLM
     # ──────────────────────────────────────────────────────────────
 
-    def format_for_telegram(self, msg: Message) -> Tuple[str, dict]:
-        tags     = msg.tags if isinstance(msg.tags, dict) else {}
-        subtasks = tags.get("subtasks", [])
-        name     = tags.get("list_name", msg.content)
-        done_ct  = sum(1 for s in subtasks if s.get("done"))
-        total    = len(subtasks)
-
-        text_ = f"📋 *{name}*"
-        if total > 0:
-            text_ += f"  ·  _{done_ct}/{total} done_"
-        text_ += "\n\n"
-
-        if not subtasks:
-            text_ += "_Nothing here yet._"
-            return text_, {"inline_keyboard": []}
-
-        buttons = []
-        for i, sub in enumerate(subtasks):
-            if sub.get("done"):
-                text_ += f"~{sub['task'][:50]}~\n"
-            else:
-                buttons.append([{
-                    "text":          f"☐  {sub['task'][:45]}",
-                    "callback_data": f"list_done:{msg.id}:{i}",
-                }])
-
-        if done_ct == total and total > 0:
-            text_ += "\n_All done! 🎉_\n"
-            buttons.append([{
-                "text":          "🗑 Clear done items",
-                "callback_data": f"list_clear:{msg.id}",
-            }])
-
-        return text_, {"inline_keyboard": buttons}
-
     def format_plain(self, msg: Message) -> str:
         tags     = msg.tags if isinstance(msg.tags, dict) else {}
         subtasks = tags.get("subtasks", [])

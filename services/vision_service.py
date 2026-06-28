@@ -93,9 +93,6 @@ async def _analyze_with_gemini(
 # Public interface
 # ─────────────────────────────────────────────────────────────
 
-# Remove download_telegram_image from VisionService entirely.
-# The caller (main.py) handles the download using the existing messaging_client.
-
 class VisionService:
 
     def __init__(self):
