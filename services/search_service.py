@@ -43,6 +43,7 @@ BUCKET_ALIASES: Dict[str, str] = {
     "idea": "Ideas", "ideas": "Ideas", "concept": "Ideas",
     "track": "Track", "log": "Track", "habit": "Track",
     "event": "Events", "events": "Events", "appointment": "Events",
+    "random": "Random", "misc": "Random",
     # "meeting" and "schedule" intentionally excluded — they are content words
     # (users search FOR something about a meeting, not FOR the Events bucket).
     # Bucket detection only fires on words that unambiguously name a bucket.
@@ -238,6 +239,21 @@ class SearchService:
         # ── 0. Image search — highest priority ───────────────────────
         if query.lower().strip().startswith("image:"):
             return await self._fetch_images_direct(user.id, query, db, limit)
+
+        # ── 0b. Bucket browse — query is solely a known bucket alias ─
+        # When the user types "idea", "todo", "remember", etc. (and nothing else),
+        # they want to browse recent items from that category — not search for
+        # content that happens to contain the word. Return the N most recent
+        # captures from that bucket sorted by recency, bypassing text/semantic search.
+        _query_word = query.strip().lower()
+        if len(query.strip().split()) == 1 and _query_word in BUCKET_ALIASES:
+            _canonical = BUCKET_ALIASES[_query_word]
+            results = await self._bucket_browse(
+                user=user, bucket=_canonical, limit=limit,
+                group_id=group_id, db=db,
+            )
+            print(f"[search] bucket-browse '{_canonical}' → {len(results)} results")
+            return {"results": results, "natural_response": ""}
 
         import time as _time
         _t0 = _time.monotonic()
@@ -537,6 +553,44 @@ Return ONLY this JSON:
         if bucket_hint and not response.get("bucket_filter"):
             response["bucket_filter"] = bucket_hint
         return response
+
+    # ──────────────────────────────────────────────────────────────
+    # Bucket browse — return recent items from a specific bucket
+    # ──────────────────────────────────────────────────────────────
+
+    async def _bucket_browse(
+        self, user: User, bucket: str, limit: int,
+        group_id: Optional[int], db: AsyncSession,
+    ) -> List[Dict]:
+        stmt = (
+            select(Message, Category)
+            .join(Category, Message.category_id == Category.id, isouter=True)
+        )
+        if group_id:
+            stmt = stmt.where(Message.group_id == group_id)
+        else:
+            stmt = stmt.where(and_(
+                Message.user_id == user.id,
+                Message.group_id.is_(None),
+                Message.assigned_to_user_id.is_(None),
+            ))
+        # Match either the primary_bucket JSONB field or the all_buckets array
+        stmt = stmt.where(
+            or_(
+                text("COALESCE(messages.tags->>'primary_bucket', messages.tags->>'intent_bucket', '') = :bkt"),
+                text("messages.tags->'all_buckets' @> jsonb_build_array(:bkt)"),
+            )
+        ).params(bkt=bucket).order_by(Message.created_at.desc()).limit(limit)
+
+        result = await db.execute(stmt)
+        rows = result.fetchall()
+        return self._rank(
+            messages=rows,
+            query=bucket,
+            expansion={"keywords": [], "core_concepts": [], "entities": [], "bucket_filter": bucket},
+            use_due_filter=False,
+            fast=True,  # sort by recency, no scoring threshold
+        )
 
     # ──────────────────────────────────────────────────────────────
     # DB retrieval
