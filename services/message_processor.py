@@ -69,6 +69,38 @@ INTENT_BUCKETS: Dict[str, str] = {
 
 BUCKET_NAMES = list(INTENT_BUCKETS.keys())
 
+
+def _implicit_search_keywords(message_type: str, media_url: Optional[str]) -> Optional[str]:
+    """
+    Compute space-separated implicit search keywords baked into tags at save time.
+    These let users type natural words ("insta", "image", "links") and instantly
+    find captures via ILIKE — both server-side and on the iOS local search index
+    (which has no access to media_url or message_type at query time).
+    """
+    parts: List[str] = []
+    if media_url and media_url.startswith("http"):
+        url = media_url.lower()
+        parts += ["link", "links", "url", "website"]
+        if "instagram" in url:
+            parts += ["instagram", "insta"]
+            if "/reel" in url:
+                parts += ["reel", "reels"]
+        elif "youtu" in url:
+            parts += ["youtube", "yt", "video"]
+        elif "twitter" in url or "x.com" in url:
+            parts += ["twitter", "tweet"]
+        elif "linkedin" in url:
+            parts.append("linkedin")
+        elif "reddit" in url:
+            parts.append("reddit")
+        elif "github" in url:
+            parts.append("github")
+    elif message_type == "image":
+        parts += ["image", "photo", "pic", "picture"]
+    # documents: filename (with .pdf / .docx extension) is already folded into content
+    # at extraction time, so "pdf" / the filename are already ILIKE-searchable there.
+    return " ".join(parts) if parts else None
+
 ACTION_VERBS = {
     "call", "email", "message", "text", "ping", "contact",
     "buy", "get", "pick", "order", "purchase",
@@ -863,6 +895,9 @@ class MessageProcessor:
             "priority":       "normal",
             "due_date":       None,
         }
+        _sk = _implicit_search_keywords(message_type, media_url)
+        if _sk:
+            tags["search_keywords"] = _sk
 
         msg = Message(
             user_id=user.id, category_id=category.id,
@@ -1410,6 +1445,7 @@ Return ONLY this JSON:
             "primary_bucket": "Remember",
             "priority":       "normal",
             "due_date":       None,
+            "search_keywords": "image photo pic picture",
         }
         if caption:
             tags["caption"] = caption
@@ -1466,6 +1502,7 @@ Return ONLY this JSON:
             "primary_bucket": "Remember",
             "priority":       "normal",
             "due_date":       None,
+            "search_keywords": "document file pdf",
         }
 
         msg = Message(

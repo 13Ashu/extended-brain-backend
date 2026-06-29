@@ -854,6 +854,11 @@ Return ONLY this JSON:
                 text(f"lower(coalesce(messages.media_url, '')) LIKE :rw_mu_{i}")
                 .bindparams(**{f"rw_mu_{i}": pattern})
             )
+            # Search baked-in implicit keywords ("image photo", "instagram insta reel", etc.)
+            kw_conds.append(
+                text(f"lower(coalesce(messages.tags->>'search_keywords', '')) LIKE :rw_sk_{i}")
+                .bindparams(**{f"rw_sk_{i}": pattern})
+            )
         # Then LLM-expanded terms (may overlap, OR logic handles dedup)
         all_terms = (
             expansion.get("keywords", [])[:8]
