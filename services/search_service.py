@@ -60,19 +60,6 @@ TYPE_ALIASES: Dict[str, str] = {
     "file": "document", "files": "document",
 }
 
-# Single-word queries that browse link captures by media_url pattern.
-# Value = domain substring to filter on ("" = all external http links).
-LINK_ALIASES: Dict[str, str] = {
-    "link":      "", "links":     "", "url":       "", "urls":      "",
-    "website":   "", "websites":  "", "web":        "",
-    "insta":     "instagram",  "instagram": "instagram",
-    "reel":      "instagram",  "reels":     "instagram",
-    "youtube":   "youtu",      "yt":        "youtu",
-    "twitter":   "twitter",    "tweet":     "twitter",    "tweets":    "twitter",
-    "linkedin":  "linkedin",
-    "reddit":    "reddit",
-    "github":    "github",
-}
 
 TODO_KEYWORDS = {
     "todo", "to-do", "to do", "task", "tasks", "pending",
@@ -287,15 +274,6 @@ class SearchService:
                 group_id=group_id, db=db,
             )
             print(f"[search] type-browse '{_msg_type}' → {len(results)} results")
-            return {"results": results, "natural_response": ""}
-
-        if len(query.strip().split()) == 1 and _query_word in LINK_ALIASES:
-            _domain = LINK_ALIASES[_query_word]
-            results = await self._link_browse(
-                user=user, domain_filter=_domain, limit=limit,
-                group_id=group_id, db=db,
-            )
-            print(f"[search] link-browse '{_query_word}' domain='{_domain}' → {len(results)} results")
             return {"results": results, "natural_response": ""}
 
         import time as _time
@@ -663,55 +641,6 @@ Return ONLY this JSON:
         return self._rank(
             messages=rows,
             query=message_type,
-            expansion={"keywords": [], "core_concepts": [], "entities": [], "bucket_filter": ""},
-            use_due_filter=False,
-            fast=True,
-        )
-
-    async def _link_browse(
-        self, user: User, domain_filter: str, limit: int,
-        group_id: Optional[int], db: AsyncSession,
-    ) -> List[Dict]:
-        stmt = (
-            select(Message, Category)
-            .join(Category, Message.category_id == Category.id, isouter=True)
-        )
-        if group_id:
-            stmt = stmt.where(Message.group_id == group_id)
-        else:
-            stmt = stmt.where(and_(
-                Message.user_id == user.id,
-                Message.group_id.is_(None),
-                Message.assigned_to_user_id.is_(None),
-            ))
-        # Match link captures: external http URL in media_url, or bare URL in content
-        link_cond = or_(
-            and_(
-                Message.media_url.isnot(None),
-                text("messages.media_url LIKE 'http%'"),
-            ),
-            and_(
-                Message.media_url.is_(None),
-                or_(
-                    func.lower(Message.content).startswith("http://"),
-                    func.lower(Message.content).startswith("https://"),
-                ),
-            ),
-        )
-        stmt = stmt.where(link_cond)
-        if domain_filter:
-            stmt = stmt.where(
-                or_(
-                    text("lower(messages.media_url) LIKE :dom").bindparams(dom=f"%{domain_filter}%"),
-                    text("lower(messages.content) LIKE :dom_c").bindparams(dom_c=f"%{domain_filter}%"),
-                )
-            )
-        stmt = stmt.order_by(Message.created_at.desc()).limit(limit)
-        result = await db.execute(stmt)
-        rows = result.fetchall()
-        return self._rank(
-            messages=rows,
-            query=domain_filter or "link",
             expansion={"keywords": [], "core_concepts": [], "entities": [], "bucket_filter": ""},
             use_due_filter=False,
             fast=True,
