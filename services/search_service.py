@@ -26,7 +26,7 @@ from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cerebras_client import CerebrasClient
-from database import Category, Message, User
+from database import Category, Message, MessageType, User
 
 class _SemanticSkipped(Exception):
     """Sentinel: tier-1 fast path intentionally skips embedding search (not an error)."""
@@ -651,10 +651,12 @@ Return ONLY this JSON:
                 Message.group_id.is_(None),
                 Message.assigned_to_user_id.is_(None),
             ))
-        # Cast to text to avoid SQLAlchemy enum coercion issues with PostgreSQL native enums
-        stmt = stmt.where(
-            text("messages.message_type::text = :mt").bindparams(mt=message_type)
-        )
+        # Use enum member so SQLAlchemy generates the correct SQL for the native enum type
+        try:
+            msg_type_enum = MessageType(message_type)
+        except ValueError:
+            return []
+        stmt = stmt.where(Message.message_type == msg_type_enum)
         stmt = stmt.order_by(Message.created_at.desc()).limit(limit)
         result = await db.execute(stmt)
         rows = result.fetchall()
