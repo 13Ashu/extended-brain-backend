@@ -51,7 +51,6 @@ BUCKET_ALIASES: Dict[str, str] = {
 
 # Single-word queries that browse by message_type rather than bucket.
 # "image" → most recent image captures; "pdf" → most recent documents.
-# Link captures are message_type="text" with media_url, so not trivially filterable here.
 TYPE_ALIASES: Dict[str, str] = {
     "image": "image", "images": "image",
     "photo": "image", "photos": "image", "pic": "image", "pics": "image",
@@ -59,6 +58,20 @@ TYPE_ALIASES: Dict[str, str] = {
     "doc": "document", "docs": "document",
     "document": "document", "documents": "document",
     "file": "document", "files": "document",
+}
+
+# Single-word queries that browse link captures by media_url pattern.
+# Value = domain substring to filter on ("" = all external http links).
+LINK_ALIASES: Dict[str, str] = {
+    "link":      "", "links":     "", "url":       "", "urls":      "",
+    "website":   "", "websites":  "", "web":        "",
+    "insta":     "instagram",  "instagram": "instagram",
+    "reel":      "instagram",  "reels":     "instagram",
+    "youtube":   "youtu",      "yt":        "youtu",
+    "twitter":   "twitter",    "tweet":     "twitter",    "tweets":    "twitter",
+    "linkedin":  "linkedin",
+    "reddit":    "reddit",
+    "github":    "github",
 }
 
 TODO_KEYWORDS = {
@@ -274,6 +287,15 @@ class SearchService:
                 group_id=group_id, db=db,
             )
             print(f"[search] type-browse '{_msg_type}' → {len(results)} results")
+            return {"results": results, "natural_response": ""}
+
+        if len(query.strip().split()) == 1 and _query_word in LINK_ALIASES:
+            _domain = LINK_ALIASES[_query_word]
+            results = await self._link_browse(
+                user=user, domain_filter=_domain, limit=limit,
+                group_id=group_id, db=db,
+            )
+            print(f"[search] link-browse '{_query_word}' domain='{_domain}' → {len(results)} results")
             return {"results": results, "natural_response": ""}
 
         import time as _time
@@ -629,13 +651,65 @@ Return ONLY this JSON:
                 Message.group_id.is_(None),
                 Message.assigned_to_user_id.is_(None),
             ))
-        stmt = stmt.where(Message.message_type == message_type)
+        # Cast to text to avoid SQLAlchemy enum coercion issues with PostgreSQL native enums
+        stmt = stmt.where(
+            text("messages.message_type::text = :mt").bindparams(mt=message_type)
+        )
         stmt = stmt.order_by(Message.created_at.desc()).limit(limit)
         result = await db.execute(stmt)
         rows = result.fetchall()
         return self._rank(
             messages=rows,
             query=message_type,
+            expansion={"keywords": [], "core_concepts": [], "entities": [], "bucket_filter": ""},
+            use_due_filter=False,
+            fast=True,
+        )
+
+    async def _link_browse(
+        self, user: User, domain_filter: str, limit: int,
+        group_id: Optional[int], db: AsyncSession,
+    ) -> List[Dict]:
+        stmt = (
+            select(Message, Category)
+            .join(Category, Message.category_id == Category.id, isouter=True)
+        )
+        if group_id:
+            stmt = stmt.where(Message.group_id == group_id)
+        else:
+            stmt = stmt.where(and_(
+                Message.user_id == user.id,
+                Message.group_id.is_(None),
+                Message.assigned_to_user_id.is_(None),
+            ))
+        # Match link captures: external http URL in media_url, or bare URL in content
+        link_cond = or_(
+            and_(
+                Message.media_url.isnot(None),
+                text("messages.media_url LIKE 'http%'"),
+            ),
+            and_(
+                Message.media_url.is_(None),
+                or_(
+                    func.lower(Message.content).startswith("http://"),
+                    func.lower(Message.content).startswith("https://"),
+                ),
+            ),
+        )
+        stmt = stmt.where(link_cond)
+        if domain_filter:
+            stmt = stmt.where(
+                or_(
+                    text("lower(messages.media_url) LIKE :dom").bindparams(dom=f"%{domain_filter}%"),
+                    text("lower(messages.content) LIKE :dom_c").bindparams(dom_c=f"%{domain_filter}%"),
+                )
+            )
+        stmt = stmt.order_by(Message.created_at.desc()).limit(limit)
+        result = await db.execute(stmt)
+        rows = result.fetchall()
+        return self._rank(
+            messages=rows,
+            query=domain_filter or "link",
             expansion={"keywords": [], "core_concepts": [], "entities": [], "bucket_filter": ""},
             use_due_filter=False,
             fast=True,
@@ -772,6 +846,11 @@ Return ONLY this JSON:
             kw_conds.append(
                 text(f"lower(messages.tags->>'original_dump') LIKE :rw_od_{i}")
                 .bindparams(**{f"rw_od_{i}": pattern})
+            )
+            # Search media_url so platform/domain words ("insta", "github", etc.) surface link captures
+            kw_conds.append(
+                text(f"lower(coalesce(messages.media_url, '')) LIKE :rw_mu_{i}")
+                .bindparams(**{f"rw_mu_{i}": pattern})
             )
         # Then LLM-expanded terms (may overlap, OR logic handles dedup)
         all_terms = (
