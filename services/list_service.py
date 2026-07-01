@@ -724,6 +724,25 @@ class ListService:
             await session.commit()
         return len(subtasks) - 1
 
+    async def delete_item(self, message_id: int, item_index: int) -> bool:
+        async with async_session_maker() as session:
+            msg = await session.scalar(select(Message).where(Message.id == message_id))
+            if not msg:
+                return False
+            tags     = dict(msg.tags or {})
+            subtasks = list(tags.get("subtasks", []))
+            if item_index >= len(subtasks):
+                return False
+            subtasks.pop(item_index)
+            tags["subtasks"]    = subtasks
+            tags["item_count"]  = len(subtasks)
+            tags["done_count"]  = sum(1 for s in subtasks if s.get("done"))
+            await session.execute(
+                update(Message).where(Message.id == message_id).values(tags=tags)
+            )
+            await session.commit()
+        return True
+
     async def clear_done_items(self, message_id: int) -> int:
         async with async_session_maker() as session:
             msg = await session.scalar(select(Message).where(Message.id == message_id))

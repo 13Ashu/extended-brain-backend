@@ -2511,6 +2511,21 @@ async def capture_message(
             )
         )
 
+    # ── Rich text metadata ────────────────────────────────────────────
+    # Share-extension captures from rich-text sources (e.g. Apple Notes) may include
+    # an HTML rendering of the original formatting alongside the plain-text content
+    # used for search/classification/embedding. Stash it in tags so iOS can render
+    # and edit the formatted version in the detail sheet; content/summary stay plain.
+    if message.metadata and message.metadata.get("rich_html") and result.get("message_id"):
+        import json as _json_rich
+        rich_tags = {"rich_html": message.metadata["rich_html"]}
+        await db.execute(
+            text("UPDATE messages SET tags = tags || CAST(:extra AS jsonb) WHERE id = :mid")
+            .bindparams(extra=_json_rich.dumps(rich_tags), mid=result["message_id"])
+        )
+        await db.commit()
+        result["rich_html"] = message.metadata["rich_html"]
+
     return {"success": True, "message": "Content captured successfully", "data": result}
 
 
@@ -2797,6 +2812,18 @@ async def update_message_content(
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Message not found")
 
+    # Optional rich-text edit: iOS sends the re-serialized HTML alongside the plain
+    # projection above whenever the message carries tags.rich_html (see capture route).
+    # "" (empty string) clears formatting — falls back to plain-text rendering.
+    if "rich_html" in body:
+        import json as _json_rich
+        rich_tags = {"rich_html": body.get("rich_html") or None}
+        await db.execute(
+            text("UPDATE messages SET tags = tags || CAST(:extra AS jsonb) WHERE id = :mid")
+            .bindparams(extra=_json_rich.dumps(rich_tags), mid=message_id)
+        )
+        await db.commit()
+
     from services import redis_cache as _rc
     asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(current_user.id, None)))
     asyncio.create_task(_rc.cache_del_user_searches(current_user.id))
@@ -2862,6 +2889,20 @@ async def add_list_item(
     if index is None:
         raise HTTPException(status_code=404, detail="List not found")
     return {"success": True, "item_index": index}
+
+
+@app.delete("/api/messages/{message_id}/items/{item_index}")
+async def delete_list_item(
+    message_id: int,
+    item_index: int,
+    current_user: User = Depends(get_current_user),
+):
+    from services.list_service import ListService
+    ls = ListService(cerebras_client)
+    success = await ls.delete_item(message_id, item_index)
+    if not success:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return {"success": True}
 
 
 @app.post("/api/categories/manage")
