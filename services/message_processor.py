@@ -1648,19 +1648,123 @@ Return ONLY this JSON:
                     print(f"[enrich] doc {message_id}: no extractable text (image-only PDF?)")
                     return
 
-                full_content = (f"{caption}\n\n{extracted}" if caption else extracted)[:10000]
-                lead         = extracted[:1500]
-                embed_text   = (f"{caption}\n\n{lead}" if caption else lead).strip()
+                # Distil extracted text to 50-100 high-signal keywords via Gemini.
+                # Storing raw 10k chars makes ILIKE search imprecise and embeds a diffuse vector.
+                # Keywords are compact, Hinglish-friendly, and directly reflect what a user would
+                # type when searching for this document.
+                keywords = await self._extract_document_keywords(extracted, caption or "")
+                searchable = (f"{caption}\n{keywords}" if caption else keywords).strip()
+                embed_text = searchable
 
                 msg = await db.get(Message, message_id)
                 if not msg:
                     return
-                msg.content = full_content
+                msg.content = searchable
                 await db.commit()
 
                 await self._save_embedding(message_id, embed_text, {}, db)
                 await cache_del(bootstrap_key(user_id, None))
-                print(f"[enrich] doc {message_id}: done ({len(extracted)} chars extracted)")
+                print(f"[enrich] doc {message_id}: done ({len(extracted)} chars → {len(keywords)} keyword chars)")
 
         except Exception as e:
             print(f"[enrich] doc {message_id} error: {e}")
+
+    async def _extract_document_keywords(self, text: str, caption: str) -> str:
+        """Use Gemini to distil long extracted document text to 50-100 searchable keywords.
+        Returns a space/newline-separated keyword string suitable for ILIKE search and embedding."""
+        snippet = text[:6000]  # give Gemini enough context without burning tokens
+        prompt = (
+            "You are a search-keyword extractor for a personal knowledge app used by Indian professionals.\n"
+            "Given the document text below, output ONLY a flat list of 50-100 high-signal search keywords "
+            "and short phrases (2-3 words max each), one per line. No bullet points, no numbering, no explanations.\n"
+            "Rules:\n"
+            "- Include proper nouns: people, places, companies, products, amounts, dates\n"
+            "- Include domain terms: technical jargon, category labels, document type\n"
+            "- Include Hinglish variants where natural (e.g. 'ghar', 'kharcha', 'bill')\n"
+            "- No stop words, no full sentences\n"
+            f"Caption: {caption}\n\n"
+            f"Document text:\n{snippet}\n\n"
+            "Keywords:"
+        )
+        try:
+            client = CerebrasClient(provider="gemini", model="gemini-2.5-flash-lite")
+            raw = await client.chat(prompt, max_tokens=400)
+            lines = [ln.strip().lower() for ln in raw.splitlines() if ln.strip()]
+            return "\n".join(lines[:100])
+        except Exception as e:
+            print(f"[keywords] extraction failed, using lead: {e}")
+            return text[:800]
+
+    async def _enrich_link_background(
+        self,
+        message_id: int,
+        user_id: int,
+        link_url: str,
+        caption: str,
+    ) -> None:
+        """Background task: fetch link OG metadata, extract keywords via Gemini,
+        update content + embedding so the capture becomes semantically searchable."""
+        from database import async_session_maker
+        from services.redis_cache import cache_del, bootstrap_key
+        import re as _re
+
+        try:
+            import httpx
+        except ImportError:
+            print(f"[enrich] link {message_id}: httpx not available, skipping")
+            return
+
+        try:
+            async with async_session_maker() as db:
+                # Fetch the page with a standard browser UA to get OG tags
+                headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                }
+                try:
+                    async with httpx.AsyncClient(follow_redirects=True, timeout=10,
+                                                  verify=False) as client:
+                        resp = await client.get(link_url, headers=headers)
+                        html = resp.text
+                except Exception as e:
+                    print(f"[enrich] link {message_id}: fetch failed: {e}")
+                    return
+
+                # Extract OG title + description from HTML
+                def _og(prop: str) -> str:
+                    m = _re.search(
+                        rf'<meta[^>]+property=["\']og:{prop}["\'][^>]+content=["\']([^"\']+)["\']',
+                        html, _re.IGNORECASE
+                    ) or _re.search(
+                        rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:{prop}["\']',
+                        html, _re.IGNORECASE
+                    )
+                    return m.group(1).strip() if m else ""
+
+                og_title = _og("title") or _og("site_name")
+                og_desc  = _og("description")
+                page_text = f"{og_title}\n{og_desc}".strip()
+
+                if not page_text:
+                    print(f"[enrich] link {message_id}: no OG metadata found")
+                    return
+
+                print(f"[enrich] link {message_id}: got OG text ({len(page_text)} chars)")
+                keywords = await self._extract_document_keywords(page_text, caption or "")
+                searchable = (f"{caption}\n{keywords}" if caption else keywords).strip()
+
+                msg = await db.get(Message, message_id)
+                if not msg:
+                    return
+                msg.content = searchable
+                await db.commit()
+
+                await self._save_embedding(message_id, searchable, {}, db)
+                await cache_del(bootstrap_key(user_id, None))
+                print(f"[enrich] link {message_id}: done ({len(keywords)} keyword chars)")
+
+        except Exception as e:
+            print(f"[enrich] link {message_id} error: {e}")

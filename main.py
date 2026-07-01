@@ -343,6 +343,10 @@ class MessageCreate(BaseModel):
     client_essence:       Optional[str]   = None   # summary from Foundation Models / truncation
     client_due_date:      Optional[str]   = None   # date from NSDataDetector (ISO8601)
     client_processing_ms: Optional[float] = None   # on-device latency for comparison logging
+    # When True, server runs its OWN full pipeline (ignores client_bucket as force_bucket)
+    # and returns {"comparison": {server_bucket, server_essence, client_bucket, ...}} in the
+    # response. The stored message uses the SERVER'S result so the DB stays gold-standard.
+    compare_mode:         bool            = False
 
 
 class SearchQuery(BaseModel):
@@ -1798,8 +1802,13 @@ async def delete_message(
         raise HTTPException(status_code=403, detail="Not your message")
     await db.execute(sql_delete(Reminder).where(Reminder.message_id == message_id))
     await db.execute(update(LabelAnnotation).where(LabelAnnotation.message_id == message_id).values(message_id=None))
+    group_id = msg.group_id
     await db.delete(msg)
     await db.commit()
+    asyncio.create_task(_rc.cache_del_user_searches(current_user.id))
+    asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(current_user.id, None)))
+    if group_id:
+        asyncio.create_task(_rc.cache_del(_rc.bootstrap_key(current_user.id, group_id)))
     return {"success": True}
 
 
@@ -2071,38 +2080,54 @@ async def capture_message(
         members = await grp_svc.get_group_members(group_id, db)
         assignments = grp_svc.parse_all_mentions(content, members)
 
+    # compare_mode: server runs its own full pipeline so both results can be compared.
+    # non-compare on_device mode: client_bucket used as force_bucket for speed (no LLM).
+    _compare_mode = message.compare_mode and message.client_processed
+
     result = await message_processor.process(
         user_phone=current_user.phone_number, content=content,
         message_type=message.message_type, media_url=message.media_url, db=db,
         skip_query=True,
         group_id=group_id,
-        # @mention tasks are always To-Do — skip classifier/LLM entirely.
-        # client_bucket wins when on-device POC mode is active.
         force_bucket=(
             "Track" if message.expense_amount is not None
             else "To-Do" if assignments
-            else message.client_bucket if (message.client_processed and message.client_bucket)
+            # In compare_mode, server decides on its own — client_bucket is not forced
+            else message.client_bucket if (message.client_processed and message.client_bucket and not _compare_mode)
             else (message.force_bucket or None)
         ),
-        # Skip LLM for group captures AND when client already classified on-device
-        no_llm_fallback=bool(group_id) or bool(message.client_processed),
+        # Skip LLM for group captures; in compare_mode keep LLM on so we get a real server result
+        no_llm_fallback=bool(group_id) or (bool(message.client_processed) and not _compare_mode),
         # When the task is assigned to someone, skip sender's reminder — assignee gets it instead
         skip_reminder=bool(assignments),
     )
 
-    # ── POC: on-device path — override essence + due_date with client values ──
     _processing_mode = "on_device" if message.client_processed else "server"
+
     if message.client_processed and result.get("message_id"):
-        if message.client_essence:
-            result["essence"] = message.client_essence
-            await db.execute(
-                update(Message)
-                .where(Message.id == result["message_id"])
-                .values(summary=message.client_essence)
-            )
-            await db.commit()
-        if message.client_due_date and not result.get("due_date"):
-            result["due_date"] = message.client_due_date
+        if _compare_mode:
+            # Server result is stored as-is (gold standard).
+            # Return comparison dict so iOS can show device vs server side by side.
+            result["comparison"] = {
+                "server_bucket":  result.get("category"),
+                "server_essence": result.get("essence"),
+                "client_bucket":  message.client_bucket,
+                "client_essence": message.client_essence,
+                "client_ms":      message.client_processing_ms,
+                "bucket_match":   result.get("category") == message.client_bucket,
+            }
+        else:
+            # Non-compare on-device mode: client values win (fast path, no LLM was used).
+            if message.client_essence:
+                result["essence"] = message.client_essence
+                await db.execute(
+                    update(Message)
+                    .where(Message.id == result["message_id"])
+                    .values(summary=message.client_essence)
+                )
+                await db.commit()
+            if message.client_due_date and not result.get("due_date"):
+                result["due_date"] = message.client_due_date
 
     # ── Stamp the idempotency key on the new row (so a retry resolves here) ──
     if message.client_id and result.get("message_id"):
@@ -2477,10 +2502,26 @@ async def capture_message(
     # ── Link metadata ────────────────────────────────────────────────
     # Share-extension URL captures arrive as message_type="text" with media_url = the external
     # link. Echo it back so iOS can render a LinkChip in the capture-confirmation bubble.
+    # For links where the user typed no caption (content == URL) or content is very short,
+    # fire a background task to fetch OG metadata and extract Gemini keywords so the capture
+    # becomes semantically searchable beyond just the URL domain.
     if (message.message_type == MessageTypeEnum.TEXT and message.media_url
             and (message.media_url.startswith("http://") or message.media_url.startswith("https://"))
             and result.get("message_id")):
         result["media_url"] = message.media_url
+        _link_caption = (message.content or "").strip()
+        _needs_enrichment = (
+            not _link_caption
+            or _link_caption == message.media_url.strip()
+            or len(_link_caption) < 60
+        )
+        if _needs_enrichment:
+            asyncio.create_task(
+                message_processor._enrich_link_background(
+                    result["message_id"], current_user.id,
+                    message.media_url, _link_caption,
+                )
+            )
 
     # ── Document metadata ────────────────────────────────────────────
     # Stamp the original filename + a flag so iOS renders a file card (and the
