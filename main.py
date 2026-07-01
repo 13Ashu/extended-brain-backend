@@ -337,6 +337,12 @@ class MessageCreate(BaseModel):
     expense_context:  Optional[str]   = None
     force_bucket:     Optional[str]   = None
     client_id:        Optional[str]   = None   # idempotency key for capture retries
+    # POC: on-device pre-processing — client classified the message itself
+    client_processed:     bool            = False
+    client_bucket:        Optional[str]   = None   # bucket from on-device classifier
+    client_essence:       Optional[str]   = None   # summary from Foundation Models / truncation
+    client_due_date:      Optional[str]   = None   # date from NSDataDetector (ISO8601)
+    client_processing_ms: Optional[float] = None   # on-device latency for comparison logging
 
 
 class SearchQuery(BaseModel):
@@ -2070,13 +2076,33 @@ async def capture_message(
         message_type=message.message_type, media_url=message.media_url, db=db,
         skip_query=True,
         group_id=group_id,
-        # @mention tasks are always To-Do — skip classifier/LLM entirely
-        force_bucket="Track" if message.expense_amount is not None else ("To-Do" if assignments else (message.force_bucket or None)),
-        # All group captures: use classifier or rule-based fallback, never LLM
-        no_llm_fallback=bool(group_id),
+        # @mention tasks are always To-Do — skip classifier/LLM entirely.
+        # client_bucket wins when on-device POC mode is active.
+        force_bucket=(
+            "Track" if message.expense_amount is not None
+            else "To-Do" if assignments
+            else message.client_bucket if (message.client_processed and message.client_bucket)
+            else (message.force_bucket or None)
+        ),
+        # Skip LLM for group captures AND when client already classified on-device
+        no_llm_fallback=bool(group_id) or bool(message.client_processed),
         # When the task is assigned to someone, skip sender's reminder — assignee gets it instead
         skip_reminder=bool(assignments),
     )
+
+    # ── POC: on-device path — override essence + due_date with client values ──
+    _processing_mode = "on_device" if message.client_processed else "server"
+    if message.client_processed and result.get("message_id"):
+        if message.client_essence:
+            result["essence"] = message.client_essence
+            await db.execute(
+                update(Message)
+                .where(Message.id == result["message_id"])
+                .values(summary=message.client_essence)
+            )
+            await db.commit()
+        if message.client_due_date and not result.get("due_date"):
+            result["due_date"] = message.client_due_date
 
     # ── Stamp the idempotency key on the new row (so a retry resolves here) ──
     if message.client_id and result.get("message_id"):
@@ -2488,6 +2514,10 @@ async def capture_message(
                 message.media_url, doc_caption,
             )
         )
+
+    result["processing_mode"] = _processing_mode
+    if message.client_processing_ms is not None:
+        result["client_processing_ms"] = message.client_processing_ms
 
     return {"success": True, "message": "Content captured successfully", "data": result}
 
