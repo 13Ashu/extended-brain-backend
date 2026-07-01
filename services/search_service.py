@@ -307,10 +307,11 @@ class SearchService:
             ranked = self._rank(messages=messages, query=query, expansion=base_expansion,
                                 use_due_filter=bool(date_from), fast=True)[:limit]
             print(f"[search] tier1 keyword → {_time.monotonic()-_t0:.2f}s ({len(ranked)} results)")
-            result = {"results": ranked, "natural_response": ""}
-            if ck:
-                await redis_cache.cache_set(ck, result, ex=120)
-            return result
+            # Do NOT cache fast=True results — they are keyword-only (no embeddings)
+            # and an empty keyword hit would poison the cache for the subsequent
+            # fast=False embedding search on the same query (e.g. "sketches" matches
+            # nothing via ILIKE but finds "sketch" images via cosine similarity).
+            return {"results": ranked, "natural_response": ""}
 
         # ── TIERS 2+3: embedding + optional LLM expansion (fast=False) ─
         # iOS calls this after showing the tier-1 result. Runs in parallel:
