@@ -677,7 +677,7 @@ class MessageProcessor:
         # Embeddings + per-task reminders
         reminder_count = 0
         for saved in saved_items:
-            await self._save_embedding(saved["id"], saved["task"], {}, db)
+            self._save_embedding(saved["id"], saved["task"], {}, db)
             # Each task with a time gets its OWN reminder (skip for group @mention captures)
             if self.reminder_service and saved["evt_time"] and not skip_reminder:
                 try:
@@ -834,7 +834,7 @@ class MessageProcessor:
             except Exception as e:
                 print(f"⚠ Reminder failed: {e}")
 
-        await self._save_embedding(msg.id, content, {}, db)
+        self._save_embedding(msg.id, content, {}, db)
         return result
 
     async def _process_track(
@@ -867,7 +867,7 @@ class MessageProcessor:
         db.add(msg)
         await db.commit()
         await db.refresh(msg)
-        await self._save_embedding(msg.id, content, {}, db)
+        self._save_embedding(msg.id, content, {}, db)
 
         return {
             "message_id": msg.id, "category": "Track",
@@ -909,7 +909,7 @@ class MessageProcessor:
         await db.commit()
         await db.refresh(msg)
         # For documents, embed_text is the focused lead; otherwise embed the content.
-        await self._save_embedding(msg.id, embed_text or content, {"keywords": keywords}, db)
+        self._save_embedding(msg.id, embed_text or content, {"keywords": keywords}, db)
 
         return {
             "message_id": msg.id, "category": bucket,
@@ -964,7 +964,7 @@ class MessageProcessor:
         db.add(msg)
         await db.commit()
         await db.refresh(msg)
-        await self._save_embedding(msg.id, content, {}, db)
+        self._save_embedding(msg.id, content, {}, db)
 
         return {
             "message_id":  msg.id,
@@ -1067,7 +1067,7 @@ class MessageProcessor:
                 except Exception as e:
                     print(f"⚠ Reminder failed: {e}")
 
-        await self._save_embedding(msg.id, content, analysis, db)
+        self._save_embedding(msg.id, content, analysis, db)
         return result
 
 
@@ -1297,7 +1297,7 @@ Return ONLY this JSON:
         await db.commit()
 
         for saved in saved_items:
-            await self._save_embedding(saved["id"], saved["task"], analysis, db)
+            self._save_embedding(saved["id"], saved["task"], analysis, db)
 
             if self.reminder_service and saved["evt_time"]:
                 item_analysis = {
@@ -1388,10 +1388,24 @@ Return ONLY this JSON:
                     topics.add(kw)
         return list(topics)[:15]
 
-    async def _save_embedding(
-        self, message_id: int, content: str, analysis: Dict, db: AsyncSession,
-    ):
+    def _save_embedding(
+        self, message_id: int, content: str, analysis: Dict,
+        db: AsyncSession = None,   # kept for call-site compat; ignored (task creates own session)
+    ) -> None:
+        """Schedule embedding generation as a fire-and-forget background task.
+
+        Synchronous so callers don't need await — returns instantly.
+        The embedding is written to the DB a few seconds later by
+        _do_save_embedding(), which creates its own short-lived session.
+        This prevents the Gemini API call from blocking the HTTP response.
+        """
         import asyncio as _aio
+        _aio.create_task(self._do_save_embedding(message_id, content, analysis))
+
+    async def _do_save_embedding(self, message_id: int, content: str, analysis: Dict):
+        """Background: call Gemini, write embedding to DB, close session."""
+        import asyncio as _aio
+        from database import async_session_maker
         from services.embedding_service import embedding_service
         people      = analysis.get("entities", {}).get("people", [])
         keywords    = analysis.get("keywords", [])
@@ -1410,10 +1424,11 @@ Return ONLY this JSON:
                 embedding = await embedding_service.aembed(
                     enriched, task_type="RETRIEVAL_DOCUMENT"
                 )
-                await db.execute(
-                    update(Message).where(Message.id == message_id).values(embedding=embedding)
-                )
-                await db.commit()
+                async with async_session_maker() as db:
+                    await db.execute(
+                        update(Message).where(Message.id == message_id).values(embedding=embedding)
+                    )
+                    await db.commit()
                 return
             except Exception as e:
                 if attempt == 0:
@@ -1467,7 +1482,7 @@ Return ONLY this JSON:
         # Seed embedding from caption so the message is searchable immediately;
         # background task replaces this with a richer vector once vision runs.
         if caption:
-            await self._save_embedding(msg.id, caption, {}, db)
+            self._save_embedding(msg.id, caption, {}, db)
 
         return {
             "message_id":  msg.id,
@@ -1520,7 +1535,7 @@ Return ONLY this JSON:
         await db.refresh(msg)
 
         if caption:
-            await self._save_embedding(msg.id, caption, {}, db)
+            self._save_embedding(msg.id, caption, {}, db)
 
         return {
             "message_id":  msg.id,
@@ -1611,7 +1626,7 @@ Return ONLY this JSON:
                 msg.tags = new_tags
                 await db.commit()
 
-                await self._save_embedding(message_id, embed_text, {}, db)
+                self._save_embedding(message_id, embed_text, {}, db)
 
                 # Bust personal bootstrap so brain view gets fresh content
                 await cache_del(bootstrap_key(user_id, None))
@@ -1665,7 +1680,7 @@ Return ONLY this JSON:
                 msg.content = searchable
                 await db.commit()
 
-                await self._save_embedding(message_id, embed_text, {}, db)
+                self._save_embedding(message_id, embed_text, {}, db)
                 await cache_del(bootstrap_key(user_id, None))
                 print(f"[enrich] doc {message_id}: done ({len(extracted)} chars → {len(keywords)} keyword chars)")
 
@@ -1765,7 +1780,7 @@ Return ONLY this JSON:
                 msg.content = searchable
                 await db.commit()
 
-                await self._save_embedding(message_id, searchable, {}, db)
+                self._save_embedding(message_id, searchable, {}, db)
                 await cache_del(bootstrap_key(user_id, None))
                 print(f"[enrich] link {message_id}: done ({len(keywords)} keyword chars)")
 
