@@ -337,16 +337,6 @@ class MessageCreate(BaseModel):
     expense_context:  Optional[str]   = None
     force_bucket:     Optional[str]   = None
     client_id:        Optional[str]   = None   # idempotency key for capture retries
-    # POC: on-device pre-processing — client classified the message itself
-    client_processed:     bool            = False
-    client_bucket:        Optional[str]   = None   # bucket from on-device classifier
-    client_essence:       Optional[str]   = None   # summary from Foundation Models / truncation
-    client_due_date:      Optional[str]   = None   # date from NSDataDetector (ISO8601)
-    client_processing_ms: Optional[float] = None   # on-device latency for comparison logging
-    # When True, server runs its OWN full pipeline (ignores client_bucket as force_bucket)
-    # and returns {"comparison": {server_bucket, server_essence, client_bucket, ...}} in the
-    # response. The stored message uses the SERVER'S result so the DB stays gold-standard.
-    compare_mode:         bool            = False
 
 
 class SearchQuery(BaseModel):
@@ -2080,10 +2070,6 @@ async def capture_message(
         members = await grp_svc.get_group_members(group_id, db)
         assignments = grp_svc.parse_all_mentions(content, members)
 
-    # compare_mode: server runs its own full pipeline so both results can be compared.
-    # non-compare on_device mode: client_bucket used as force_bucket for speed (no LLM).
-    _compare_mode = message.compare_mode and message.client_processed
-
     result = await message_processor.process(
         user_phone=current_user.phone_number, content=content,
         message_type=message.message_type, media_url=message.media_url, db=db,
@@ -2092,42 +2078,11 @@ async def capture_message(
         force_bucket=(
             "Track" if message.expense_amount is not None
             else "To-Do" if assignments
-            # In compare_mode, server decides on its own — client_bucket is not forced
-            else message.client_bucket if (message.client_processed and message.client_bucket and not _compare_mode)
             else (message.force_bucket or None)
         ),
-        # Skip LLM for group captures; in compare_mode keep LLM on so we get a real server result
-        no_llm_fallback=bool(group_id) or (bool(message.client_processed) and not _compare_mode),
-        # When the task is assigned to someone, skip sender's reminder — assignee gets it instead
+        no_llm_fallback=bool(group_id),
         skip_reminder=bool(assignments),
     )
-
-    _processing_mode = "on_device" if message.client_processed else "server"
-
-    if message.client_processed and result.get("message_id"):
-        if _compare_mode:
-            # Server result is stored as-is (gold standard).
-            # Return comparison dict so iOS can show device vs server side by side.
-            result["comparison"] = {
-                "server_bucket":  result.get("category"),
-                "server_essence": result.get("essence"),
-                "client_bucket":  message.client_bucket,
-                "client_essence": message.client_essence,
-                "client_ms":      message.client_processing_ms,
-                "bucket_match":   result.get("category") == message.client_bucket,
-            }
-        else:
-            # Non-compare on-device mode: client values win (fast path, no LLM was used).
-            if message.client_essence:
-                result["essence"] = message.client_essence
-                await db.execute(
-                    update(Message)
-                    .where(Message.id == result["message_id"])
-                    .values(summary=message.client_essence)
-                )
-                await db.commit()
-            if message.client_due_date and not result.get("due_date"):
-                result["due_date"] = message.client_due_date
 
     # ── Stamp the idempotency key on the new row (so a retry resolves here) ──
     if message.client_id and result.get("message_id"):
@@ -2555,10 +2510,6 @@ async def capture_message(
                 message.media_url, doc_caption,
             )
         )
-
-    result["processing_mode"] = _processing_mode
-    if message.client_processing_ms is not None:
-        result["client_processing_ms"] = message.client_processing_ms
 
     return {"success": True, "message": "Content captured successfully", "data": result}
 
