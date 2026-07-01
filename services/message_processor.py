@@ -1578,7 +1578,10 @@ Return ONLY this JSON:
                 kw: list[str] = []
                 if caption:
                     kw.append(caption)
-                kw.append(doc_label)
+                # Only include the document type label when it's meaningful (not the
+                # fallback "other" that vision returns on failure — it pollutes search).
+                if doc_type and doc_type != "other":
+                    kw.append(doc_label)
                 if extracted:
                     kw.append(extracted[:5000])
                 if recall_terms:
