@@ -2507,7 +2507,7 @@ async def capture_message(
         asyncio.create_task(
             message_processor._enrich_document_background(
                 result["message_id"], current_user.id,
-                message.media_url, doc_caption,
+                message.media_url, doc_caption, file_name,
             )
         )
 

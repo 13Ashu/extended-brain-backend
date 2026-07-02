@@ -1641,8 +1641,9 @@ Return ONLY this JSON:
         user_id: int,
         media_url: str,
         caption: str,
+        file_name: str = "",
     ) -> None:
-        """Background task: extract PDF/DOCX text then update content and embedding.
+        """Background task: extract PDF/DOCX/txt text then update content and embedding.
         Does NOT touch tags — main.py already stamped file_name/is_document/caption."""
         from database import async_session_maker
         from services.document_processor import extract_text_from_bytes
@@ -1657,7 +1658,12 @@ Return ONLY this JSON:
 
                 print(f"[enrich] doc {message_id}: extracting text ({len(raw)//1024} KB)")
                 try:
-                    extracted = (await extract_text_from_bytes(raw, hint=caption or media_url) or "").strip()
+                    # file_name (the real original filename, always has the right extension)
+                    # takes precedence over caption — PDFs still detect fine via magic bytes
+                    # either way, but plain text has NO magic-byte signature, so detection for
+                    # .txt/.md relies entirely on this. A user-typed caption ("My grocery
+                    # list") would otherwise silently defeat detection for those.
+                    extracted = (await extract_text_from_bytes(raw, hint=file_name or caption or media_url) or "").strip()
                 except Exception as e:
                     print(f"[enrich] doc {message_id} extraction error: {e}")
                     return

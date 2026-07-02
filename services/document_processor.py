@@ -31,7 +31,7 @@ def _sanitize(text: str) -> str:
 
 
 def detect_doc_kind(content: bytes, hint: str = "") -> str:
-    """Return 'pdf' | 'docx' | 'unknown' from magic bytes, with a filename/url fallback."""
+    """Return 'pdf' | 'docx' | 'txt' | 'unknown' from magic bytes, with a filename/url fallback."""
     head = content[:8] if content else b""
     # PDF files start with "%PDF"
     if head.startswith(b"%PDF"):
@@ -40,12 +40,16 @@ def detect_doc_kind(content: bytes, hint: str = "") -> str:
     if head.startswith(b"PK\x03\x04"):
         # Could be docx/xlsx/pptx — assume docx for our text use case
         return "docx"
-    # Fall back to the hint (filename or url)
+    # Fall back to the hint (filename or url) — plain text has no magic-byte signature,
+    # so .txt/.md detection depends entirely on this. Callers must pass the real filename
+    # as hint (not a user-typed caption, which won't carry the extension).
     h = (hint or "").lower()
     if h.endswith(".pdf"):
         return "pdf"
     if h.endswith((".docx", ".doc")):
         return "docx"
+    if h.endswith((".txt", ".md", ".markdown")):
+        return "txt"
     return "unknown"
 
 
@@ -58,6 +62,8 @@ async def extract_text_from_bytes(content: bytes, hint: str = "") -> str:
         return _sanitize(await extract_pdf_text(content))
     if kind == "docx":
         return _sanitize(await extract_docx_text(content))
+    if kind == "txt":
+        return _sanitize(content.decode("utf-8", errors="replace"))
     return "[Document content - unsupported format]"
 
 
