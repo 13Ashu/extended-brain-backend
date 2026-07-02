@@ -1785,6 +1785,7 @@ async def delete_message(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a message owned by the current user."""
+    from services import redis_cache as _rc
     msg = await db.get(Message, message_id)
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
