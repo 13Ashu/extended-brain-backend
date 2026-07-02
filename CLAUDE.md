@@ -158,8 +158,10 @@ extended-brain-backend/
 | PATCH | `/api/messages/{id}/assign` | Retroactively assign a group To-Do to a member; body: `{user_id, name, phone}`; updates `assigned_to_user_id` + `tags.assignments`, mirrors To-Do in assignee feed, sends APNs; cannot self-assign; 409 if already assigned to same member |
 | GET | `/api/messages/detail/{id}` | Single message detail |
 | PATCH | `/api/messages/{id}/done` | Mark task done/undone `{"done": bool}`. **Authorization:** message owner always allowed; group members may also mark a group-wide unassigned To-Do done (not just the owner). On completion of a group-wide task: busts bootstrap cache for all group members + broadcasts `todo_completed` WS event so other members' lists update in real-time without a manual refresh. |
-| PATCH | `/api/messages/{id}/content` | Edit message text `{"content": str}` — updates `content` + `summary`; busts bootstrap cache |
+| PATCH | `/api/messages/{id}/content` | Edit message text `{"content": str, "rich_html": str?}` — updates `content` + `summary` (always the flattened plain-text projection). `rich_html` is optional; when present it's merged into `tags.rich_html` so a formatted capture (e.g. from Apple Notes) keeps its original formatting after editing. |
 | PATCH | `/api/messages/{id}/items/{idx}/complete` | Check off a list item |
+| POST | `/api/messages/{id}/items` | Add a new item to a list `{"task": str}` → `{item_index}` |
+| DELETE | `/api/messages/{id}/items/{idx}` | Remove an item from a list |
 | DELETE | `/api/messages/{id}` | Delete message |
 
 ### Search & Upload
@@ -270,6 +272,7 @@ All models in `database.py`. Uses SQLAlchemy 2.0 async with `asyncpg`.
   - `expense_context`: `string` — optional free-text note for an expense ("lunch with team"); omitted when empty; displayed in TimelineCard above category (both shown when note is present; category alone when absent); primary label in Expenses sheet ENTRIES
   - `auto_notify_date`: `string (YYYY-MM-DD)` — set on Events with a future due_date; the day before the event. Scheduler fires a silent APNs day-before push when this matches today, then sets `auto_notified = true`. No Reminder row is created — these notifications never appear in the Reminders section.
   - `auto_notified`: `"true"` — set after `auto_notify_date` push fires, prevents re-sending
+  - `rich_html`: `string` — optional HTML re-rendering of the original formatting, set when a capture comes from a rich-text source (e.g. Apple Notes via the iOS share extension) or via a subsequent edit. `content`/`summary` always stay the flattened plain-text projection (search/classification/embedding never see HTML) — `rich_html` is purely for iOS to render + edit the formatted version in `SearchResultDetailSheet`.
 - `entities` (JSONB): `{people, locations, dates, numbers}`
 - `embedding` (pgvector, 1536 dims)
 - `created_at`
